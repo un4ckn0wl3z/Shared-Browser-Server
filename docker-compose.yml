@@ -1,0 +1,57 @@
+name: shared-browser
+
+services:
+  shared-browser:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: shared-browser-server:local
+    restart: unless-stopped
+    environment:
+      SHARED_BROWSER_ADMIN_TOKEN: "${SHARED_BROWSER_ADMIN_TOKEN:?Set SHARED_BROWSER_ADMIN_TOKEN in .env}"
+      SHARED_BROWSER_DATA_KEY: "${SHARED_BROWSER_DATA_KEY:?Set SHARED_BROWSER_DATA_KEY in .env}"
+      ASPNETCORE_URLS: "http://0.0.0.0:8787"
+      SHARED_BROWSER_DATA: "/data"
+      SHARED_BROWSER_PROXY_BIND: "0.0.0.0"
+    ports:
+      - "${SHARED_BROWSER_HTTP_PUBLISH_IP:-127.0.0.1}:8787:8787"
+      - "${SHARED_BROWSER_PROXY_PUBLISH_IP:-127.0.0.1}:8899:8899"
+    volumes:
+      - shared-browser-data:/data
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    networks:
+      - shared-browser
+
+  caddy:
+    image: caddy:2-alpine
+    profiles: ["https"]
+    restart: unless-stopped
+    depends_on:
+      - shared-browser
+    environment:
+      SHARED_BROWSER_DOMAIN: "${SHARED_BROWSER_DOMAIN:-localhost}"
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - shared-browser
+
+volumes:
+  shared-browser-data:
+  caddy-data:
+  caddy-config:
+
+networks:
+  shared-browser:

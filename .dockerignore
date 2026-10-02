@@ -1,0 +1,15 @@
+.git
+.gitignore
+.env
+**/bin
+**/obj
+**/node_modules
+**/dist
+**/browser-data
+**/server-data
+**/webview-profile
+*.log
+*.tmp
+.vs
+.DS_Store
+Thumbs.db

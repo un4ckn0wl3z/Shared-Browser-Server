@@ -14,6 +14,7 @@ electron-client/dist/
 # Local logs and temporary files
 *.log
 *.tmp
+.env
 *.user
 *.suo
 .vs/

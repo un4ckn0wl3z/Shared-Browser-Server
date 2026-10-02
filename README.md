@@ -28,6 +28,70 @@ Each browser independently connects to the management server to synchronize auth
 
 Session values are sensitive credentials. Use this only for domains and accounts you own or are explicitly authorized to administer.
 
+## Docker deployment on Linux
+
+Docker is the recommended server deployment. The image uses the .NET 8 non-root `app` user, stores the encrypted vault in a named volume, binds the dashboard to localhost by default, and includes an optional Caddy HTTPS profile.
+
+On the Linux server:
+
+```bash
+git clone https://github.com/un4ckn0wl3z/Shared-Browser-Server.git
+cd Shared-Browser-Server
+cp .env.example .env
+```
+
+Generate two independent secrets and place them in `.env`:
+
+```bash
+openssl rand -hex 48
+openssl rand -hex 48
+chmod 600 .env
+```
+
+Do not change `SHARED_BROWSER_DATA_KEY` after the vault contains data. Without the original key, stored sessions cannot be decrypted.
+
+Build and start the server:
+
+```bash
+docker compose up -d --build
+docker compose ps
+docker compose logs -f shared-browser
+```
+
+Verify it locally:
+
+```bash
+curl http://127.0.0.1:8787/healthz
+```
+
+The default bindings are intentionally local-only:
+
+- Dashboard/API: `127.0.0.1:8787`
+- Forward proxy: `127.0.0.1:8899`
+
+For HTTPS, point the DNS record in `SHARED_BROWSER_DOMAIN` at the server and start the optional Caddy profile:
+
+```bash
+docker compose --profile https up -d
+```
+
+Caddy publishes ports 80 and 443 and forwards only the management dashboard/API to the server container. Browser clients should then use `https://browser.example.com` as their management-server URL.
+
+To allow remote browsers to use Managed proxy mode, set `SHARED_BROWSER_PROXY_PUBLISH_IP` in `.env` to the Linux server's private or VPN interface address, recreate the container, and configure the same address as the advertised proxy host in the dashboard:
+
+```bash
+docker compose up -d
+```
+
+Keep port `8899` behind a private network, firewall allowlist, WireGuard, or Tailscale. Do not publish it openly to the internet: the destination HTTPS connection is tunneled, but the browser-to-proxy authentication exchange is not protected by TLS. If the dashboard proxy port is changed from `8899`, update the Compose port mapping at the same time.
+
+Back up the `shared-browser-data` volume and securely retain the matching data key. Upgrade with:
+
+```bash
+git pull
+docker compose up -d --build
+```
+
 ## Start the server
 
 PowerShell:

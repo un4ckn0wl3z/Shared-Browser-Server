@@ -1,0 +1,4 @@
+{$SHARED_BROWSER_DOMAIN:localhost} {
+    encode zstd gzip
+    reverse_proxy shared-browser:8787
+}
