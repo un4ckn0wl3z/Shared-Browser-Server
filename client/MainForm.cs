@@ -52,7 +52,14 @@ public sealed class MainForm : Form
 
         try
         {
-            _environment = await CoreWebView2Environment.CreateAsync(null, ConfigStore.ProfileDirectory, new CoreWebView2EnvironmentOptions());
+            var options = new CoreWebView2EnvironmentOptions();
+            if (_config.NetworkMode.Equals("managed", StringComparison.OrdinalIgnoreCase))
+            {
+                var proxy = _config.Cache.Settings.Proxy;
+                if (!proxy.Enabled) throw new InvalidOperationException("Managed proxy mode is selected, but the proxy is disabled on the management server. Choose Direct mode or enable the proxy in the dashboard.");
+                options.AdditionalBrowserArguments = $"--proxy-server=http://{proxy.Host}:{proxy.Port} --proxy-bypass-list=\"{proxy.BypassList}\"";
+            }
+            _environment = await CoreWebView2Environment.CreateAsync(null, ConfigStore.ProfileDirectory, options);
             await NewTabAsync(_config.Cache.Settings.HomePage);
             await PushAllStoredCookiesAsync(Current());
             _timer.Start();
@@ -106,6 +113,12 @@ public sealed class MainForm : Form
         var page = new TabPage("New tab"); var web = new WebView2 { Dock = DockStyle.Fill }; page.Controls.Add(web); _tabs.TabPages.Add(page); _tabs.SelectedTab = page;
         await web.EnsureCoreWebView2Async(_environment);
         web.CoreWebView2.Settings.IsStatusBarEnabled = false;
+        web.CoreWebView2.BasicAuthenticationRequested += (_, args) =>
+        {
+            if (!_config.NetworkMode.Equals("managed", StringComparison.OrdinalIgnoreCase) || !args.Challenge.Contains("Shared Browser Proxy", StringComparison.OrdinalIgnoreCase)) return;
+            args.Response.UserName = _config.DeviceId;
+            args.Response.Password = _config.DeviceToken;
+        };
         web.CoreWebView2.NavigationStarting += async (_, args) => await PrepareNavigationAsync(web, args);
         web.CoreWebView2.NavigationCompleted += async (_, _) => { UpdateToolbar(); await PushCurrentDomainAsync(web); };
         web.CoreWebView2.SourceChanged += (_, _) => { if (Current() == web) _address.Text = web.Source?.ToString() ?? ""; };
@@ -227,7 +240,7 @@ public sealed class MainForm : Form
     }
     private WebView2? Current() => _tabs.SelectedTab?.Controls.OfType<WebView2>().FirstOrDefault();
     private void UpdateToolbar() { var web = Current(); _back.Enabled = web?.CanGoBack == true; _forward.Enabled = web?.CanGoForward == true; _address.Text = web?.Source?.ToString() ?? ""; }
-    private void SetStatus(string text, bool error) { _syncStatus.Text = text; _syncStatus.ForeColor = error ? Color.Firebrick : Color.SeaGreen; }
+    private void SetStatus(string text, bool error) { _syncStatus.Text = $"{text} • {(_config.NetworkMode.Equals("managed", StringComparison.OrdinalIgnoreCase) ? "Server IP" : "Client IP")}"; _syncStatus.ForeColor = error ? Color.Firebrick : Color.SeaGreen; }
     private static void LogSyncError(Exception error)
     {
         try { File.AppendAllText(Path.Combine(ConfigStore.DataDirectory, "sync-errors.log"), $"{DateTimeOffset.Now:O} {error.Message}{Environment.NewLine}"); } catch { }

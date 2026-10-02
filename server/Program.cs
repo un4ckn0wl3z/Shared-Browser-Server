@@ -4,6 +4,8 @@ using System.Text.Json;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddSingleton<SharedStateStore>();
+builder.Services.AddSingleton<ForwardProxyService>();
+builder.Services.AddHostedService(provider => provider.GetRequiredService<ForwardProxyService>());
 var app = builder.Build();
 
 var adminToken = Environment.GetEnvironmentVariable("SHARED_BROWSER_ADMIN_TOKEN");
@@ -51,9 +53,9 @@ app.MapPost("/api/client/sync", async (HttpContext context, SyncRequest request,
     catch (InvalidOperationException error) { return Results.BadRequest(new { error = error.Message }); }
 });
 
-app.MapGet("/api/admin/status", (HttpContext context, SharedStateStore store) =>
+app.MapGet("/api/admin/status", (HttpContext context, SharedStateStore store, ForwardProxyService proxy) =>
     AdminAuthorized(context.Request)
-        ? Results.Json(new { revision = store.Revision, profiles = store.PublicProfiles(), devices = store.PublicDevices(), settings = store.Settings })
+        ? Results.Json(new { revision = store.Revision, profiles = store.PublicProfiles(), devices = store.PublicDevices(), settings = store.Settings, proxy = proxy.PublicStatus() })
         : Results.Unauthorized());
 
 app.MapPut("/api/admin/settings", async (HttpContext context, BrowserSettings settings, SharedStateStore store) =>
@@ -198,6 +200,8 @@ public sealed class SharedStateStore
     {
         if (!Uri.TryCreate(settings.HomePage, UriKind.Absolute, out var home) || home.Scheme is not ("http" or "https")) throw new InvalidOperationException("Home page must be a valid HTTP or HTTPS URL");
         var primaryDeviceId = string.IsNullOrWhiteSpace(settings.PrimaryDeviceId) ? "" : NormalizeId(settings.PrimaryDeviceId);
+        settings.Proxy ??= new ProxySettings();
+        ValidateProxySettings(settings.Proxy);
         await _gate.WaitAsync();
         try
         {
@@ -205,6 +209,7 @@ public sealed class SharedStateStore
             _state.Settings.HomePage = home.AbsoluteUri;
             _state.Settings.PrimaryDeviceId = primaryDeviceId;
             _state.Settings.AutoShareCookies = settings.AutoShareCookies;
+            _state.Settings.Proxy = CloneProxySettings(settings.Proxy);
             BumpRevision();
             await SaveLockedAsync();
         }
@@ -318,6 +323,8 @@ public sealed class SharedStateStore
     {
         if (!File.Exists(_path)) return new SharedState();
         var disk = JsonSerializer.Deserialize<SharedState>(File.ReadAllText(_path), JsonOptions) ?? new SharedState();
+        disk.Settings ??= new BrowserSettings();
+        disk.Settings.Proxy ??= new ProxySettings();
         foreach (var cookie in disk.Profiles.SelectMany(profile => profile.Cookies)) cookie.Value = Decrypt(cookie.Value);
         return disk;
     }
@@ -401,7 +408,18 @@ public sealed class SharedStateStore
     }
 
     private static bool CookieEqual(SharedCookie a, SharedCookie b) => a.Name == b.Name && a.Value == b.Value && a.Domain == b.Domain && a.Path == b.Path && a.Secure == b.Secure && a.HttpOnly == b.HttpOnly && a.SameSite == b.SameSite;
-    private static BrowserSettings CloneSettings(BrowserSettings settings) => new() { HomePage = settings.HomePage, PrimaryDeviceId = settings.PrimaryDeviceId, AutoShareCookies = settings.AutoShareCookies };
+    private static BrowserSettings CloneSettings(BrowserSettings settings) => new() { HomePage = settings.HomePage, PrimaryDeviceId = settings.PrimaryDeviceId, AutoShareCookies = settings.AutoShareCookies, Proxy = CloneProxySettings(settings.Proxy) };
+    private static ProxySettings CloneProxySettings(ProxySettings settings) => new() { Enabled = settings.Enabled, Host = settings.Host, Port = settings.Port, AllowedPorts = settings.AllowedPorts, BypassList = settings.BypassList };
+    private static void ValidateProxySettings(ProxySettings proxy)
+    {
+        proxy.Host = proxy.Host.Trim();
+        proxy.AllowedPorts = string.Join(',', proxy.AllowedPorts.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+        proxy.BypassList = proxy.BypassList.Trim();
+        if (proxy.Port is < 1 or > 65535) throw new InvalidOperationException("Proxy port must be between 1 and 65535");
+        if (proxy.Host.Length is < 1 or > 253 || proxy.Host.Any(character => !(char.IsAsciiLetterOrDigit(character) || character is '.' or '-' or ':' or '[' or ']'))) throw new InvalidOperationException("Proxy host is invalid");
+        if (proxy.AllowedPorts.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Any(item => !int.TryParse(item, out var port) || port is < 1 or > 65535)) throw new InvalidOperationException("Allowed proxy ports must be comma-separated port numbers");
+        if (proxy.BypassList.Length > 500 || proxy.BypassList.Any(character => !(char.IsAsciiLetterOrDigit(character) || character is '.' or '-' or '_' or '*' or ';' or ':' or '<' or '>' or '[' or ']'))) throw new InvalidOperationException("Proxy bypass list contains unsupported characters");
+    }
     private static SessionProfile CloneProfile(SessionProfile profile) => new()
     {
         Id = profile.Id,
@@ -422,7 +440,8 @@ public sealed class SharedState
     public List<SharedBookmark> Bookmarks { get; set; } = [];
 }
 
-public sealed class BrowserSettings { public string HomePage { get; set; } = "https://example.com/"; public string PrimaryDeviceId { get; set; } = ""; public bool AutoShareCookies { get; set; } = true; }
+public sealed class BrowserSettings { public string HomePage { get; set; } = "https://example.com/"; public string PrimaryDeviceId { get; set; } = ""; public bool AutoShareCookies { get; set; } = true; public ProxySettings Proxy { get; set; } = new(); }
+public sealed class ProxySettings { public bool Enabled { get; set; } public string Host { get; set; } = "127.0.0.1"; public int Port { get; set; } = 8899; public string AllowedPorts { get; set; } = "80,443"; public string BypassList { get; set; } = "localhost;127.0.0.1"; }
 public sealed class SessionProfile { public string Id { get; set; } = ""; public string Name { get; set; } = ""; public string Domain { get; set; } = ""; public bool Enabled { get; set; } = true; public List<SharedCookie> Cookies { get; set; } = []; }
 public sealed class SharedCookie { public string Name { get; set; } = ""; public string Value { get; set; } = ""; public string Domain { get; set; } = ""; public string Path { get; set; } = "/"; public bool Secure { get; set; } = true; public bool HttpOnly { get; set; } = true; public string SameSite { get; set; } = "Lax"; public DateTimeOffset UpdatedAt { get; set; } public string SourceDeviceId { get; set; } = ""; }
 public sealed class SharedBookmark { public string Title { get; set; } = ""; public string Url { get; set; } = ""; }

@@ -16,6 +16,10 @@ public static class ConfigStore
         Directory.CreateDirectory(ProfileDirectory);
         if (!File.Exists(ConfigPath)) { var fresh = new ClientConfig(); Save(fresh); return fresh; }
         var config = JsonSerializer.Deserialize<ClientConfig>(File.ReadAllText(ConfigPath), JsonOptions) ?? new ClientConfig();
+        config.NetworkMode = config.NetworkMode?.Equals("managed", StringComparison.OrdinalIgnoreCase) == true ? "managed" : "direct";
+        config.Cache ??= new SharedSnapshot();
+        config.Cache.Settings ??= new BrowserSettings();
+        config.Cache.Settings.Proxy ??= new ProxySettings();
         config.DeviceToken = Unprotect(config.DeviceToken);
         config.EnrollmentToken = Unprotect(config.EnrollmentToken);
         foreach (var cookie in config.Cache.Profiles.SelectMany(profile => profile.Cookies)) cookie.Value = Unprotect(cookie.Value);
@@ -39,11 +43,18 @@ public static class ConfigStore
         DeviceName = input.DeviceName,
         DeviceToken = input.DeviceToken,
         EnrollmentToken = input.EnrollmentToken,
+        NetworkMode = input.NetworkMode,
         Cache = new SharedSnapshot
         {
             Revision = input.Cache.Revision,
             UpdatedAt = input.Cache.UpdatedAt,
-            Settings = new BrowserSettings { HomePage = input.Cache.Settings.HomePage, PrimaryDeviceId = input.Cache.Settings.PrimaryDeviceId, AutoShareCookies = input.Cache.Settings.AutoShareCookies },
+            Settings = new BrowserSettings
+            {
+                HomePage = input.Cache.Settings.HomePage,
+                PrimaryDeviceId = input.Cache.Settings.PrimaryDeviceId,
+                AutoShareCookies = input.Cache.Settings.AutoShareCookies,
+                Proxy = new ProxySettings { Enabled = input.Cache.Settings.Proxy.Enabled, Host = input.Cache.Settings.Proxy.Host, Port = input.Cache.Settings.Proxy.Port, AllowedPorts = input.Cache.Settings.Proxy.AllowedPorts, BypassList = input.Cache.Settings.Proxy.BypassList }
+            },
             Profiles = input.Cache.Profiles.Select(profile => new SessionProfile
             {
                 Id = profile.Id, Name = profile.Name, Domain = profile.Domain, Enabled = profile.Enabled,
