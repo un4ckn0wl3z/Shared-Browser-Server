@@ -1,0 +1,19 @@
+# .NET build output
+**/bin/
+**/obj/
+
+# Shared Browser runtime data (tokens, cookies, sessions, caches)
+**/browser-data/
+**/server-data/
+**/webview-profile/
+
+# Local logs and temporary files
+*.log
+*.tmp
+*.user
+*.suo
+.vs/
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db

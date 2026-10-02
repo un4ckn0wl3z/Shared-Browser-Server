@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Shared Browser Server</title><link rel="stylesheet" href="/app.css"></head>
+<body>
+  <header><div><span class="eyebrow">CONTROL PLANE</span><h1>Shared Browser Server</h1></div><span id="connection" class="badge off">Disconnected</span></header>
+  <main>
+    <section id="login" class="card login"><div><h2>Administrator access</h2><p>Enter the server administrator token.</p></div><form id="login-form"><input id="token" type="password" placeholder="Admin token" required><button>Connect</button></form></section>
+    <div id="app" hidden>
+      <section class="metrics"><article><span>Revision</span><strong id="revision">—</strong></article><article><span>Devices</span><strong id="device-count">—</strong></article><article><span>Session profiles</span><strong id="profile-count">—</strong></article><article><span>Transport</span><strong>Client/server</strong></article></section>
+      <div class="grid">
+        <section class="card"><div class="head"><div><span class="eyebrow">SHARED CONFIG</span><h2>Browser settings</h2></div></div><form id="settings-form"><label>Shared home page<input id="home-page" type="url" required></label><label>Primary session browser<select id="primary-device"></select></label><label class="check"><input id="auto-share" type="checkbox" checked>Automatically share cookies for every visited domain</label><button>Save settings</button></form></section>
+        <section class="card"><div class="head"><div><span class="eyebrow">ENROLLMENT</span><h2>Connect a browser</h2></div></div><ol><li>Open Shared Browser.</li><li>Choose <strong>Server settings</strong>.</li><li>Enter this server URL and the admin token once.</li><li>The server issues a unique revocable device token.</li></ol></section>
+      </div>
+      <section class="card"><div class="head"><div><span class="eyebrow">CLIENTS</span><h2>Managed browsers</h2></div><button id="refresh" class="secondary">Refresh</button></div><div class="table-wrap"><table><thead><tr><th>Device</th><th>ID</th><th>Last seen</th><th>Status</th><th></th></tr></thead><tbody id="devices"></tbody></table></div></section>
+      <section class="card"><div class="head"><div><span class="eyebrow">SHARED VAULT</span><h2>Cookie and session profiles</h2><p>Domains visited by the primary browser are added automatically.</p></div><button id="new-profile" class="secondary">New profile</button></div><div id="profiles" class="profiles"></div></section>
+      <section id="editor" class="card" hidden><div class="head"><div><span class="eyebrow">PROFILE EDITOR</span><h2 id="editor-title">New profile</h2></div><button id="close-editor" class="ghost">Close</button></div><form id="profile-form"><input id="profile-id" type="hidden"><div class="row"><label>Name<input id="profile-name" required></label><label>Authorized domain<input id="profile-domain" placeholder="example.com" required></label></div><label class="check"><input id="profile-enabled" type="checkbox" checked>Enabled</label><div class="head compact"><h3>Cookies</h3><button type="button" id="add-cookie" class="secondary">Add cookie</button></div><div id="cookies"></div><div class="actions"><button>Save profile</button><button type="button" id="delete-profile" class="danger" hidden>Delete</button></div></form></section>
+    </div>
+  </main>
+  <template id="cookie-template"><div class="cookie"><label>Name<input class="cookie-name" required></label><label>Value<input class="cookie-value" type="password" autocomplete="off" required></label><label>Domain<input class="cookie-domain" placeholder="uses profile domain"></label><label>Path<input class="cookie-path" value="/" required></label><label class="check"><input class="cookie-secure" type="checkbox" checked>Secure</label><label class="check"><input class="cookie-http" type="checkbox" checked>HttpOnly</label><select class="cookie-same"><option>Lax</option><option>Strict</option><option>None</option></select><button type="button" class="remove danger">×</button></div></template>
+  <div id="toast"></div><script src="/app.js"></script>
+</body>
+</html>
