@@ -14,6 +14,7 @@ Each browser independently connects to the management server to synchronize auth
 
 - `server/` — ASP.NET Core management server and web dashboard
 - `client/` — native Windows Shared Browser using WebView2
+- `electron-client/` — cross-platform Shared Browser for Windows, macOS, and Linux
 - Encrypted server-side cookie/session vault
 - Unique device identities and revocable device tokens
 - Automatic per-domain cookie/session profiles
@@ -45,7 +46,7 @@ For browsers on other computers, bind the server to an appropriate private netwo
 
 `SHARED_BROWSER_PROXY_BIND` controls the interface used by the built-in forward proxy. Keep `127.0.0.1` for a local-only installation. For clients on a private network, set it to the server's private interface (or `0.0.0.0`) and protect the port with a firewall. The proxy always requires an active enrolled-device ID and device token; it is not an open unauthenticated proxy.
 
-## Build and open a browser
+## Windows .NET client
 
 ```powershell
 dotnet build client\SharedBrowser.csproj -c Release
@@ -73,6 +74,39 @@ The server issues a random per-device token. The administrator token is discarde
 
 Repeat enrollment for WB2 and WB3. In the dashboard, choose the signed-in browser (normally WB1) as **Primary session browser**. Its stored cookies are scanned on startup, and every domain it visits is added to the shared vault automatically. WB2 and WB3 pull those changes approximately every 2.5 seconds.
 
+## Cross-platform Electron client
+
+The Electron client runs on Windows, macOS, and Linux while the original .NET/WebView2 client remains available. Both clients use the same server API and can share the same cookie/session vault.
+
+Install and start it with Node.js 20 or newer:
+
+```bash
+cd electron-client
+npm install
+npm start -- --profile=WB1
+```
+
+Use a different profile name for every browser instance:
+
+```bash
+npm start -- --profile=WB2
+npm start -- --profile=WB3
+```
+
+On first launch, the settings dialog opens automatically. Enter the management-server URL, a device name, the administrator token as the one-time enrollment token, and choose Direct or Managed proxy mode. Saving restarts and enrolls the client.
+
+Electron stores each named profile in the operating system's application-data directory. Device credentials and the offline shared snapshot use Electron `safeStorage`; Chromium protects its persistent cookie store using the facilities available on the operating system. On Linux, install and unlock a supported secret store such as KWallet, GNOME Keyring, or Secret Service. The client warns when Electron falls back to unencrypted `basic_text` storage.
+
+Create platform installers from the matching operating system:
+
+```bash
+npm run dist:win
+npm run dist:mac
+npm run dist:linux
+```
+
+macOS installers normally must be built and code-signed on macOS. Windows installers should be signed before public distribution.
+
 ## Direct IP or management-server IP
 
 The dashboard's **Forward proxy management** section controls the built-in proxy endpoint, advertised host, port, allowed destination ports, and browser bypass list.
@@ -82,7 +116,7 @@ Each browser independently chooses its route in **Server settings**:
 - **Direct connection — use client IP**: websites connect directly and see the browser computer's public IP.
 - **Managed proxy — use server IP**: HTTP and HTTPS traffic goes through the authenticated management-server proxy, so websites see the management server's outbound IP.
 
-Restart a browser after changing its connection mode or after changing the proxy endpoint. WebView2 fixes proxy routing when its environment starts. HTTPS uses standard `CONNECT` tunneling and remains end-to-end encrypted between the browser and destination; the management proxy does not install a certificate authority or decrypt page contents.
+Restart a browser after changing its connection mode or after changing the proxy endpoint. Both WebView2 and Electron establish proxy routing at startup. HTTPS uses standard `CONNECT` tunneling and remains end-to-end encrypted between the browser and destination; the management proxy does not install a certificate authority or decrypt page contents.
 
 The default destination-port allowlist is `80,443`. Private, loopback, link-local, and multicast destinations are blocked to reduce server-side request-forgery risk.
 
@@ -95,6 +129,6 @@ The default destination-port allowlist is `80,443`. Private, loopback, link-loca
 - Cookie conflicts use server-arrival last-write-wins behavior.
 - Identical updates are deduplicated and do not create new revisions.
 - A revoked browser can no longer pull or push shared data.
-- Browser web traffic does not pass through the management server.
+- In Direct mode, browser web traffic does not pass through the management server. In Managed mode, it passes through the authenticated forward proxy.
 
 The first version deliberately uses the central server as the authority. Direct P2P transport can be added later without changing the browser data model.

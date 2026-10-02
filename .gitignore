@@ -2,6 +2,10 @@
 **/bin/
 **/obj/
 
+# Electron build output and dependencies
+**/node_modules/
+electron-client/dist/
+
 # Shared Browser runtime data (tokens, cookies, sessions, caches)
 **/browser-data/
 **/server-data/

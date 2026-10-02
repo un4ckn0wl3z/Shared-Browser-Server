@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:">
+  <title>Shared Browser</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header>
+    <div id="tabs" class="tabs"></div>
+    <button id="new-tab" class="compact" title="New tab">+</button>
+    <div class="toolbar">
+      <button id="back" title="Back">←</button>
+      <button id="forward" title="Forward">→</button>
+      <button id="reload" title="Reload">↻</button>
+      <input id="address" aria-label="Address" autocomplete="off" spellcheck="false">
+      <button id="go">Go</button>
+      <button id="sync">Sync now</button>
+      <button id="settings">Settings</button>
+      <span id="status">Starting…</span>
+    </div>
+  </header>
+
+  <dialog id="settings-dialog">
+    <form id="settings-form">
+      <div class="dialog-title">
+        <div><strong>Server settings</strong><small id="profile-label"></small></div>
+        <button type="button" id="settings-close" class="compact">×</button>
+      </div>
+      <label>Management server URL<input id="server-url" type="url" required></label>
+      <label>Device name<input id="device-name" maxlength="80" required></label>
+      <label>Enrollment token<input id="enrollment-token" type="password" autocomplete="off"><small id="enrollment-help"></small></label>
+      <label>Connection mode<select id="network-mode">
+        <option value="direct">Direct connection — use client IP</option>
+        <option value="managed">Managed proxy — use server IP</option>
+      </select></label>
+      <div id="proxy-info" class="info"></div>
+      <div id="storage-warning" class="warning" hidden>OS secret storage is unavailable. Install and unlock a system keyring before using production session credentials.</div>
+      <div id="settings-error" class="error"></div>
+      <div class="actions"><button type="button" id="cancel">Cancel</button><button type="submit" class="primary">Save and restart</button></div>
+    </form>
+  </dialog>
+  <script src="renderer.js"></script>
+</body>
+</html>

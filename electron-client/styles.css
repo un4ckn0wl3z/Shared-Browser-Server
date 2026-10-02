@@ -1,0 +1,37 @@
+:root { color-scheme: light; font-family: Inter, "Segoe UI", system-ui, sans-serif; }
+* { box-sizing: border-box; }
+body { margin: 0; overflow: hidden; background: #f5f7fb; color: #152033; }
+header { height: 112px; padding: 7px 8px 8px; border-bottom: 1px solid #ccd3df; background: #edf1f7; }
+button, input, select { font: inherit; }
+button { border: 1px solid #c4cbd7; border-radius: 7px; background: #fff; color: #263246; padding: 7px 11px; cursor: pointer; }
+button:hover:not(:disabled) { background: #f7f9fc; border-color: #9ba8ba; }
+button:disabled { opacity: .4; cursor: default; }
+.tabs { display: inline-flex; gap: 4px; max-width: calc(100% - 52px); height: 38px; overflow-x: auto; vertical-align: top; }
+.tab { display: inline-flex; align-items: center; justify-content: space-between; width: 190px; min-width: 120px; height: 34px; padding: 6px 7px 6px 11px; border-radius: 9px 9px 4px 4px; background: #dfe5ee; border-color: transparent; }
+.tab.active { background: #fff; border-color: #c8d0dc; }
+.tab span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tab-close { margin-left: 8px; border-radius: 4px; padding: 0 4px; font-size: 18px; line-height: 20px; }
+.tab-close:hover { background: #d8deea; }
+.compact { width: 34px; height: 34px; padding: 2px; font-size: 20px; }
+.toolbar { display: flex; align-items: center; gap: 6px; margin-top: 5px; }
+.toolbar button { height: 34px; white-space: nowrap; }
+#address { flex: 1; min-width: 180px; height: 34px; border: 1px solid #bcc5d3; border-radius: 8px; padding: 6px 10px; background: #fff; }
+#address:focus { outline: 2px solid #6596e8; border-color: transparent; }
+#status { min-width: 165px; max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; text-align: right; }
+.status-ok { color: #147647; }
+.status-error { color: #b3261e; }
+dialog { width: min(540px, calc(100vw - 40px)); border: 0; border-radius: 14px; padding: 0; box-shadow: 0 18px 60px #15203355; }
+dialog::backdrop { background: #15203366; }
+form { display: grid; gap: 15px; padding: 22px; }
+.dialog-title { display: flex; justify-content: space-between; align-items: start; font-size: 20px; }
+.dialog-title small { display: block; color: #667085; font-size: 12px; margin-top: 3px; font-weight: normal; }
+label { display: grid; gap: 6px; color: #344054; font-size: 13px; font-weight: 600; }
+label input, label select { width: 100%; padding: 9px 10px; border: 1px solid #c8d0dc; border-radius: 7px; background: #fff; }
+label small { color: #667085; font-weight: normal; }
+.info, .warning { padding: 10px 12px; border-radius: 8px; font-size: 13px; }
+.info { color: #205493; background: #eaf2fd; }
+.warning { color: #7a4b00; background: #fff3d6; }
+.error { min-height: 18px; color: #b3261e; font-size: 13px; }
+.actions { display: flex; justify-content: flex-end; gap: 8px; }
+.primary { background: #2868c7; border-color: #2868c7; color: white; }
+.primary:hover { background: #1e57ac !important; }
