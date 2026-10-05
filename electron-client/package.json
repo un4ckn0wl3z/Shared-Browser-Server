@@ -1,6 +1,6 @@
 {
   "name": "shared-browser-electron",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Cross-platform Shared Browser client",
   "main": "main.cjs",
   "author": "Shared Browser Server contributors",
