@@ -47,5 +47,9 @@
       ],
       "category": "Network"
     }
+  },
+  "allowScripts": {
+    "electron@38.8.6": true
   }
 }
+ 
