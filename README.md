@@ -142,6 +142,8 @@ Repeat enrollment for WB2 and WB3. In the dashboard, choose the signed-in browse
 
 The Electron client runs on Windows, macOS, and Linux while the original .NET/WebView2 client remains available. Both clients use the same server API and can share the same cookie/session vault.
 
+Ready-to-use Windows and macOS installers are published on the [GitHub Releases page](https://github.com/un4ckn0wl3z/Shared-Browser-Server/releases). Release tags build a Windows x64 NSIS installer and a universal macOS DMG on native GitHub runners. These community builds are currently unsigned, so Windows SmartScreen or macOS Gatekeeper may display a warning; review the repository source before allowing an unsigned build.
+
 Install and start it with Node.js 20 or newer:
 
 ```bash

@@ -6,12 +6,13 @@
   "author": "Shared Browser Server contributors",
   "license": "UNLICENSED",
   "private": true,
+  "packageManager": "pnpm@11.19.0",
   "scripts": {
     "start": "electron .",
     "check": "node --check main.cjs && node --check preload.cjs && node --check renderer.js",
     "dist": "electron-builder",
-    "dist:win": "electron-builder --win",
-    "dist:mac": "electron-builder --mac",
+    "dist:win": "electron-builder --win nsis --x64",
+    "dist:mac": "electron-builder --mac dmg --universal",
     "dist:linux": "electron-builder --linux"
   },
   "devDependencies": {
@@ -33,6 +34,7 @@
     "directories": {
       "output": "dist"
     },
+    "artifactName": "Shared-Browser-${version}-${os}-${arch}.${ext}",
     "win": {
       "target": "nsis"
     },
