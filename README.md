@@ -181,8 +181,13 @@ Each browser independently chooses its route in **Server settings**:
 
 - **Direct connection — use client IP**: websites connect directly and see the browser computer's public IP.
 - **Managed proxy — use server IP**: HTTP and HTTPS traffic goes through the authenticated management-server proxy, so websites see the management server's outbound IP.
+- **Strict privacy**: requires Managed proxy mode, removes Chromium's implicit direct bypass routes, blocks browsing if the proxy configuration is unavailable, restricts WebRTC from using non-proxied UDP, and denies website permission prompts such as location, camera, microphone, and notifications.
 
 Restart a browser after changing its connection mode or after changing the proxy endpoint. Both WebView2 and Electron establish proxy routing at startup. HTTPS uses standard `CONNECT` tunneling and remains end-to-end encrypted between the browser and destination; the management proxy does not install a certificate authority or decrypt page contents.
+
+Strict privacy is leak reduction, not anonymity. Signed-in accounts, shared cookies, browser fingerprints, and account activity can still identify a user. Because WebRTC cannot use direct UDP in this mode, browser-based voice or video calls may fall back to TCP or fail.
+
+The Electron settings dialog includes **Run privacy check**, which verifies that Chromium resolves both public and loopback destinations through the configured proxy and confirms that the non-proxied WebRTC policy was applied. Run it after saving and restarting the browser.
 
 The default destination-port allowlist is `80,443`. Private, loopback, link-local, and multicast destinations are blocked to reduce server-side request-forgery risk.
 

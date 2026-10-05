@@ -44,6 +44,7 @@ public static class ConfigStore
         DeviceToken = input.DeviceToken,
         EnrollmentToken = input.EnrollmentToken,
         NetworkMode = input.NetworkMode,
+        StrictPrivacy = input.StrictPrivacy,
         Cache = new SharedSnapshot
         {
             Revision = input.Cache.Revision,

@@ -28,6 +28,9 @@ form { display: grid; gap: 15px; padding: 22px; }
 label { display: grid; gap: 6px; color: #344054; font-size: 13px; font-weight: 600; }
 label input, label select { width: 100%; padding: 9px 10px; border: 1px solid #c8d0dc; border-radius: 7px; background: #fff; }
 label small { color: #667085; font-weight: normal; }
+.check { display: grid; grid-template-columns: auto 1fr; align-items: start; gap: 9px; }
+.check > input { width: auto; margin: 3px 0 0; }
+.check span { display: grid; gap: 3px; }
 .info, .warning { padding: 10px 12px; border-radius: 8px; font-size: 13px; }
 .info { color: #205493; background: #eaf2fd; }
 .warning { color: #7a4b00; background: #fff3d6; }

@@ -53,11 +53,14 @@ public sealed class MainForm : Form
         try
         {
             var options = new CoreWebView2EnvironmentOptions();
+            if (_config.StrictPrivacy && !_config.NetworkMode.Equals("managed", StringComparison.OrdinalIgnoreCase)) throw new InvalidOperationException("Strict privacy requires Managed proxy mode. Direct browsing is blocked.");
             if (_config.NetworkMode.Equals("managed", StringComparison.OrdinalIgnoreCase))
             {
                 var proxy = _config.Cache.Settings.Proxy;
-                if (!proxy.Enabled) throw new InvalidOperationException("Managed proxy mode is selected, but the proxy is disabled on the management server. Choose Direct mode or enable the proxy in the dashboard.");
-                options.AdditionalBrowserArguments = $"--proxy-server=http://{proxy.Host}:{proxy.Port} --proxy-bypass-list=\"{proxy.BypassList}\"";
+                if (!proxy.Enabled) throw new InvalidOperationException(_config.StrictPrivacy ? "Strict privacy is blocking browsing because the managed proxy is disabled on the server." : "Managed proxy mode is selected, but the proxy is disabled on the management server. Choose Direct mode or enable the proxy in the dashboard.");
+                var bypassList = _config.StrictPrivacy ? "<-loopback>" : proxy.BypassList;
+                options.AdditionalBrowserArguments = $"--proxy-server=http://{proxy.Host}:{proxy.Port} --proxy-bypass-list=\"{bypassList}\"";
+                if (_config.StrictPrivacy) options.AdditionalBrowserArguments += " --force-webrtc-ip-handling-policy=disable_non_proxied_udp";
             }
             _environment = await CoreWebView2Environment.CreateAsync(null, ConfigStore.ProfileDirectory, options);
             await NewTabAsync(_config.Cache.Settings.HomePage);
@@ -113,6 +116,7 @@ public sealed class MainForm : Form
         var page = new TabPage("New tab"); var web = new WebView2 { Dock = DockStyle.Fill }; page.Controls.Add(web); _tabs.TabPages.Add(page); _tabs.SelectedTab = page;
         await web.EnsureCoreWebView2Async(_environment);
         web.CoreWebView2.Settings.IsStatusBarEnabled = false;
+        web.CoreWebView2.PermissionRequested += (_, args) => { if (_config.StrictPrivacy) args.State = CoreWebView2PermissionState.Deny; };
         web.CoreWebView2.BasicAuthenticationRequested += (_, args) =>
         {
             if (!_config.NetworkMode.Equals("managed", StringComparison.OrdinalIgnoreCase) || !args.Challenge.Contains("Shared Browser Proxy", StringComparison.OrdinalIgnoreCase)) return;
@@ -243,7 +247,7 @@ public sealed class MainForm : Form
     private WebView2? Current() => _tabs.SelectedTab?.Controls.OfType<WebView2>().FirstOrDefault();
     private void UpdateToolbar() { var web = Current(); _back.Enabled = web?.CanGoBack == true; _forward.Enabled = web?.CanGoForward == true; _address.Text = DisplayAddress(web?.Source); }
     private static string DisplayAddress(Uri? source) => source?.AbsoluteUri == "about:blank" ? "" : source?.ToString() ?? "";
-    private void SetStatus(string text, bool error) { _syncStatus.Text = $"{text} • {(_config.NetworkMode.Equals("managed", StringComparison.OrdinalIgnoreCase) ? "Server IP" : "Client IP")}"; _syncStatus.ForeColor = error ? Color.Firebrick : Color.SeaGreen; }
+    private void SetStatus(string text, bool error) { _syncStatus.Text = $"{text} • {(_config.NetworkMode.Equals("managed", StringComparison.OrdinalIgnoreCase) ? $"Server IP{(_config.StrictPrivacy ? " • Strict" : "")}" : "Client IP")}"; _syncStatus.ForeColor = error ? Color.Firebrick : Color.SeaGreen; }
     private static void LogSyncError(Exception error)
     {
         try { File.AppendAllText(Path.Combine(ConfigStore.DataDirectory, "sync-errors.log"), $"{DateTimeOffset.Now:O} {error.Message}{Environment.NewLine}"); } catch { }

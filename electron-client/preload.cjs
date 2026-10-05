@@ -10,6 +10,7 @@ contextBridge.exposeInMainWorld('sharedBrowser', {
   selectTab: (id) => ipcRenderer.invoke('browser:select-tab', id),
   closeTab: (id) => ipcRenderer.invoke('browser:close-tab', id),
   syncNow: () => ipcRenderer.invoke('browser:sync-now'),
+  privacyCheck: () => ipcRenderer.invoke('browser:privacy-check'),
   setSettingsOpen: (open) => ipcRenderer.invoke('browser:settings-open', Boolean(open)),
   saveSettings: (settings) => ipcRenderer.invoke('browser:save-settings', settings),
   onState: (callback) => ipcRenderer.on('browser:state', (_, value) => callback(value)),

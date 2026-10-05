@@ -36,7 +36,11 @@
         <option value="direct">Direct connection — use client IP</option>
         <option value="managed">Managed proxy — use server IP</option>
       </select></label>
+      <label class="check"><input id="strict-privacy" type="checkbox"><span>Strict privacy mode<small>Requires Managed proxy. Blocks direct fallback and non-proxied WebRTC, and denies website permission prompts.</small></span></label>
       <div id="proxy-info" class="info"></div>
+      <div id="privacy-warning" class="warning" hidden>Strict privacy reduces IP leaks but does not hide signed-in accounts, shared cookies, or browser fingerprints.</div>
+      <div><button type="button" id="privacy-check">Run privacy check</button></div>
+      <div id="privacy-result" class="info" hidden></div>
       <div id="storage-warning" class="warning" hidden>OS secret storage is unavailable. Install and unlock a system keyring before using production session credentials.</div>
       <div id="settings-error" class="error"></div>
       <div class="actions"><button type="button" id="cancel">Cancel</button><button type="submit" class="primary">Save and restart</button></div>

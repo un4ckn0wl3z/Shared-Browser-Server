@@ -46,6 +46,8 @@ async function openSettings() {
   element('enrollment-token').required = !currentConfig.enrolled;
   element('enrollment-help').textContent = currentConfig.enrolled ? 'Already enrolled. Leave empty to keep the current device token.' : 'Enter the server administrator token once to enroll this browser.';
   element('network-mode').value = currentConfig.networkMode;
+  element('strict-privacy').checked = currentConfig.strictPrivacy === true;
+  element('privacy-warning').hidden = !currentConfig.strictPrivacy;
   element('proxy-info').textContent = currentConfig.proxy?.enabled
     ? `Managed proxy available at ${currentConfig.proxy.host}:${currentConfig.proxy.port}.`
     : 'Managed proxy is disabled on the server.';
@@ -76,6 +78,25 @@ element('settings-close').addEventListener('click', closeSettings);
 element('cancel').addEventListener('click', closeSettings);
 dialog.addEventListener('cancel', event => { event.preventDefault(); closeSettings(); });
 address.addEventListener('keydown', event => { if (event.key === 'Enter') navigate(); });
+element('strict-privacy').addEventListener('change', event => {
+  if (event.target.checked) element('network-mode').value = 'managed';
+  element('privacy-warning').hidden = !event.target.checked;
+});
+element('privacy-check').addEventListener('click', async () => {
+  const output = element('privacy-result');
+  output.hidden = false;
+  output.textContent = 'Checking Chromium routes…';
+  try {
+    const result = await api.privacyCheck();
+    output.className = result.ok ? 'info' : 'warning';
+    output.textContent = result.ok
+      ? `Passed — external: ${result.externalRoute}; loopback: ${result.loopbackRoute}; WebRTC: ${result.webRtcPolicy}.`
+      : `Not protected — strict: ${result.strictPrivacy ? 'on' : 'off'}; external: ${result.externalRoute || 'none'}; loopback: ${result.loopbackRoute || 'none'}; WebRTC: ${result.webRtcPolicy}. Save and restart after enabling Strict privacy.`;
+  } catch (error) {
+    output.className = 'warning';
+    output.textContent = `Privacy check failed: ${error.message}`;
+  }
+});
 
 element('settings-form').addEventListener('submit', async event => {
   event.preventDefault();
@@ -86,7 +107,8 @@ element('settings-form').addEventListener('submit', async event => {
       serverUrl: element('server-url').value,
       deviceName: element('device-name').value,
       enrollmentToken: element('enrollment-token').value,
-      networkMode: element('network-mode').value
+      networkMode: element('network-mode').value,
+      strictPrivacy: element('strict-privacy').checked
     });
   } catch (failure) {
     error.textContent = failure.message;

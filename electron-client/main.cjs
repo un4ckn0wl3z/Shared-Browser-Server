@@ -7,6 +7,7 @@ const TOOLBAR_HEIGHT = 112;
 const SYNC_INTERVAL_MS = 2500;
 const profileName = sanitizeProfile(readArgument('profile') || process.env.SHARED_BROWSER_PROFILE || 'default');
 app.setPath('userData', path.join(app.getPath('appData'), 'Shared Browser', profileName));
+if (readStrictPrivacySetting()) app.commandLine.appendSwitch('force-webrtc-ip-handling-policy', 'disable_non_proxied_udp');
 
 let mainWindow;
 let browserSession;
@@ -60,12 +61,17 @@ function defaultConfig() {
     deviceId: crypto.randomUUID().replaceAll('-', ''),
     deviceName: profileName,
     networkMode: 'direct',
+    strictPrivacy: false,
     secrets: { deviceToken: '', enrollmentToken: '', cache: defaultSnapshot() }
   };
 }
 
 function configPath() {
   return path.join(app.getPath('userData'), 'client-config.json');
+}
+
+function readStrictPrivacySetting() {
+  try { return JSON.parse(fs.readFileSync(configPath(), 'utf8')).strictPrivacy === true; } catch { return false; }
 }
 
 function encrypt(value) {
@@ -93,6 +99,7 @@ function loadConfig() {
       deviceId: /^[a-f0-9]{32}$/i.test(disk.deviceId || '') ? disk.deviceId.toLowerCase() : fresh.deviceId,
       deviceName: String(disk.deviceName || profileName).slice(0, 80),
       networkMode: disk.networkMode === 'managed' ? 'managed' : 'direct',
+      strictPrivacy: disk.strictPrivacy === true,
       secrets: {
         deviceToken: String(secrets?.deviceToken || ''),
         enrollmentToken: String(secrets?.enrollmentToken || ''),
@@ -111,6 +118,7 @@ function saveConfig() {
     deviceId: config.deviceId,
     deviceName: config.deviceName,
     networkMode: config.networkMode,
+    strictPrivacy: config.strictPrivacy,
     protected: encrypt(config.secrets)
   };
   const target = configPath();
@@ -144,7 +152,7 @@ function status(text, error = false) {
   send('browser:status', {
     text,
     error,
-    route: config?.networkMode === 'managed' ? 'Server IP' : 'Client IP'
+    route: config?.networkMode === 'managed' ? `Server IP${config.strictPrivacy ? ' • Strict' : ''}` : 'Client IP'
   });
 }
 
@@ -476,21 +484,73 @@ function scheduleCookiePush() {
 
 async function configureProxy() {
   const proxy = config.secrets.cache.settings.proxy;
+  if (config.strictPrivacy && config.networkMode !== 'managed') {
+    await blockBrowserTraffic();
+    throw new Error('Strict privacy requires Managed proxy mode. Direct browsing is blocked.');
+  }
   if (config.networkMode !== 'managed') {
     await browserSession.setProxy({ mode: 'direct' });
     return;
   }
-  if (!proxy?.enabled) throw new Error('Managed proxy is selected, but it is disabled on the server. Choose Direct mode or enable it in the dashboard.');
+  if (!proxy?.enabled) {
+    if (config.strictPrivacy) await blockBrowserTraffic();
+    throw new Error(config.strictPrivacy
+      ? 'Strict privacy is blocking browsing because the managed proxy is disabled on the server.'
+      : 'Managed proxy is selected, but it is disabled on the server. Choose Direct mode or enable it in the dashboard.');
+  }
   const host = String(proxy.host).includes(':') && !String(proxy.host).startsWith('[') ? `[${proxy.host}]` : proxy.host;
   await browserSession.setProxy({
     mode: 'fixed_servers',
     proxyRules: `http://${host}:${proxy.port}`,
-    proxyBypassRules: String(proxy.bypassList || '').split(';').filter(Boolean).join(',')
+    proxyBypassRules: config.strictPrivacy ? '<-loopback>' : String(proxy.bypassList || '').split(';').filter(Boolean).join(',')
   });
+  if (config.strictPrivacy) {
+    const route = await browserSession.resolveProxy('https://example.com/');
+    if (routeIsDirect(route)) {
+      await blockBrowserTraffic();
+      throw new Error('Strict privacy blocked browsing because Chromium resolved a direct route.');
+    }
+  }
+}
+
+async function blockBrowserTraffic() {
+  await browserSession.setProxy({
+    mode: 'fixed_servers',
+    proxyRules: 'http://127.0.0.1:1',
+    proxyBypassRules: '<-loopback>'
+  });
+}
+
+function configurePrivacyPermissions() {
+  if (!config.strictPrivacy) return;
+  browserSession.setPermissionCheckHandler(() => false);
+  browserSession.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false));
+}
+
+function routeIsDirect(value) {
+  return !value || /(^|;)\s*DIRECT\s*(;|$)/i.test(value);
+}
+
+async function privacyCheck() {
+  const externalRoute = await browserSession.resolveProxy('https://example.com/');
+  const loopbackRoute = await browserSession.resolveProxy('http://127.0.0.1/');
+  const webRtcPolicy = app.commandLine.getSwitchValue('force-webrtc-ip-handling-policy');
+  const ok = config.strictPrivacy
+    && !routeIsDirect(externalRoute)
+    && !routeIsDirect(loopbackRoute)
+    && webRtcPolicy === 'disable_non_proxied_udp';
+  return {
+    ok,
+    strictPrivacy: config.strictPrivacy,
+    externalRoute,
+    loopbackRoute,
+    webRtcPolicy: webRtcPolicy || 'default'
+  };
 }
 
 async function startClient() {
   try {
+    if (config.strictPrivacy) await blockBrowserTraffic();
     await ensureEnrolled();
     await pullSnapshot(false);
     await configureProxy();
@@ -513,6 +573,7 @@ function publicConfig() {
     deviceName: config.deviceName,
     enrolled: Boolean(config.secrets.deviceToken),
     networkMode: config.networkMode,
+    strictPrivacy: config.strictPrivacy,
     revision: config.secrets.cache.revision,
     proxy: config.secrets.cache.settings.proxy,
     secureStorage: safeStorage.isEncryptionAvailable() && backend !== 'basic_text'
@@ -532,6 +593,7 @@ function registerIpc() {
     if (isPrimary()) await pushAllStoredCookies();
     await pullSnapshot(true);
   });
+  ipcMain.handle('browser:privacy-check', privacyCheck);
   ipcMain.handle('browser:settings-open', (_, open) => {
     settingsOpen = Boolean(open);
     const tab = tabs.get(activeTabId);
@@ -547,13 +609,18 @@ function registerIpc() {
     const deviceName = String(input.deviceName || '').trim();
     if (!deviceName || deviceName.length > 80) throw new Error('Device name must be between 1 and 80 characters.');
     const serverUrl = String(input.serverUrl).trim().replace(/\/$/, '');
+    const networkMode = input.networkMode === 'managed' ? 'managed' : 'direct';
+    const strictPrivacy = input.strictPrivacy === true;
+    if (strictPrivacy && networkMode !== 'managed') throw new Error('Strict privacy requires Managed proxy mode.');
+    if (strictPrivacy && !config.secrets.cache.settings.proxy?.enabled) throw new Error('Enable the managed proxy in the server dashboard before turning on Strict privacy.');
     if (serverUrl !== config.serverUrl) {
       config.secrets.deviceToken = '';
       config.secrets.cache = defaultSnapshot();
     }
     config.serverUrl = serverUrl;
     config.deviceName = deviceName;
-    config.networkMode = input.networkMode === 'managed' ? 'managed' : 'direct';
+    config.networkMode = networkMode;
+    config.strictPrivacy = strictPrivacy;
     if (String(input.enrollmentToken || '').trim()) config.secrets.enrollmentToken = String(input.enrollmentToken).trim();
     if (!config.secrets.deviceToken && !config.secrets.enrollmentToken) throw new Error('An enrollment token is required for a new browser or server.');
     saveConfig();
@@ -572,6 +639,7 @@ app.on('login', (event, webContents, details, authInfo, callback) => {
 app.whenReady().then(async () => {
   config = loadConfig();
   browserSession = session.fromPartition('persist:shared-browser');
+  configurePrivacyPermissions();
   registerIpc();
   createWindow();
   await startClient();

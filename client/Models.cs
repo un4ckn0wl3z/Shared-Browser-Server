@@ -8,6 +8,7 @@ public sealed class ClientConfig
     public string DeviceToken { get; set; } = "";
     public string EnrollmentToken { get; set; } = "";
     public string NetworkMode { get; set; } = "direct";
+    public bool StrictPrivacy { get; set; }
     public SharedSnapshot Cache { get; set; } = new();
 }
 
