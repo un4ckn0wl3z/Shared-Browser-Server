@@ -198,7 +198,9 @@ public sealed class SharedStateStore
 
     public async Task UpdateSettingsAsync(BrowserSettings settings)
     {
-        if (!Uri.TryCreate(settings.HomePage, UriKind.Absolute, out var home) || home.Scheme is not ("http" or "https")) throw new InvalidOperationException("Home page must be a valid HTTP or HTTPS URL");
+        var requestedHomePage = settings.HomePage?.Trim() ?? "";
+        Uri? home = null;
+        if (requestedHomePage.Length > 0 && (!Uri.TryCreate(requestedHomePage, UriKind.Absolute, out home) || home.Scheme is not ("http" or "https"))) throw new InvalidOperationException("Home page must be empty or a valid HTTP or HTTPS URL");
         var primaryDeviceId = string.IsNullOrWhiteSpace(settings.PrimaryDeviceId) ? "" : NormalizeId(settings.PrimaryDeviceId);
         settings.Proxy ??= new ProxySettings();
         ValidateProxySettings(settings.Proxy);
@@ -206,7 +208,7 @@ public sealed class SharedStateStore
         try
         {
             if (primaryDeviceId.Length > 0 && !_state.Devices.Any(item => item.Id == primaryDeviceId && !item.Revoked)) throw new InvalidOperationException("Primary browser must be an active enrolled device");
-            _state.Settings.HomePage = home.AbsoluteUri;
+            _state.Settings.HomePage = home?.AbsoluteUri ?? "";
             _state.Settings.PrimaryDeviceId = primaryDeviceId;
             _state.Settings.AutoShareCookies = settings.AutoShareCookies;
             _state.Settings.Proxy = CloneProxySettings(settings.Proxy);
@@ -324,6 +326,7 @@ public sealed class SharedStateStore
         if (!File.Exists(_path)) return new SharedState();
         var disk = JsonSerializer.Deserialize<SharedState>(File.ReadAllText(_path), JsonOptions) ?? new SharedState();
         disk.Settings ??= new BrowserSettings();
+        if (disk.Settings.HomePage is "https://example.com/" or "https://example.com") disk.Settings.HomePage = "";
         disk.Settings.Proxy ??= new ProxySettings();
         foreach (var cookie in disk.Profiles.SelectMany(profile => profile.Cookies)) cookie.Value = Decrypt(cookie.Value);
         return disk;
@@ -440,7 +443,7 @@ public sealed class SharedState
     public List<SharedBookmark> Bookmarks { get; set; } = [];
 }
 
-public sealed class BrowserSettings { public string HomePage { get; set; } = "https://example.com/"; public string PrimaryDeviceId { get; set; } = ""; public bool AutoShareCookies { get; set; } = true; public ProxySettings Proxy { get; set; } = new(); }
+public sealed class BrowserSettings { public string HomePage { get; set; } = ""; public string PrimaryDeviceId { get; set; } = ""; public bool AutoShareCookies { get; set; } = true; public ProxySettings Proxy { get; set; } = new(); }
 public sealed class ProxySettings { public bool Enabled { get; set; } public string Host { get; set; } = "127.0.0.1"; public int Port { get; set; } = 8899; public string AllowedPorts { get; set; } = "80,443"; public string BypassList { get; set; } = "localhost;127.0.0.1"; }
 public sealed class SessionProfile { public string Id { get; set; } = ""; public string Name { get; set; } = ""; public string Domain { get; set; } = ""; public bool Enabled { get; set; } = true; public List<SharedCookie> Cookies { get; set; } = []; }
 public sealed class SharedCookie { public string Name { get; set; } = ""; public string Value { get; set; } = ""; public string Domain { get; set; } = ""; public string Path { get; set; } = "/"; public bool Secure { get; set; } = true; public bool HttpOnly { get; set; } = true; public string SameSite { get; set; } = "Lax"; public DateTimeOffset UpdatedAt { get; set; } public string SourceDeviceId { get; set; } = ""; }

@@ -20,7 +20,7 @@ public sealed class SharedSnapshot
     public List<SharedBookmark> Bookmarks { get; set; } = [];
 }
 
-public sealed class BrowserSettings { public string HomePage { get; set; } = "https://example.com/"; public string PrimaryDeviceId { get; set; } = ""; public bool AutoShareCookies { get; set; } = true; public ProxySettings Proxy { get; set; } = new(); }
+public sealed class BrowserSettings { public string HomePage { get; set; } = ""; public string PrimaryDeviceId { get; set; } = ""; public bool AutoShareCookies { get; set; } = true; public ProxySettings Proxy { get; set; } = new(); }
 public sealed class ProxySettings { public bool Enabled { get; set; } public string Host { get; set; } = "127.0.0.1"; public int Port { get; set; } = 8899; public string AllowedPorts { get; set; } = "80,443"; public string BypassList { get; set; } = "localhost;127.0.0.1"; }
 public sealed class SessionProfile { public string Id { get; set; } = ""; public string Name { get; set; } = ""; public string Domain { get; set; } = ""; public bool Enabled { get; set; } = true; public List<SharedCookie> Cookies { get; set; } = []; }
 public sealed class SharedCookie { public string Name { get; set; } = ""; public string Value { get; set; } = ""; public string Domain { get; set; } = ""; public string Path { get; set; } = "/"; public bool Secure { get; set; } = true; public bool HttpOnly { get; set; } = true; public string SameSite { get; set; } = "Lax"; public DateTimeOffset UpdatedAt { get; set; } public string SourceDeviceId { get; set; } = ""; }

@@ -121,10 +121,10 @@ public sealed class MainForm : Form
         };
         web.CoreWebView2.NavigationStarting += async (_, args) => await PrepareNavigationAsync(web, args);
         web.CoreWebView2.NavigationCompleted += async (_, _) => { UpdateToolbar(); await PushCurrentDomainAsync(web); };
-        web.CoreWebView2.SourceChanged += (_, _) => { if (Current() == web) _address.Text = web.Source?.ToString() ?? ""; };
+        web.CoreWebView2.SourceChanged += (_, _) => { if (Current() == web) _address.Text = DisplayAddress(web.Source); };
         web.CoreWebView2.DocumentTitleChanged += (_, _) => page.Text = ShortTitle(web.CoreWebView2.DocumentTitle);
         await ApplyAllCookiesAsync(web);
-        await NavigateAsync(web, string.IsNullOrWhiteSpace(url) ? "https://example.com/" : url);
+        await NavigateAsync(web, url ?? "");
     }
 
     private async Task PrepareNavigationAsync(WebView2 web, CoreWebView2NavigationStartingEventArgs args)
@@ -234,12 +234,15 @@ public sealed class MainForm : Form
     private async Task NavigateCurrentAsync(string value) { var web = Current(); if (web is not null) await NavigateAsync(web, value); }
     private static async Task NavigateAsync(WebView2 web, string value)
     {
-        var url = value.Trim(); if (!url.Contains("://", StringComparison.Ordinal)) url = "https://" + url;
+        var url = value.Trim();
+        if (string.IsNullOrWhiteSpace(url) || url.Equals("about:blank", StringComparison.OrdinalIgnoreCase)) { web.CoreWebView2.Navigate("about:blank"); return; }
+        if (!url.Contains("://", StringComparison.Ordinal)) url = "https://" + url;
         if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) || uri.Scheme is not ("http" or "https")) { MessageBox.Show("Enter a valid HTTP or HTTPS address."); return; }
         web.CoreWebView2.Navigate(uri.AbsoluteUri); await Task.CompletedTask;
     }
     private WebView2? Current() => _tabs.SelectedTab?.Controls.OfType<WebView2>().FirstOrDefault();
-    private void UpdateToolbar() { var web = Current(); _back.Enabled = web?.CanGoBack == true; _forward.Enabled = web?.CanGoForward == true; _address.Text = web?.Source?.ToString() ?? ""; }
+    private void UpdateToolbar() { var web = Current(); _back.Enabled = web?.CanGoBack == true; _forward.Enabled = web?.CanGoForward == true; _address.Text = DisplayAddress(web?.Source); }
+    private static string DisplayAddress(Uri? source) => source?.AbsoluteUri == "about:blank" ? "" : source?.ToString() ?? "";
     private void SetStatus(string text, bool error) { _syncStatus.Text = $"{text} • {(_config.NetworkMode.Equals("managed", StringComparison.OrdinalIgnoreCase) ? "Server IP" : "Client IP")}"; _syncStatus.ForeColor = error ? Color.Firebrick : Color.SeaGreen; }
     private static void LogSyncError(Exception error)
     {

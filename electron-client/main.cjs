@@ -44,7 +44,7 @@ function defaultSnapshot() {
     revision: 0,
     updatedAt: new Date(0).toISOString(),
     settings: {
-      homePage: 'https://example.com/',
+      homePage: '',
       primaryDeviceId: '',
       autoShareCookies: true,
       proxy: { enabled: false, host: '127.0.0.1', port: 8899, allowedPorts: '80,443', bypassList: 'localhost;127.0.0.1' }
@@ -123,6 +123,8 @@ function normalizeSnapshot(input) {
   const fallback = defaultSnapshot();
   if (!input || typeof input !== 'object') return fallback;
   input.settings ||= fallback.settings;
+  if (input.settings.homePage === 'https://example.com/' || input.settings.homePage === 'https://example.com') input.settings.homePage = '';
+  if (typeof input.settings.homePage !== 'string') input.settings.homePage = fallback.settings.homePage;
   input.settings.proxy ||= fallback.settings.proxy;
   input.profiles = Array.isArray(input.profiles) ? input.profiles : [];
   input.bookmarks = Array.isArray(input.bookmarks) ? input.bookmarks : [];
@@ -198,8 +200,9 @@ function publishTabs() {
 
 function publishNavigationState() {
   const tab = tabs.get(activeTabId);
+  const currentUrl = tab?.view.webContents.getURL() || '';
   send('browser:state', {
-    url: tab?.view.webContents.getURL() || '',
+    url: currentUrl === 'about:blank' ? '' : currentUrl,
     canGoBack: tab?.view.webContents.navigationHistory.canGoBack() || false,
     canGoForward: tab?.view.webContents.navigationHistory.canGoForward() || false
   });
@@ -207,6 +210,7 @@ function publishNavigationState() {
 
 function normalizeAddress(value) {
   let text = String(value || '').trim();
+  if (!text || text.toLowerCase() === 'about:blank') return 'about:blank';
   if (!text.includes('://')) text = `https://${text}`;
   const url = new URL(text);
   if (!['http:', 'https:'].includes(url.protocol)) throw new Error('Enter a valid HTTP or HTTPS address.');
