@@ -24,7 +24,7 @@ function renderTabs(tabs) {
 }
 
 function updateState(state) {
-  address.value = state.url || '';
+  if (document.activeElement !== address) address.value = state.url || '';
   element('back').disabled = !state.canGoBack;
   element('forward').disabled = !state.canGoForward;
 }
@@ -60,7 +60,9 @@ function closeSettings() {
 }
 
 async function navigate() {
-  try { await api.navigate(address.value); } catch (error) { updateStatus({ text: error.message, route: '', error: true }); }
+  const target = address.value;
+  address.blur();
+  try { await api.navigate(target); } catch (error) { updateStatus({ text: error.message, route: '', error: true }); }
 }
 
 element('back').addEventListener('click', api.back);
