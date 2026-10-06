@@ -1,14 +1,60 @@
 # Shared Browser System
 
-This system replaces the proxy design with a client/server browser architecture:
+Shared Browser is a centrally managed browser system for synchronizing authorized cookie-based sessions across multiple browser profiles. Each browser independently connects to the management server, while website traffic can either connect directly or use the server's authenticated forward proxy.
 
-```text
-Shared Browser WB1 ─┐
-Shared Browser WB2 ─┼── Browser Management Server ── encrypted shared vault
-Shared Browser WB3 ─┘
+## Architecture
+
+```mermaid
+flowchart LR
+    Admin[Administrator] -->|Dashboard and API| Server[Browser Management Server]
+
+    subgraph Clients[Managed browser clients]
+        WB1[WB1 - primary writer]
+        WB2[WB2 - consumer]
+        WB3[WB3 - consumer]
+    end
+
+    WB1 <-->|Device-authenticated sync API| Server
+    WB2 <-->|Device-authenticated sync API| Server
+    WB3 <-->|Device-authenticated sync API| Server
+    Server <--> Vault[(Encrypted cookie vault)]
+    Server --> Proxy[Authenticated forward proxy]
+
+    WB1 -. Direct mode .-> Sites[Authorized websites]
+    WB2 -. Direct mode .-> Sites
+    WB3 -. Direct mode .-> Sites
+    WB1 -->|Managed mode| Proxy
+    WB2 -->|Managed mode| Proxy
+    WB3 -->|Managed mode| Proxy
+    Proxy --> Sites
 ```
 
-Each browser independently connects to the management server to synchronize authorized browser data. Website traffic can either connect directly or use the management server's authenticated forward proxy, selected per browser.
+The management API and website route are separate. Synchronization always goes through the management server. Each browser independently chooses whether website requests use its own IP or the management server's IP.
+
+## Session synchronization flow
+
+```mermaid
+sequenceDiagram
+    participant Admin as Administrator
+    participant Primary as WB1 - primary browser
+    participant Server as Management server
+    participant Vault as Encrypted vault
+    participant Secondary as WB2 / WB3
+    participant Site as Website
+
+    Admin->>Primary: Enroll once with administrator token
+    Primary->>Server: Enrollment request
+    Server-->>Primary: Unique device ID and token
+    Primary->>Site: Sign in normally
+    Site-->>Primary: Authentication cookies
+    Primary->>Server: Publish authorized domain cookies
+    Server->>Vault: Encrypt and save revision
+    Secondary->>Server: Request latest snapshot
+    Server-->>Secondary: Updated cookie profiles
+    Secondary->>Site: Browse using synchronized cookies
+```
+
+The primary-writer model prevents a logged-out secondary browser from replacing a valid shared session. Secondary clients consume updates approximately every 2.5 seconds.
 
 ## Included
 
@@ -19,7 +65,7 @@ Each browser independently connects to the management server to synchronize auth
 - Unique device identities and revocable device tokens
 - Automatic per-domain cookie/session profiles
 - A primary browser that publishes session changes while other browsers consume them
-- Bidirectional cookie synchronization
+- Controlled cookie synchronization with one primary writer
 - Shared home-page configuration
 - Offline encrypted browser cache
 - Browser/device status in the management dashboard
@@ -27,6 +73,52 @@ Each browser independently connects to the management server to synchronize auth
 - Per-browser choice between direct client-IP traffic and management-server-IP traffic
 
 Session values are sensitive credentials. Use this only for domains and accounts you own or are explicitly authorized to administer.
+
+## Use cases
+
+### Operate one authorized account from several computers
+
+Sign in on WB1 and let WB2/WB3 receive the same cookie-based session. This is useful for an authorized support desk, operations team, test lab, or a single user moving between managed computers.
+
+### Keep session synchronization separate from network routing
+
+One browser can use Direct mode while another uses Managed proxy mode. Both can consume the same authorized cookie vault even though websites see different source IP addresses.
+
+### Give websites a consistent server IP
+
+Use Managed proxy mode when an authorized site should see the VPS outbound IP instead of each client's home, office, or mobile IP. Each browser authenticates to the proxy with its enrolled device credentials.
+
+### Reduce accidental IP leaks
+
+Strict Privacy mode requires the managed proxy, blocks direct fallback, restricts non-proxied WebRTC UDP, removes implicit Chromium proxy bypasses, and denies website permission prompts. It reduces leaks but does not conceal signed-in accounts or browser fingerprints.
+
+### Centrally revoke a lost or retired browser
+
+Revoke a device from the dashboard. A revoked device can no longer download or publish shared session data, and its proxy credentials stop authorizing new connections.
+
+## What is synchronized?
+
+| Browser data | Synchronized | Notes |
+| --- | --- | --- |
+| Regular cookies | Yes | Restricted to authorized domain profiles |
+| Secure and HttpOnly cookies | Yes | Values are encrypted in the server vault |
+| Cookie-based login sessions | Yes | Works when the website's login state is cookie-based |
+| Cookie expiration dates | No | Synchronized values are installed as browser-session cookies |
+| `localStorage` | No | Some sites may still require a new login |
+| `sessionStorage` | No | Intentionally tab-scoped and temporary |
+| IndexedDB and service-worker caches | No | Remain local to each browser profile |
+| Passwords, passkeys, and payment data | No | Deliberately outside the synchronization boundary |
+
+## Typical workflow
+
+1. Deploy the management server and securely save its administrator token and data key.
+2. Enable the forward proxy only if browsers need the server's outbound IP.
+3. Install Shared Browser on each computer and give every instance a unique profile name.
+4. Enroll each browser once with the administrator token; the server replaces it with a revocable device token.
+5. Select WB1 as the primary session browser in the dashboard.
+6. Sign in to an authorized website on WB1.
+7. Open the same website on WB2 or WB3 after synchronization completes.
+8. Choose Direct, Managed proxy, or Strict Privacy independently on each browser.
 
 ## Docker deployment on Linux
 
