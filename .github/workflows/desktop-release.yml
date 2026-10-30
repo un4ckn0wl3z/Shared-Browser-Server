@@ -20,7 +20,11 @@ jobs:
             os: windows-latest
             command: dist:win
             artifact: shared-browser-windows-x64
-            files: electron-client/dist/*.exe
+            # latest.yml and the blockmap let installed Windows clients auto-update from the release.
+            files: |
+              electron-client/dist/*.exe
+              electron-client/dist/*.exe.blockmap
+              electron-client/dist/latest.yml
           - name: macOS universal
             os: macos-14
             command: dist:mac

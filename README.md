@@ -253,6 +253,10 @@ npm start -- --profile=WB3
 
 On first launch, the settings dialog opens automatically. Enter the management-server URL, a device name, the administrator token as the one-time enrollment token, and choose Direct or Managed proxy mode. Saving restarts and enrolls the client.
 
+The installed client checks GitHub Releases at startup and every four hours. Its version is shown in the window title, the toolbar status text, and the settings dialog, which also has **Check for updates**. Windows and Linux AppImage builds download a new release in the background and show **Restart to update** in the toolbar; the update otherwise installs when the browser is closed. The macOS DMG is unsigned, so macOS cannot install updates in place: the toolbar shows **Update to vX** and opens the release page. Update checks follow the browser's connection mode, so in Managed or Strict privacy mode they go through the management proxy.
+
+Keyboard shortcuts (⌘ instead of Ctrl on macOS): Ctrl+T new tab, Ctrl+W close tab, Ctrl+Tab / Ctrl+Shift+Tab switch tabs, Ctrl+L focus the address bar, Ctrl+R or F5 reload, Ctrl+Shift+R hard reload, Alt+← / Alt+→ back and forward, Ctrl+= / Ctrl+- / Ctrl+0 zoom, and F12 developer tools. Right-click a page for copy/paste, link, and Inspect actions. Links that open a new tab load as tabs; `window.open` popups open as real windows so sign-in and approval flows that report back to their opener keep working.
+
 Electron stores each named profile in the operating system's application-data directory. Device credentials and the offline shared snapshot use Electron `safeStorage`; Chromium protects its persistent cookie store using the facilities available on the operating system. On Linux, install and unlock a supported secret store such as KWallet, GNOME Keyring, or Secret Service. The client warns when Electron falls back to unencrypted `basic_text` storage.
 
 Create platform installers from the matching operating system:

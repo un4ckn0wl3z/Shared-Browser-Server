@@ -1,6 +1,6 @@
 {
   "name": "shared-browser-electron",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Cross-platform Shared Browser client",
   "main": "main.cjs",
   "author": "Shared Browser Server contributors",
@@ -10,10 +10,10 @@
   "scripts": {
     "start": "electron .",
     "check": "node --check main.cjs && node --check preload.cjs && node --check renderer.js",
-    "dist": "electron-builder",
-    "dist:win": "electron-builder --win nsis --x64",
-    "dist:mac": "electron-builder --mac dmg --universal",
-    "dist:linux": "electron-builder --linux"
+    "dist": "electron-builder --publish never",
+    "dist:win": "electron-builder --win nsis --x64 --publish never",
+    "dist:mac": "electron-builder --mac dmg --universal --publish never",
+    "dist:linux": "electron-builder --linux --publish never"
   },
   "devDependencies": {
     "electron": "^38.0.0",
@@ -34,6 +34,13 @@
     "directories": {
       "output": "dist"
     },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "un4ckn0wl3z",
+        "repo": "Shared-Browser-Server"
+      }
+    ],
     "artifactName": "Shared-Browser-${version}-${os}-${arch}.${ext}",
     "win": {
       "target": "nsis"
@@ -52,6 +59,8 @@
   },
   "allowScripts": {
     "electron@38.8.6": true
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.11"
   }
 }
- 

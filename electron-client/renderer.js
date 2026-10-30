@@ -4,6 +4,7 @@ const address = element('address');
 const tabsElement = element('tabs');
 const dialog = element('settings-dialog');
 let currentConfig;
+let loading = false;
 
 function renderTabs(tabs) {
   tabsElement.replaceChildren(...tabs.map(tab => {
@@ -27,11 +28,39 @@ function updateState(state) {
   if (document.activeElement !== address) address.value = state.url || '';
   element('back').disabled = !state.canGoBack;
   element('forward').disabled = !state.canGoForward;
+  loading = Boolean(state.loading);
+  const reload = element('reload');
+  reload.textContent = loading ? '✕' : '↻';
+  reload.title = loading ? 'Stop loading' : 'Reload';
+}
+
+function updateUpdate(value) {
+  const button = element('update');
+  button.hidden = !['available', 'downloading', 'ready'].includes(value.state);
+  button.disabled = value.state === 'downloading';
+  if (!button.hidden) button.textContent = value.state === 'ready' ? `Restart to update to v${value.version}`
+    : value.state === 'downloading' ? `Downloading v${value.version}${value.percent ? ` (${value.percent}%)` : ''}…`
+    : `Update to v${value.version}`;
+  button.title = value.state === 'available' ? 'Open the release download page' : '';
+  element('version-label').textContent = `Version ${value.currentVersion}`;
+  const result = element('update-result');
+  const messages = {
+    checking: 'Checking for updates…',
+    current: 'You are running the latest version.',
+    available: `Version ${value.version} is available. Use the Update button in the toolbar to download it.`,
+    downloading: `Downloading version ${value.version}…`,
+    ready: `Version ${value.version} is ready. Use the toolbar button to restart, or it installs when you quit.`,
+    error: `Update check failed: ${value.error}`
+  };
+  result.hidden = !messages[value.state];
+  result.className = value.state === 'error' ? 'warning' : 'info';
+  result.textContent = messages[value.state] || '';
 }
 
 function updateStatus(value) {
   const target = element('status');
-  target.textContent = `${value.text} • ${value.route}`;
+  target.textContent = `${value.text} • ${value.route}${currentConfig?.version ? ` • v${currentConfig.version}` : ''}`;
+  target.title = target.textContent;
   target.className = value.error ? 'status-error' : 'status-ok';
 }
 
@@ -69,9 +98,11 @@ async function navigate() {
 
 element('back').addEventListener('click', api.back);
 element('forward').addEventListener('click', api.forward);
-element('reload').addEventListener('click', api.reload);
+element('reload').addEventListener('click', () => loading ? api.stop() : api.reload());
 element('go').addEventListener('click', navigate);
 element('sync').addEventListener('click', api.syncNow);
+element('update').addEventListener('click', api.installUpdate);
+element('check-updates').addEventListener('click', api.checkForUpdates);
 element('new-tab').addEventListener('click', () => api.newTab());
 element('settings').addEventListener('click', openSettings);
 element('settings-close').addEventListener('click', closeSettings);
@@ -119,9 +150,12 @@ api.onState(updateState);
 api.onTabs(renderTabs);
 api.onStatus(updateStatus);
 api.onShowSettings(openSettings);
+api.onUpdate(updateUpdate);
+api.onFocusAddress(() => { address.focus(); address.select(); });
 
 api.bootstrap().then(state => {
   currentConfig = state.config;
   renderTabs(state.tabs);
+  updateUpdate(state.update);
   if (!currentConfig.enrolled) openSettings();
 });

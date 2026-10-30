@@ -36,5 +36,8 @@ label small { color: #667085; font-weight: normal; }
 .warning { color: #7a4b00; background: #fff3d6; }
 .error { min-height: 18px; color: #b3261e; font-size: 13px; }
 .actions { display: flex; justify-content: flex-end; gap: 8px; }
+.update { background: #e7f6ec; border-color: #7cc596; color: #146c36; }
+.update:hover:not(:disabled) { background: #d6efdf !important; border-color: #4fa96e; }
+.version-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: #475467; font-size: 13px; }
 .primary { background: #2868c7; border-color: #2868c7; color: white; }
 .primary:hover { background: #1e57ac !important; }
