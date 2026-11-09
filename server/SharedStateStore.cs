@@ -91,6 +91,42 @@ public sealed partial class SharedStateStore
 
     public string DeviceName(string id) => _deviceIndex.TryGetValue(id, out var device) ? device.Name : id;
 
+    /// <summary>A browser's proxy limits: its own overrides, otherwise the defaults from the proxy settings.</summary>
+    public ProxyLimits LimitsFor(string deviceId)
+    {
+        var proxy = _snapshot.Settings.Proxy;
+        _deviceIndex.TryGetValue(deviceId, out var device);
+        return new ProxyLimits(
+            device?.MaxConnections ?? proxy.MaxConnectionsPerDevice,
+            device?.MonthlyQuotaGb ?? proxy.MonthlyQuotaGb,
+            device?.RateLimitMbps ?? proxy.RateLimitMbps);
+    }
+
+    public static readonly string[] NetworkPolicies = ["choice", "managed", "strict"];
+    private static readonly string[] NetworkModes = ["direct", "managed", "strict"];
+
+    public async Task<string?> SetDeviceLimitsAsync(string id, DeviceLimitsRequest request)
+    {
+        ValidateLimit(request.MaxConnections, 100_000, "Connection limit");
+        ValidateLimit(request.MonthlyQuotaGb, 1_000_000, "Monthly quota");
+        ValidateLimit(request.RateLimitMbps, 100_000, "Rate limit");
+        await _gate.WaitAsync();
+        try
+        {
+            var device = _state.Devices.FirstOrDefault(item => item.Id == id);
+            if (device is null) return null;
+            (device.MaxConnections, device.MonthlyQuotaGb, device.RateLimitMbps) = (request.MaxConnections, request.MonthlyQuotaGb, request.RateLimitMbps);
+            await SaveLockedAsync();
+            return device.Name;
+        }
+        finally { _gate.Release(); }
+    }
+
+    private static void ValidateLimit(double? value, double max, string name)
+    {
+        if (value is { } number && (!double.IsFinite(number) || number < 0 || number > max)) throw new InvalidOperationException($"{name} must be between 0 (unlimited) and {max:N0}");
+    }
+
     /// <summary>Counts a device's open event streams, shown as "live" in the dashboard. Dispose to release.</summary>
     public IDisposable TrackLiveConnection(string deviceId)
     {
@@ -100,7 +136,7 @@ public sealed partial class SharedStateStore
 
     private sealed class Release(Action action) : IDisposable { public void Dispose() => action(); }
 
-    public async Task<object> AdminStatusAsync(object proxyStatus, IReadOnlyList<AuditEntry> audit)
+    public async Task<object> AdminStatusAsync(object proxyStatus, IReadOnlyList<AuditEntry> audit, Func<string, object> usage)
     {
         await _gate.WaitAsync();
         try
@@ -121,7 +157,20 @@ public sealed partial class SharedStateStore
                     cookieCount = profile.Cookies.Count,
                     cookies = profile.Cookies.Select(cookie => new { cookie.Name, cookie.Domain, cookie.Path, cookie.Secure, cookie.HttpOnly, cookie.SameSite, cookie.ExpiresAt, cookie.UpdatedAt, cookie.SourceDeviceId, hasValue = !string.IsNullOrEmpty(cookie.Value) }).ToList()
                 }).ToList(),
-                devices = _state.Devices.Select(device => new { device.Id, device.Name, device.EnrolledAt, device.LastSeenAt, device.Revoked, primary = device.Id == _state.Settings.PrimaryDeviceId, live = _liveConnections.GetValueOrDefault(device.Id) > 0 }).ToList(),
+                devices = _state.Devices.Select(device => new
+                {
+                    device.Id,
+                    device.Name,
+                    device.EnrolledAt,
+                    device.LastSeenAt,
+                    device.Revoked,
+                    device.ClientVersion,
+                    device.NetworkMode,
+                    limitOverrides = new { device.MaxConnections, device.MonthlyQuotaGb, device.RateLimitMbps },
+                    usage = usage(device.Id),
+                    primary = device.Id == _state.Settings.PrimaryDeviceId,
+                    live = _liveConnections.GetValueOrDefault(device.Id) > 0
+                }).ToList(),
                 bookmarks = _state.Bookmarks.Select(CloneBookmark).ToList(),
                 announcements = _state.Announcements.OrderByDescending(item => item.CreatedAt).Select(item =>
                 {
@@ -251,7 +300,7 @@ public sealed partial class SharedStateStore
         finally { _gate.Release(); }
     }
 
-    public async Task TouchDeviceAsync(string id, string name)
+    public async Task TouchDeviceAsync(string id, string name, string version = "", string mode = "")
     {
         await _gate.WaitAsync();
         try
@@ -267,6 +316,10 @@ public sealed partial class SharedStateStore
                 renamed = clean != device.Name;
                 device.Name = clean;
             }
+            // Version and connection mode let the dashboard show whether each browser follows the policy.
+            var cleanVersion = new string(version.Where(character => char.IsAsciiLetterOrDigit(character) || character is '.' or '-' or '+').Take(32).ToArray());
+            if (cleanVersion.Length > 0 && cleanVersion != device.ClientVersion) { device.ClientVersion = cleanVersion; renamed = true; }
+            if (NetworkModes.Contains(mode) && mode != device.NetworkMode) { device.NetworkMode = mode; renamed = true; }
             // Last-seen times are kept in memory and only persisted occasionally so that polling clients
             // do not rewrite the vault file every few seconds.
             var persist = renamed || !_lastSeenPersisted.TryGetValue(id, out var persisted) || now - persisted > LastSeenPersistInterval;
@@ -291,6 +344,10 @@ public sealed partial class SharedStateStore
         if (searchUrl.Length > 0 && (!searchUrl.Contains("%s", StringComparison.Ordinal) || !Uri.TryCreate(searchUrl.Replace("%s", "test", StringComparison.Ordinal), UriKind.Absolute, out var search) || search.Scheme is not ("http" or "https") || searchUrl.Length > 500))
             throw new InvalidOperationException("Search URL must be empty or an HTTP or HTTPS URL containing %s");
         var primaryDeviceId = string.IsNullOrWhiteSpace(settings.PrimaryDeviceId) ? "" : NormalizeId(settings.PrimaryDeviceId);
+        var policy = (settings.NetworkPolicy ?? "strict").Trim().ToLowerInvariant();
+        if (!NetworkPolicies.Contains(policy)) throw new InvalidOperationException("Browser connection mode must be choice, managed or strict");
+        var ipCheckUrl = (settings.IpCheckUrl ?? "").Trim();
+        if (ipCheckUrl.Length > 0 && (ipCheckUrl.Length > 500 || !Uri.TryCreate(ipCheckUrl, UriKind.Absolute, out var check) || check.Scheme is not ("http" or "https"))) throw new InvalidOperationException("IP check URL must be empty or an HTTP or HTTPS URL");
         settings.Proxy ??= new ProxySettings();
         ValidateProxySettings(settings.Proxy);
         await _gate.WaitAsync();
@@ -310,6 +367,14 @@ public sealed partial class SharedStateStore
             Compare("proxy TLS", before.Proxy.Tls, settings.Proxy.Tls);
             Compare("allowed ports", before.Proxy.AllowedPorts, settings.Proxy.AllowedPorts);
             Compare("bypass list", before.Proxy.BypassList, settings.Proxy.BypassList);
+            Compare("browser connection mode", before.NetworkPolicy, policy);
+            Compare("IP check URL", before.IpCheckUrl, ipCheckUrl);
+            Compare("egress family", before.Proxy.EgressAddressFamily, settings.Proxy.EgressAddressFamily);
+            Compare("egress source", before.Proxy.EgressSourceAddress, settings.Proxy.EgressSourceAddress);
+            Compare("default connection limit", before.Proxy.MaxConnectionsPerDevice, settings.Proxy.MaxConnectionsPerDevice);
+            Compare("default monthly quota (GB)", before.Proxy.MonthlyQuotaGb, settings.Proxy.MonthlyQuotaGb);
+            Compare("default rate limit (Mbps)", before.Proxy.RateLimitMbps, settings.Proxy.RateLimitMbps);
+            Compare("record destinations", before.Proxy.RecordDestinations, settings.Proxy.RecordDestinations);
             _state.Settings = new BrowserSettings
             {
                 HomePage = home?.AbsoluteUri ?? "",
@@ -317,6 +382,8 @@ public sealed partial class SharedStateStore
                 PrimaryDeviceId = primaryDeviceId,
                 AutoShareCookies = settings.AutoShareCookies,
                 AllowAdminTokenEnrollment = settings.AllowAdminTokenEnrollment,
+                NetworkPolicy = policy,
+                IpCheckUrl = ipCheckUrl,
                 Proxy = CloneProxySettings(settings.Proxy)
             };
             BumpRevision();
@@ -720,6 +787,8 @@ public sealed partial class SharedStateStore
         disk.Settings ??= new BrowserSettings();
         if (disk.Settings.HomePage is "https://example.com/" or "https://example.com") disk.Settings.HomePage = "";
         disk.Settings.SearchUrl ??= "";
+        disk.Settings.NetworkPolicy = NetworkPolicies.Contains(disk.Settings.NetworkPolicy) ? disk.Settings.NetworkPolicy : "strict";
+        disk.Settings.IpCheckUrl ??= "";
         disk.Settings.Proxy ??= new ProxySettings();
         disk.Profiles ??= [];
         disk.Devices ??= [];
@@ -747,7 +816,7 @@ public sealed partial class SharedStateStore
             Revision = _state.Revision,
             UpdatedAt = _state.UpdatedAt,
             Settings = CloneSettings(_state.Settings),
-            Devices = _state.Devices.Select(device => new DeviceRecord { Id = device.Id, Name = device.Name, TokenHash = device.TokenHash, EnrolledAt = device.EnrolledAt, LastSeenAt = device.LastSeenAt, Revoked = device.Revoked }).ToList(),
+            Devices = _state.Devices.Select(device => new DeviceRecord { Id = device.Id, Name = device.Name, TokenHash = device.TokenHash, EnrolledAt = device.EnrolledAt, LastSeenAt = device.LastSeenAt, Revoked = device.Revoked, ClientVersion = device.ClientVersion, NetworkMode = device.NetworkMode, MaxConnections = device.MaxConnections, MonthlyQuotaGb = device.MonthlyQuotaGb, RateLimitMbps = device.RateLimitMbps }).ToList(),
             Profiles = _state.Profiles.Select(CloneProfile).ToList(),
             Bookmarks = _state.Bookmarks.Select(CloneBookmark).ToList(),
             EnrollmentCodes = _state.EnrollmentCodes.Select(code => new EnrollmentCode { Id = code.Id, CodeHash = code.CodeHash, Label = code.Label, CreatedAt = code.CreatedAt, ExpiresAt = code.ExpiresAt, UsedAt = code.UsedAt, UsedByDeviceId = code.UsedByDeviceId, Revoked = code.Revoked }).ToList(),
@@ -788,7 +857,7 @@ public sealed partial class SharedStateStore
                 .OrderByDescending(item => item.CreatedAt)
                 .Select(item => new ClientAnnouncement(item.Id, item.Title, item.Message, item.Level, item.Url, item.CreatedAt, item.ExpiresAt) { ShareWithAllDevices = item.ShareWithAllDevices, AllowedDeviceIds = [.. item.AllowedDeviceIds] })
                 .ToList());
-        _deviceIndex = _state.Devices.ToDictionary(device => device.Id, device => new DeviceAuth(device.Id, device.Name, device.TokenHash, device.Revoked));
+        _deviceIndex = _state.Devices.ToDictionary(device => device.Id, device => new DeviceAuth(device.Id, device.Name, device.TokenHash, device.Revoked, device.MaxConnections, device.MonthlyQuotaGb, device.RateLimitMbps));
         if (_state.Revision != _publishedRevision)
         {
             _publishedRevision = _state.Revision;
@@ -897,8 +966,13 @@ public sealed partial class SharedStateStore
     private static bool CookieEqual(SharedCookie a, SharedCookie b) =>
         a.Name == b.Name && a.Value == b.Value && a.Domain == b.Domain && a.Path == b.Path && a.Secure == b.Secure && a.HttpOnly == b.HttpOnly && a.SameSite == b.SameSite
         && (a.ExpiresAt is null) == (b.ExpiresAt is null) && Math.Abs((a.ExpiresAt ?? 0) - (b.ExpiresAt ?? 0)) < ExpiryTolerance;
-    private static BrowserSettings CloneSettings(BrowserSettings settings) => new() { HomePage = settings.HomePage, SearchUrl = settings.SearchUrl, PrimaryDeviceId = settings.PrimaryDeviceId, AutoShareCookies = settings.AutoShareCookies, AllowAdminTokenEnrollment = settings.AllowAdminTokenEnrollment, Proxy = CloneProxySettings(settings.Proxy) };
-    private static ProxySettings CloneProxySettings(ProxySettings settings) => new() { Enabled = settings.Enabled, Host = settings.Host, Port = settings.Port, AllowedPorts = settings.AllowedPorts, BypassList = settings.BypassList, Tls = settings.Tls, CertificateSha256 = settings.CertificateSha256 };
+    private static BrowserSettings CloneSettings(BrowserSettings settings) => new() { HomePage = settings.HomePage, SearchUrl = settings.SearchUrl, PrimaryDeviceId = settings.PrimaryDeviceId, AutoShareCookies = settings.AutoShareCookies, AllowAdminTokenEnrollment = settings.AllowAdminTokenEnrollment, NetworkPolicy = settings.NetworkPolicy, IpCheckUrl = settings.IpCheckUrl, Proxy = CloneProxySettings(settings.Proxy) };
+    private static ProxySettings CloneProxySettings(ProxySettings settings) => new()
+    {
+        Enabled = settings.Enabled, Host = settings.Host, Port = settings.Port, AllowedPorts = settings.AllowedPorts, BypassList = settings.BypassList, Tls = settings.Tls, CertificateSha256 = settings.CertificateSha256,
+        EgressAddressFamily = settings.EgressAddressFamily, EgressSourceAddress = settings.EgressSourceAddress,
+        MaxConnectionsPerDevice = settings.MaxConnectionsPerDevice, MonthlyQuotaGb = settings.MonthlyQuotaGb, RateLimitMbps = settings.RateLimitMbps, RecordDestinations = settings.RecordDestinations
+    };
     private static SharedBookmark CloneBookmark(SharedBookmark item) => new() { Title = item.Title, Url = item.Url };
     private static SharedCookie CloneCookie(SharedCookie cookie, string? value = null) => new() { Name = cookie.Name, Value = value ?? cookie.Value, Domain = cookie.Domain, Path = cookie.Path, Secure = cookie.Secure, HttpOnly = cookie.HttpOnly, SameSite = cookie.SameSite, ExpiresAt = cookie.ExpiresAt, UpdatedAt = cookie.UpdatedAt, SourceDeviceId = cookie.SourceDeviceId };
     private static void ValidateProxySettings(ProxySettings proxy)
@@ -911,6 +985,10 @@ public sealed partial class SharedStateStore
         if (proxy.Host.Length is < 1 or > 253 || proxy.Host.Any(character => !(char.IsAsciiLetterOrDigit(character) || character is '.' or '-' or ':' or '[' or ']'))) throw new InvalidOperationException("Proxy host is invalid");
         if (proxy.AllowedPorts.Length == 0 || proxy.AllowedPorts.Split(',').Any(item => !int.TryParse(item, out var port) || port is < 1 or > 65535)) throw new InvalidOperationException("Allowed proxy ports must be comma-separated port numbers");
         if (proxy.BypassList.Length > 500 || proxy.BypassList.Any(character => !(char.IsAsciiLetterOrDigit(character) || character is '.' or '-' or '_' or '*' or ';' or ':' or '<' or '>' or '[' or ']'))) throw new InvalidOperationException("Proxy bypass list contains unsupported characters");
+        Egress.Validate(proxy);
+        ValidateLimit(proxy.MaxConnectionsPerDevice, 100_000, "Connection limit");
+        ValidateLimit(proxy.MonthlyQuotaGb, 1_000_000, "Monthly quota");
+        ValidateLimit(proxy.RateLimitMbps, 100_000, "Rate limit");
     }
     private static SessionProfile CloneProfile(SessionProfile profile) => new()
     {
