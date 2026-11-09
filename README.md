@@ -42,13 +42,15 @@ sequenceDiagram
     participant Secondary as WB2 / WB3
     participant Site as Website
 
-    Admin->>Primary: Enroll once with administrator token
-    Primary->>Server: Enrollment request
+    Admin->>Server: Create a one-time enrollment code
+    Admin->>Primary: Enter the code once in Settings
+    Primary->>Server: Enrollment request with the code
     Server-->>Primary: Unique device ID and token
     Primary->>Site: Sign in normally
     Site-->>Primary: Authentication cookies
     Primary->>Server: Publish authorized domain cookies
     Server->>Vault: Encrypt and save revision
+    Server-->>Secondary: Revision event (Server-Sent Events)
     Secondary->>Server: Request latest snapshot
     Server-->>Secondary: Updated cookie profiles
     Secondary->>Site: Browse using synchronized cookies
@@ -110,6 +112,7 @@ Revoke a device from the dashboard. A revoked device can no longer download or p
 | Cookie expiration dates | Yes | Expired cookies are dropped from the vault |
 | Sign-outs and deleted cookies | Yes | Cookies the primary browser no longer holds are removed from the vault and from the other browsers |
 | Shared bookmarks | Yes | Managed in the dashboard and shown in the client's ★ menu |
+| Open tabs and window position | No | Restored per profile on the same computer |
 | `localStorage` | No | Some sites may still require a new login |
 | `sessionStorage` | No | Intentionally tab-scoped and temporary |
 | IndexedDB and service-worker caches | No | Remain local to each browser profile |
@@ -181,6 +184,8 @@ To allow remote browsers to use Managed proxy mode, set `SHARED_BROWSER_PROXY_PU
 docker compose up -d
 ```
 
+The bundled Caddy profile streams the browsers' live-update connection (`/api/client/events`, Server-Sent Events) without extra configuration. Behind another reverse proxy, turn off response buffering for that path (for nginx: `proxy_buffering off;` and a `proxy_read_timeout` above 30 seconds); otherwise browsers fall back to polling every 30 seconds.
+
 Turn on **Encrypt the browser-to-proxy connection with TLS** in the dashboard so the device credentials browsers send to the proxy are never readable on the network (see [Proxy TLS](#proxy-tls)). Even with TLS, prefer keeping port `8899` behind a private network, firewall allowlist, WireGuard, or Tailscale. If the dashboard proxy port is changed from `8899`, update the Compose port mapping at the same time.
 
 The server keeps hourly backups of the vault in the `backups` folder of the data volume (see [Backups, export and import](#backups-export-and-import)). Still back up the `shared-browser-data` volume and securely retain the matching data key. Upgrade with:
@@ -189,6 +194,13 @@ The server keeps hourly backups of the vault in the `backups` folder of the data
 git pull
 docker compose up -d --build
 ```
+
+### Upgrading
+
+- The server reads vaults written by earlier versions as they are; there is nothing to migrate. Settings added later start with the previous behavior: profiles and announcements go to all browsers, the administrator token still enrolls browsers, and proxy TLS is off.
+- Older browsers keep working against a newer server. They do not show announcements, keep polling instead of receiving live updates, and (before 1.1) do not remove cookies from profiles they lose access to.
+- Update every browser that uses Managed proxy mode to 1.2 or newer before turning on proxy TLS.
+- Restarting the server briefly interrupts open proxy connections; browsers reconnect and resume syncing on their own.
 
 ## Start the server
 
@@ -244,13 +256,15 @@ pnpm start --profile=WB3
 
 On Windows, `Open-WB1.cmd`, `Open-WB2.cmd`, and `Open-WB3.cmd` in the repository root start the WB1, WB2, and WB3 profiles after the dependencies are installed.
 
+On Linux, make the AppImage executable and pass the profile name the same way (`chmod +x Shared-Browser-*.AppImage`, then `./Shared-Browser-1.2.0-linux-x86_64.AppImage --profile=WB1`). AppImages need FUSE; on Ubuntu 22.04 and newer install `libfuse2` (`libfuse2t64` on 24.04). Started from the AppImage, the client updates itself.
+
 Each profile name gets its own browser storage, device identity, encrypted device token, and offline cache. All profiles connect to the same management server and shared vault.
 
 On first launch, the settings dialog opens automatically. In the dashboard, use **Connect a browser** to create a one-time enrollment code (it expires after 10 minutes by default and works once). In the browser, enter the management-server URL, a device name such as `WB1`, and the enrollment code, then choose Direct or Managed proxy mode. Saving restarts and enrolls the client, and the server issues a random per-device token.
 
 The administrator token also works as an enrollment credential for compatibility. Turn off **Allow browsers to enroll with the administrator token** in the dashboard once every browser uses codes, so the administrator token never has to be typed on a browser computer.
 
-Repeat enrollment for WB2 and WB3. In the dashboard, choose the signed-in browser (normally WB1) as **Primary session browser**. Its stored cookies are published on startup, and every domain whose cookies it holds is added to the shared vault automatically. WB2 and WB3 pull those changes approximately every 2.5 seconds.
+Repeat enrollment for WB2 and WB3. In the dashboard, choose the signed-in browser (normally WB1) as **Primary session browser**. Its stored cookies are published on startup, and every domain whose cookies it holds is added to the shared vault automatically. WB2 and WB3 receive each change within about a second over the live event stream; if it is unavailable they poll every 2.5 seconds instead.
 
 The installed client checks GitHub Releases at startup and every four hours. Its version is shown in the window title, the toolbar status text, and the settings dialog, which also has **Check for updates**. Windows and Linux AppImage builds download a new release in the background and show **Restart to update** in the toolbar; the update otherwise installs when the browser is closed. The macOS DMG is unsigned, so macOS cannot install updates in place: the toolbar shows **Update to vX** and opens the release page. Update checks follow the browser's connection mode, so in Managed or Strict privacy mode they go through the management proxy.
 
@@ -298,7 +312,9 @@ Proxy TLS requires Shared Browser 1.2 or newer on every browser that uses Manage
 
 Plain-HTTP requests through the proxy are answered with `Connection: close`, so a browser never reuses the connection for a second request that the proxy would pass to the first origin unparsed.
 
-The default destination-port allowlist is `80,443`. Private, loopback, link-local, and multicast destinations are blocked to reduce server-side request-forgery risk.
+The default destination-port allowlist is `80,443`. To reduce server-side request-forgery risk, the proxy refuses private, loopback, link-local (including cloud metadata), carrier-grade NAT (`100.64.0.0/10`), documentation and benchmarking ranges, multicast and reserved addresses, and IPv6 NAT64 or 6to4 addresses that embed any of those.
+
+A tunnel stays open as long as data flows and closes after 10 minutes without traffic, so long downloads and WebSockets are not cut off. The proxy accepts up to 2048 simultaneous connections, gives up on destinations that do not answer within 20 seconds (502), and closes a revoked browser's open tunnels within about 5 seconds.
 
 ## Synchronization rules
 
@@ -307,7 +323,7 @@ The default destination-port allowlist is `80,443`. Private, loopback, link-loca
 - The primary browser publishes a complete cookie list per domain, and only for domains whose cookies changed. Cookies it no longer has (for example after signing out) are removed from the vault. A cookie typed into the dashboard is protected until the primary browser has received it; after that it is removed on sign-out like any other cookie. Secondary browsers delete a removed cookie only while it still holds the value they received.
 - A disabled profile stops sharing for its domain; the primary browser does not recreate an automatic profile for it.
 - Profile edits in the dashboard keep stored cookie values when the value field is left empty, so one cookie can be changed without re-entering the others.
-- Clients poll with the revision they already have and the server answers `204 No Content` when nothing changed. After errors, polling backs off up to one minute.
+- The server announces every new revision over Server-Sent Events, and browsers pull the snapshot immediately. Polling remains as a safety net (every 30 seconds while the event stream is connected, every 2.5 seconds otherwise): browsers send the revision they already have and the server answers `204 No Content` when nothing changed. After errors, polling backs off up to one minute.
 - Profiles can still be disabled or removed from the dashboard when a domain should not be shared.
 - A profile can be shared with all browsers or only selected ones. A browser that loses access removes the cookies it received from that profile, and deleting the last selected browser never widens a profile to everyone.
 - Server revisions provide a consistent order across browsers.
@@ -319,6 +335,10 @@ The default destination-port allowlist is `80,443`. Private, loopback, link-loca
 The first version deliberately uses the central server as the authority. Direct P2P transport can be added later without changing the browser data model.
 
 ## Administration
+
+### Browsers
+
+The dashboard's **Managed browsers** table shows each enrolled browser, when it was last seen, and a **LIVE** badge while it holds the live event stream. **Revoke** stops a browser from syncing or using the proxy (and closes its open proxy tunnels) but keeps its record so it can be restored; **Delete** removes it, and it must enroll again with a new code to reconnect. The primary session browser is marked **PRIMARY**.
 
 ### Announcements
 
@@ -348,4 +368,12 @@ pnpm exec playwright install chromium
 xvfb-run -a pnpm test
 ```
 
-On a desktop, run `pnpm test` without `xvfb-run`. The proxy tunnel tests need an origin on an address the proxy treats as public; they are skipped unless `TEST_PUBLIC_IP` (default `8.8.4.4`) is bound locally, for example with `sudo ip addr add 8.8.4.4/32 dev lo` on Linux. The CI workflow runs the whole suite on every pull request.
+`pnpm run test:server`, `pnpm run test:dashboard`, and `pnpm run test:electron` run one suite at a time. On a desktop, run `pnpm test` without `xvfb-run`. The proxy tunnel tests need an origin on an address the proxy treats as public; they are skipped unless `TEST_PUBLIC_IP` (default `8.8.4.4`) is bound locally, for example with `sudo ip addr add 8.8.4.4/32 dev lo` on Linux. The CI workflow runs the whole suite on every pull request.
+
+## Releasing
+
+1. Bump `version` in `electron-client/package.json` and merge it to `main`.
+2. In GitHub Actions, run **Desktop release** with `release_tag` set to the new tag (for example `v1.3.0`), or push that tag.
+3. The workflow builds the Windows installer, the macOS DMG, and the Linux AppImage on native runners, creates the GitHub release with generated notes, and uploads the installers together with `latest.yml` and `latest-linux.yml`, which installed Windows and Linux clients use to update themselves.
+
+Running the workflow without `release_tag` only builds the installers and keeps them as workflow artifacts for 30 days. Redeploy the server separately (see [Docker deployment on Linux](#docker-deployment-on-linux)).
