@@ -1,4 +1,4 @@
-const { app, BrowserWindow, WebContentsView, Menu, clipboard, ipcMain, net, session, safeStorage, shell } = require('electron');
+const { app, BrowserWindow, WebContentsView, Menu, clipboard, ipcMain, net, screen, session, safeStorage, shell } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const crypto = require('node:crypto');
@@ -11,6 +11,12 @@ const MAX_CLOSED_TABS = 25;
 // The server ignores expiry shifts smaller than a day, so the client does not re-push them either.
 const EXPIRY_BUCKET_SECONDS = 24 * 60 * 60;
 const DEFAULT_SEARCH_URL = 'https://duckduckgo.com/?q=%s';
+// While the server can push changes over Server-Sent Events, polling is only a slow safety net.
+const EVENTS_POLL_INTERVAL_MS = 30 * 1000;
+const EVENTS_IDLE_TIMEOUT_MS = 70 * 1000;
+const MAX_RESTORED_TABS = 30;
+// Set by the release workflow when the build is code-signed; macOS can only self-update signed apps.
+const SIGNED_BUILD = Boolean(require('./package.json').signedBuild);
 const UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000;
 const RELEASE_REPOSITORY = 'un4ckn0wl3z/Shared-Browser-Server';
 // electron-updater downloads through this partition (its NET_SESSION_NAME); it gets the same proxy as
@@ -37,6 +43,10 @@ let appliedCookies = new Map();
 let pushedDomains = new Map();
 let wasPrimary = false;
 let watchingCookies = false;
+let eventsConnected = false;
+let eventsController;
+let sessionSaveTimer;
+let quitting = false;
 const closedTabs = [];
 let autoUpdater;
 let updateTimer;
@@ -89,7 +99,8 @@ function defaultConfig() {
     deviceName: profileName,
     networkMode: 'direct',
     strictPrivacy: false,
-    secrets: { deviceToken: '', enrollmentToken: '', cache: defaultSnapshot() }
+    window: undefined,
+    secrets: { deviceToken: '', enrollmentToken: '', cache: defaultSnapshot(), session: { tabs: [], active: 0 } }
   };
 }
 
@@ -127,10 +138,15 @@ function loadConfig() {
       deviceName: String(disk.deviceName || profileName).slice(0, 80),
       networkMode: disk.networkMode === 'managed' ? 'managed' : 'direct',
       strictPrivacy: disk.strictPrivacy === true,
+      window: normalizeWindowState(disk.window),
       secrets: {
         deviceToken: String(secrets?.deviceToken || ''),
         enrollmentToken: String(secrets?.enrollmentToken || ''),
-        cache: normalizeSnapshot(secrets?.cache)
+        cache: normalizeSnapshot(secrets?.cache),
+        session: {
+          tabs: Array.isArray(secrets?.session?.tabs) ? secrets.session.tabs.filter(url => /^https?:\/\//i.test(String(url))).slice(0, MAX_RESTORED_TABS) : [],
+          active: Number(secrets?.session?.active) || 0
+        }
       }
     };
   } catch {
@@ -146,6 +162,8 @@ function saveConfig() {
     deviceName: config.deviceName,
     networkMode: config.networkMode,
     strictPrivacy: config.strictPrivacy,
+    window: config.window,
+    // Open tab addresses can contain tokens, so they are encrypted along with the device credentials.
     protected: encrypt(config.secrets)
   };
   const target = configPath();
@@ -168,6 +186,66 @@ function normalizeSnapshot(input) {
   return input;
 }
 
+function normalizeWindowState(value) {
+  if (!value || typeof value !== 'object') return undefined;
+  const bounds = ['x', 'y', 'width', 'height'].map(key => Number(value[key]));
+  if (bounds.some(number => !Number.isFinite(number))) return undefined;
+  const [x, y, width, height] = bounds;
+  return { x, y, width: Math.max(850, width), height: Math.max(560, height), maximized: value.maximized === true };
+}
+
+// Saved bounds are only reused while they still overlap a connected display.
+function savedBounds() {
+  const saved = config.window;
+  if (!saved) return {};
+  const visible = screen.getAllDisplays().some(({ workArea: area }) =>
+    saved.x < area.x + area.width - 80 && saved.x + saved.width > area.x + 80 && saved.y < area.y + area.height - 40 && saved.y + saved.height > area.y);
+  return visible ? { x: saved.x, y: saved.y, width: saved.width, height: saved.height } : { width: saved.width, height: saved.height };
+}
+
+function captureSessionState() {
+  if (!config) return;
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    config.window = { ...mainWindow.getNormalBounds(), maximized: mainWindow.isMaximized() };
+  }
+  const ordered = [...tabs.values()];
+  const urls = [];
+  let active = 0;
+  for (const tab of ordered) {
+    const url = tab.view.webContents.isDestroyed() ? '' : tab.view.webContents.getURL();
+    if (!/^https?:\/\//i.test(url)) continue;
+    if (tab.id === activeTabId) active = urls.length;
+    urls.push(url);
+  }
+  config.secrets.session = { tabs: urls.slice(0, MAX_RESTORED_TABS), active };
+}
+
+function saveSessionState() {
+  clearTimeout(sessionSaveTimer);
+  try {
+    captureSessionState();
+    saveConfig();
+  } catch (error) { logFatal(error); }
+}
+
+function scheduleSessionSave() {
+  clearTimeout(sessionSaveTimer);
+  sessionSaveTimer = setTimeout(saveSessionState, 5000);
+}
+
+// Reopens the tabs from the last session, or the shared home page when there were none.
+async function openInitialTabs() {
+  if (tabs.size > 0) return;
+  const { tabs: urls, active } = config.secrets.session;
+  if (!urls.length) {
+    await addTab(config.secrets.cache.settings.homePage);
+    return;
+  }
+  const ids = [];
+  for (const url of urls) ids.push(await addTab(url));
+  await selectTab(ids[Math.min(Math.max(active, 0), ids.length - 1)]);
+}
+
 function validServerUrl(value) {
   try { return ['http:', 'https:'].includes(new URL(value).protocol); } catch { return false; }
 }
@@ -188,6 +266,7 @@ function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1280,
     height: 820,
+    ...savedBounds(),
     minWidth: 850,
     minHeight: 560,
     title: `Shared Browser ${app.getVersion()} — ${profileName}`,
@@ -205,8 +284,13 @@ function createWindow() {
     if (handleShortcut(input, mainWindow.webContents)) event.preventDefault();
   });
   mainWindow.loadFile(path.join(__dirname, 'index.html'));
-  mainWindow.on('resize', layoutActiveView);
+  if (config.window?.maximized) mainWindow.maximize();
+  mainWindow.on('resize', () => { layoutActiveView(); scheduleSessionSave(); });
+  mainWindow.on('move', scheduleSessionSave);
+  mainWindow.on('close', () => { quitting = true; saveSessionState(); });
   mainWindow.on('closed', () => {
+    eventsController?.abort();
+    clearTimeout(sessionSaveTimer);
     clearTimeout(syncTimer);
     clearInterval(updateTimer);
     clearTimeout(cookiePushTimer);
@@ -304,6 +388,7 @@ async function addTab(url, details) {
     view.webContents.on(eventName, () => {
       if (activeTabId === id) publishNavigationState();
       if (eventName === 'did-start-loading' || eventName === 'did-stop-loading') publishTabs();
+      if (eventName === 'did-navigate' || eventName === 'did-navigate-in-page') scheduleSessionSave();
     });
   }
   view.webContents.on('did-finish-load', () => {
@@ -461,9 +546,10 @@ async function closeTab(id) {
   }
   if (!tab.view.webContents.isDestroyed()) tab.view.webContents.close();
   if (activeTabId === numericId) activeTabId = undefined;
-  if (tabs.size === 0) await addTab(config.secrets.cache.settings.homePage);
-  else if (!activeTabId) await selectTab(ids[index - 1] || ids[index + 1] || [...tabs.keys()][0]);
+  if (tabs.size === 0 && !quitting) await addTab(config.secrets.cache.settings.homePage);
+  else if (!activeTabId && tabs.size) await selectTab(ids[index - 1] || ids[index + 1] || [...tabs.keys()][0]);
   publishTabs();
+  scheduleSessionSave();
 }
 
 async function reopenClosedTab() {
@@ -492,7 +578,12 @@ async function api(pathname, options = {}, useDevice = true) {
   try {
     const response = await fetch(apiUrl(pathname), { ...options, headers, signal: controller.signal });
     const text = await response.text();
-    if (!response.ok) throw new Error(response.status === 401 ? 'This browser is unauthorized or revoked.' : `Server returned ${response.status}${text ? `: ${text}` : ''}`);
+    if (!response.ok) {
+      let message = '';
+      try { message = JSON.parse(text).error || ''; } catch { }
+      if (response.status === 401) throw new Error(useDevice ? 'This browser is unauthorized or revoked.' : message || 'The enrollment code or token was not accepted.');
+      throw new Error(message || `Server returned ${response.status}${text ? `: ${text.slice(0, 200)}` : ''}`);
+    }
     return text ? JSON.parse(text) : undefined;
   } finally {
     clearTimeout(timeout);
@@ -501,7 +592,7 @@ async function api(pathname, options = {}, useDevice = true) {
 
 async function ensureEnrolled() {
   if (config.secrets.deviceToken) return;
-  if (!config.secrets.enrollmentToken) throw new Error('Open Settings and enter the management server administrator token.');
+  if (!config.secrets.enrollmentToken) throw new Error('Open Settings and enter an enrollment code from the management dashboard.');
   const result = await api('/api/client/enroll', {
     method: 'POST',
     headers: { authorization: `Bearer ${config.secrets.enrollmentToken}` },
@@ -511,6 +602,55 @@ async function ensureEnrolled() {
   config.secrets.deviceToken = result.deviceToken;
   config.secrets.enrollmentToken = '';
   saveConfig();
+}
+
+// Listens for "revision" events from the server and pulls right away, so a change made on the primary
+// browser reaches the others within a moment instead of at the next poll.
+async function listenForEvents() {
+  let failures = 0;
+  while (mainWindow && config.secrets.deviceToken) {
+    const controller = new AbortController();
+    eventsController = controller;
+    let idle;
+    const resetIdle = () => { clearTimeout(idle); idle = setTimeout(() => controller.abort(), EVENTS_IDLE_TIMEOUT_MS); };
+    try {
+      resetIdle();
+      const response = await fetch(apiUrl('/api/client/events'), {
+        headers: { accept: 'text/event-stream', authorization: `Bearer ${config.secrets.deviceToken}`, 'x-device-id': config.deviceId },
+        signal: controller.signal
+      });
+      if (!response.ok || !response.body) throw Object.assign(new Error(`events ${response.status}`), { status: response.status });
+      eventsConnected = true;
+      failures = 0;
+      scheduleSync();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      for await (const chunk of response.body) {
+        resetIdle();
+        buffer += decoder.decode(chunk, { stream: true });
+        let end;
+        while ((end = buffer.indexOf('\n\n')) >= 0) {
+          const block = buffer.slice(0, end);
+          buffer = buffer.slice(end + 2);
+          const type = /^event: *(.*)$/m.exec(block)?.[1];
+          const data = /^data: *(.*)$/m.exec(block)?.[1];
+          if (type === 'revision' && Number(data) !== config.secrets.cache.revision) pullSnapshot(false);
+        }
+      }
+    } catch (error) {
+      failures++;
+      // A revoked or unknown device is reported by the regular sync; just retry slowly.
+      if (error.status === 401) failures = Math.max(failures, 5);
+    } finally {
+      clearTimeout(idle);
+      if (eventsConnected) {
+        eventsConnected = false;
+        scheduleSync();
+      }
+    }
+    if (!mainWindow) return;
+    await new Promise(resolve => setTimeout(resolve, Math.min(2000 * 2 ** Math.min(failures, 5), 60000)));
+  }
 }
 
 // All server traffic runs one request at a time so a slow snapshot pull can never land after a
@@ -581,7 +721,8 @@ async function installSnapshot(snapshot, previous) {
 
 function scheduleSync() {
   clearTimeout(syncTimer);
-  const delay = syncFailures ? Math.min(SYNC_INTERVAL_MS * 2 ** Math.min(syncFailures, 6), MAX_SYNC_BACKOFF_MS) : SYNC_INTERVAL_MS;
+  const delay = syncFailures ? Math.min(SYNC_INTERVAL_MS * 2 ** Math.min(syncFailures, 6), MAX_SYNC_BACKOFF_MS)
+    : eventsConnected ? EVENTS_POLL_INTERVAL_MS : SYNC_INTERVAL_MS;
   syncTimer = setTimeout(async () => {
     try { await pullSnapshot(false); } finally { if (mainWindow) scheduleSync(); }
   }, delay);
@@ -834,7 +975,7 @@ async function configureProxy() {
   const host = String(proxy.host).includes(':') && !String(proxy.host).startsWith('[') ? `[${proxy.host}]` : proxy.host;
   await setProxy({
     mode: 'fixed_servers',
-    proxyRules: `http://${host}:${proxy.port}`,
+    proxyRules: `${proxy.tls ? 'https' : 'http'}://${host}:${proxy.port}`,
     proxyBypassRules: config.strictPrivacy ? '<-loopback>' : String(proxy.bypassList || '').split(';').filter(Boolean).join(',')
   });
   if (config.strictPrivacy) {
@@ -844,6 +985,25 @@ async function configureProxy() {
       throw new Error('Strict privacy blocked browsing because Chromium resolved a direct route.');
     }
   }
+}
+
+function certificateSha256(certificate) {
+  try { return new crypto.X509Certificate(certificate.data).fingerprint256.replaceAll(':', '').toLowerCase(); } catch { return ''; }
+}
+
+// The management server advertises the SHA-256 of its proxy certificate over the authenticated API, so
+// a self-signed proxy certificate is trusted exactly when it matches. Anything else, including a site
+// that happens to share the proxy's host name, gets Chromium's normal verification.
+function verifyCertificate(request, callback) {
+  const proxy = config?.secrets.cache.settings.proxy;
+  const pinned = String(proxy?.certificateSha256 || '').toLowerCase();
+  const host = String(proxy?.host || '').replace(/^\[|\]$/g, '').toLowerCase();
+  if (config?.networkMode === 'managed' && proxy?.tls && pinned && request.hostname.replace(/^\[|\]$/g, '').toLowerCase() === host
+    && certificateSha256(request.certificate) === pinned) {
+    callback(0);
+    return;
+  }
+  callback(-3);
 }
 
 async function setProxy(proxyConfig) {
@@ -896,20 +1056,22 @@ async function startClient() {
     await configureProxy();
     await applyAllCookies();
     watchCookies();
-    if (tabs.size === 0) await addTab(config.secrets.cache.settings.homePage);
+    await openInitialTabs();
     wasPrimary = isPrimary();
     await pushAllStoredCookies();
     scheduleSync();
+    listenForEvents();
   } catch (error) {
     status(error.message, true);
     try { await applyAllCookies(); } catch { }
-    if (tabs.size === 0) await addTab(config.secrets.cache.settings.homePage);
+    await openInitialTabs();
     send('browser:show-settings');
     // Keep retrying in the background (for example when the server was briefly unreachable at startup).
     if (config.secrets.deviceToken) {
       watchCookies();
       syncFailures = Math.max(syncFailures, 1);
       scheduleSync();
+      listenForEvents();
     }
   }
 }
@@ -970,10 +1132,12 @@ function proxyLogin(authInfo, callback) {
   else callback();
 }
 
-// Windows (NSIS) and Linux AppImage builds download and install updates themselves. Other builds,
-// including the unsigned macOS DMG that Squirrel.Mac refuses to update, link to the release page.
+// Windows (NSIS), Linux AppImage and code-signed macOS builds download and install updates themselves.
+// Other builds, including the unsigned macOS DMG that Squirrel.Mac refuses to update, link to the release page.
 function installsUpdates() {
-  return app.isPackaged && (process.platform === 'win32' || (process.platform === 'linux' && Boolean(process.env.APPIMAGE)));
+  return app.isPackaged && (process.platform === 'win32'
+    || (process.platform === 'linux' && Boolean(process.env.APPIMAGE))
+    || (process.platform === 'darwin' && SIGNED_BUILD));
 }
 
 function publishUpdate(patch) {
@@ -1149,8 +1313,9 @@ function registerIpc() {
     config.networkMode = networkMode;
     config.strictPrivacy = strictPrivacy;
     if (String(input.enrollmentToken || '').trim()) config.secrets.enrollmentToken = String(input.enrollmentToken).trim();
-    if (!config.secrets.deviceToken && !config.secrets.enrollmentToken) throw new Error('An enrollment token is required for a new browser or server.');
+    if (!config.secrets.deviceToken && !config.secrets.enrollmentToken) throw new Error('An enrollment code is required for a new browser or server.');
     saveConfig();
+    saveSessionState();
     app.relaunch({ args: process.argv.slice(1) });
     app.exit(0);
     return true;
@@ -1183,6 +1348,7 @@ app.whenReady().then(async () => {
   Menu.setApplicationMenu(applicationMenu());
   browserSession = session.fromPartition('persist:shared-browser');
   browserSession.setUserAgent(app.userAgentFallback);
+  for (const item of [browserSession, session.fromPartition(UPDATER_PARTITION, { cache: false })]) item.setCertificateVerifyProc(verifyCertificate);
   configurePrivacyPermissions();
   configureDownloads();
   registerIpc();

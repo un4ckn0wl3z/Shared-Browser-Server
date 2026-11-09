@@ -111,7 +111,7 @@ async function openSettings() {
   element('device-name').value = currentConfig.deviceName;
   element('enrollment-token').value = '';
   element('enrollment-token').required = !currentConfig.enrolled;
-  element('enrollment-help').textContent = currentConfig.enrolled ? 'Already enrolled. Leave empty to keep the current device token.' : 'Enter the server administrator token once to enroll this browser.';
+  element('enrollment-help').textContent = currentConfig.enrolled ? 'Already enrolled. Leave empty to keep the current device token.' : 'Create a one-time enrollment code in the management dashboard and enter it here. The administrator token also works unless the server has disabled it.';
   element('network-mode').value = currentConfig.networkMode;
   element('strict-privacy').checked = currentConfig.strictPrivacy === true;
   element('privacy-warning').hidden = !currentConfig.strictPrivacy;
