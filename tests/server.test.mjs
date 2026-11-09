@@ -102,6 +102,47 @@ describe('management API', () => {
     await assert.rejects(server.settings({ searchUrl: 'https://search.example/' }), /%s/);
   });
 
+  test('announcements reach their browsers and record dismissals', async () => {
+    const everyone = await server.enroll(randomDeviceId(), 'reader-1');
+    const other = await server.enroll(randomDeviceId(), 'reader-2');
+    const visible = async device => (await (await server.device(device, '/snapshot')).json()).announcements;
+    const all = await server.admin('/announcements', 'POST', { title: 'Maintenance', message: 'Line one\nLine two', level: 'warning', url: 'https://status.example/', expiresInMinutes: 60 });
+    const targeted = await server.admin('/announcements', 'POST', { title: 'Only you', level: 'info', shareWithAllDevices: false, allowedDeviceIds: [everyone.id] });
+    const first = await visible(everyone);
+    assert.deepEqual(first.map(item => item.title).sort(), ['Maintenance', 'Only you']);
+    const maintenance = first.find(item => item.id === all.id);
+    assert.equal(maintenance.message, 'Line one\nLine two');
+    assert.equal(maintenance.level, 'warning');
+    assert.equal(maintenance.url, 'https://status.example/');
+    assert.ok(maintenance.expiresAt);
+    // Targeting and acknowledgements stay on the server.
+    assert.equal(maintenance.allowedDeviceIds, undefined);
+    assert.equal(maintenance.acknowledgements, undefined);
+    assert.deepEqual((await visible(other)).map(item => item.title), ['Maintenance']);
+    // A browser can only acknowledge announcements it was sent.
+    assert.equal((await server.device(other, `/announcements/${targeted.id}/ack`, 'POST')).status, 404);
+    assert.equal((await server.device(everyone, `/announcements/${all.id}/ack`, 'POST')).status, 204);
+    assert.equal((await server.device(everyone, `/announcements/${all.id}/ack`, 'POST')).status, 204);
+    const listed = (await server.status()).announcements.find(item => item.id === all.id);
+    assert.deepEqual(listed.acknowledgedBy.map(entry => entry.name), ['reader-1']);
+    assert.ok(listed.recipients.includes('reader-2'));
+    await server.admin(`/announcements/${targeted.id}`, 'DELETE');
+    assert.deepEqual((await visible(everyone)).map(item => item.title), ['Maintenance']);
+    await server.admin(`/announcements/${all.id}`, 'DELETE');
+    assert.deepEqual(await visible(everyone), []);
+    const actions = (await server.status()).audit.map(item => item.action);
+    assert.ok(actions.includes('announcement.sent') && actions.includes('announcement.deleted'));
+  });
+
+  test('announcement validation', async () => {
+    await assert.rejects(server.admin('/announcements', 'POST', { title: '', message: '' }), /title or a message/);
+    await assert.rejects(server.admin('/announcements', 'POST', { title: 'x', level: 'urgent' }), /Level/);
+    await assert.rejects(server.admin('/announcements', 'POST', { title: 'x', url: 'javascript:alert(1)' }), /link/);
+    await assert.rejects(server.admin('/announcements', 'POST', { title: 'x', expiresInMinutes: 0 }), /expire/);
+    await assert.rejects(server.admin('/announcements', 'POST', { title: 'x'.repeat(121) }), /120/);
+    await assert.rejects(server.admin('/announcements', 'POST', { title: 'x', shareWithAllDevices: false, allowedDeviceIds: [] }), /Select at least one/);
+  });
+
   test('server-sent events announce new revisions', async () => {
     const device = await server.enroll(randomDeviceId(), 'listener');
     const controller = new AbortController();

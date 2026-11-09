@@ -132,22 +132,61 @@ describe('Electron browsers sharing a session', () => {
     await waitFor(async () => (await wb2.address()) === `http://localhost:${site.port}/find`, { message: 'reopened tab' });
   });
 
+  const tabViewTop = browser => browser.app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].contentView.children.map(view => view.getBounds().y)[0]);
+
+  test('announcements appear as a banner, plain text only, and can be dismissed', async () => {
+    const baseline = await tabViewTop(wb2);
+    const started = Date.now();
+    const sent = await server.admin('/announcements', 'POST', {
+      title: 'Maintenance tonight',
+      message: 'Sessions refresh at 18:00 <img src=x onerror="document.title=\'pwned\'">',
+      level: 'warning',
+      url: `${site.origin}/status`
+    });
+    await waitFor(async () => (await wb2.window.textContent('#announcements')).includes('Maintenance tonight'), { message: 'banner on WB2', timeout: 8000, interval: 100 });
+    assert.ok(Date.now() - started < 8000);
+    // The message is rendered as text, never as markup.
+    assert.equal(await wb2.window.locator('#announcements img').count(), 0);
+    assert.ok((await wb2.window.textContent('#announcements')).includes('<img src=x'));
+    // The page moves down so the banner does not cover it.
+    await waitFor(async () => (await tabViewTop(wb2)) > baseline, { message: 'page below banner' });
+    await wb2.window.click('.announcement button:has-text("Open link")');
+    await waitFor(async () => (await wb2.address()) === `${site.origin}/status`, { message: 'link opened in a tab' });
+    await wb2.window.click('.announcement .dismiss');
+    await waitFor(async () => (await wb2.window.locator('.announcement').count()) === 0, { message: 'banner dismissed' });
+    await waitFor(async () => (await tabViewTop(wb2)) === baseline, { message: 'page back in place' });
+    await waitFor(async () => (await server.status()).announcements.find(item => item.id === sent.id).acknowledgedBy.some(entry => entry.name === 'WB2'), { message: 'dismissal recorded' });
+    // WB1 still shows it until its own user dismisses it.
+    assert.ok((await wb1.window.textContent('#announcements')).includes('Maintenance tonight'));
+  });
+
+  test('targeted announcements only reach the selected browser', async () => {
+    await server.admin('/announcements', 'POST', { title: 'For WB1 only', level: 'info', shareWithAllDevices: false, allowedDeviceIds: [deviceId('WB1')] });
+    await waitFor(async () => (await wb1.window.textContent('#announcements')).includes('For WB1 only'), { message: 'banner on WB1' });
+    await sleep(1500);
+    assert.ok(!(await wb2.window.textContent('#announcements')).includes('For WB1 only'));
+  });
+
   test('tabs and the window size come back after a restart', async () => {
     await wb2.window.click('#new-tab');
     await wb2.navigate(`${site.origin}/second-tab`);
     await waitFor(async () => (await wb2.address()) === `${site.origin}/second-tab`, { message: 'second tab' });
     await wb2.app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].setBounds({ x: 40, y: 30, width: 1100, height: 700 }));
     await sleep(300);
+    // Blank tabs are not saved; every page is.
+    const urls = () => wb2.app.evaluate(({ webContents }) => webContents.getAllWebContents().map(item => item.getURL()).filter(url => /^https?:/.test(url)).sort());
+    const before = await urls();
+    assert.ok(before.includes(`${site.origin}/find`) && before.includes(`${site.origin}/second-tab`));
     await wb2.close();
     wb2 = await launchBrowser(home, 'WB2');
-    // Blank tabs are not saved; the two pages are.
-    const urls = () => wb2.app.evaluate(({ webContents }) => webContents.getAllWebContents().map(item => item.getURL()).filter(url => /^https?:/.test(url)).sort());
-    await waitFor(async () => JSON.stringify(await urls()) === JSON.stringify([`${site.origin}/find`, `${site.origin}/second-tab`].sort()), { message: 'restored tabs' });
-    assert.equal(await wb2.window.locator('.tab').count(), 2);
+    await waitFor(async () => JSON.stringify(await urls()) === JSON.stringify(before), { message: 'restored tabs' });
+    assert.equal(await wb2.window.locator('.tab').count(), before.length);
     await waitFor(async () => (await wb2.address()) === `${site.origin}/second-tab`, { message: 'active tab restored' });
     const bounds = await wb2.app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].getBounds());
     assert.equal(bounds.width, 1100);
     assert.equal(bounds.height, 700);
+    // A dismissed announcement stays dismissed after a restart.
+    assert.equal(await wb2.window.locator('.announcement').count(), 0);
   });
 
   test('a revoked browser asks for settings once and keeps what the user types', async () => {

@@ -20,6 +20,9 @@ contextBridge.exposeInMainWorld('sharedBrowser', {
   reopenTab: () => ipcRenderer.invoke('browser:reopen-tab'),
   find: (text, options) => ipcRenderer.invoke('browser:find', text, options),
   stopFind: () => ipcRenderer.invoke('browser:stop-find'),
+  dismissAnnouncement: (id) => ipcRenderer.invoke('browser:dismiss-announcement', id),
+  openAnnouncementLink: (id) => ipcRenderer.invoke('browser:open-announcement-link', id),
+  setChromeHeight: (height) => ipcRenderer.invoke('browser:chrome-height', height),
   onState: (callback) => ipcRenderer.on('browser:state', (_, value) => callback(value)),
   onTabs: (callback) => ipcRenderer.on('browser:tabs', (_, value) => callback(value)),
   onStatus: (callback) => ipcRenderer.on('browser:status', (_, value) => callback(value)),
@@ -27,6 +30,7 @@ contextBridge.exposeInMainWorld('sharedBrowser', {
   onFocusAddress: (callback) => ipcRenderer.on('browser:focus-address', () => callback()),
   onUpdate: (callback) => ipcRenderer.on('browser:update', (_, value) => callback(value)),
   onBookmarks: (callback) => ipcRenderer.on('browser:bookmarks', (_, value) => callback(value)),
+  onAnnouncements: (callback) => ipcRenderer.on('browser:announcements', (_, value) => callback(value)),
   onShowFind: (callback) => ipcRenderer.on('browser:show-find', (_, value) => callback(value)),
   onFindResult: (callback) => ipcRenderer.on('browser:find-result', (_, value) => callback(value))
 });

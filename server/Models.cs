@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 public sealed class SharedState
 {
     public long Revision { get; set; }
@@ -7,6 +9,25 @@ public sealed class SharedState
     public List<DeviceRecord> Devices { get; set; } = [];
     public List<SharedBookmark> Bookmarks { get; set; } = [];
     public List<EnrollmentCode> EnrollmentCodes { get; set; } = [];
+    public List<Announcement> Announcements { get; set; } = [];
+}
+
+/// <summary>A message from the administrator that browsers show in a banner until the user dismisses it.</summary>
+public sealed class Announcement
+{
+    public string Id { get; set; } = "";
+    public string Title { get; set; } = "";
+    public string Message { get; set; } = "";
+    /// <summary>info, warning or critical. Warning and critical also raise a desktop notification.</summary>
+    public string Level { get; set; } = "info";
+    /// <summary>Optional http(s) link the banner offers to open.</summary>
+    public string Url { get; set; } = "";
+    public DateTimeOffset CreatedAt { get; set; }
+    public DateTimeOffset? ExpiresAt { get; set; }
+    public bool ShareWithAllDevices { get; set; } = true;
+    public List<string> AllowedDeviceIds { get; set; } = [];
+    /// <summary>Device ID → when that browser's user dismissed the announcement.</summary>
+    public Dictionary<string, DateTimeOffset> Acknowledgements { get; set; } = [];
 }
 
 public sealed class BrowserSettings
@@ -96,5 +117,12 @@ public sealed record EnrollmentCodeResponse(string Id, string Code, string Label
 /// </summary>
 public sealed record SyncRequest(long KnownRevision, string PageUrl, List<SharedCookie>? Cookies, bool Complete = false);
 public sealed record SyncResponse(long Revision, int ChangedCookies, SharedSnapshot Snapshot);
-public sealed record SharedSnapshot(long Revision, DateTimeOffset UpdatedAt, BrowserSettings Settings, List<SessionProfile> Profiles, List<SharedBookmark> Bookmarks);
+public sealed record SharedSnapshot(long Revision, DateTimeOffset UpdatedAt, BrowserSettings Settings, List<SessionProfile> Profiles, List<SharedBookmark> Bookmarks, List<ClientAnnouncement> Announcements);
+public sealed record AnnouncementRequest(string? Title, string? Message, string? Level, string? Url, int? ExpiresInMinutes, bool ShareWithAllDevices = true, List<string>? AllowedDeviceIds = null);
+/// <summary>What a browser receives. Targeting stays on the server.</summary>
+public sealed record ClientAnnouncement(string Id, string Title, string Message, string Level, string Url, DateTimeOffset CreatedAt, DateTimeOffset? ExpiresAt)
+{
+    [JsonIgnore] public bool ShareWithAllDevices { get; init; } = true;
+    [JsonIgnore] public IReadOnlyList<string> AllowedDeviceIds { get; init; } = [];
+}
 public sealed record BackupInfo(string Name, long Size, DateTimeOffset CreatedAt);

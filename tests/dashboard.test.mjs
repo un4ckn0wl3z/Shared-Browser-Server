@@ -65,10 +65,20 @@ describe('dashboard', () => {
     await waitFor(async () => /Certificate SHA-256/.test(await page.textContent('#proxy-fingerprint')), { message: 'fingerprint shown' });
   });
 
+  test('sends an announcement and lists it', async () => {
+    await page.fill('#announcement-title', 'Dashboard notice');
+    await page.fill('#announcement-message', 'Hello browsers');
+    await page.selectOption('#announcement-level', 'critical');
+    await page.click('#announcement-form > button');
+    await waitFor(async () => (await page.textContent('#announcements')).includes('Dashboard notice'), { message: 'announcement listed' });
+    assert.match(await page.textContent('#announcements'), /dismissed by 0 of \d/);
+    assert.equal((await server.status()).announcements[0].level, 'critical');
+  });
+
   test('lists backups and the audit log', async () => {
     await waitFor(async () => (await page.locator('#backups tr').count()) >= 1 && !(await page.textContent('#backups')).includes('No backups'), { message: 'backup rows' });
     const audit = await page.textContent('#audit');
-    for (const action of ['enrollment_code.created', 'device.enrolled', 'profile.updated', 'settings.updated']) assert.ok(audit.includes(action), action);
+    for (const action of ['enrollment_code.created', 'device.enrolled', 'profile.updated', 'settings.updated', 'announcement.sent']) assert.ok(audit.includes(action), action);
   });
 
   test('has no script errors', () => {

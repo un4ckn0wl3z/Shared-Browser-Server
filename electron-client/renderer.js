@@ -30,6 +30,46 @@ function renderTabs(tabs) {
   }));
 }
 
+function renderAnnouncements(items) {
+  const container = element('announcements');
+  container.replaceChildren(...items.map(item => {
+    const banner = document.createElement('div');
+    banner.className = `announcement ${item.level}`;
+    banner.setAttribute('role', item.level === 'critical' ? 'alert' : 'status');
+    const body = document.createElement('div');
+    body.className = 'announcement-body';
+    // Announcements are plain text: nothing from the server is ever interpreted as HTML.
+    if (item.title) {
+      const title = document.createElement('strong');
+      title.textContent = item.title;
+      body.append(title);
+    }
+    if (item.message) {
+      const message = document.createElement('p');
+      message.textContent = item.message;
+      body.append(message);
+    }
+    const meta = document.createElement('small');
+    meta.textContent = `From the administrator · ${new Date(item.createdAt).toLocaleString()}`;
+    body.append(meta);
+    banner.append(body);
+    if (item.url) {
+      const open = document.createElement('button');
+      open.textContent = 'Open link';
+      open.title = item.url;
+      open.addEventListener('click', () => api.openAnnouncementLink(item.id));
+      banner.append(open);
+    }
+    const dismiss = document.createElement('button');
+    dismiss.className = 'dismiss';
+    dismiss.textContent = '×';
+    dismiss.title = 'Dismiss';
+    dismiss.addEventListener('click', () => api.dismissAnnouncement(item.id));
+    banner.append(dismiss);
+    return banner;
+  }));
+}
+
 function showFind(options = {}) {
   const wasOpen = !findBar.hidden;
   findBar.hidden = false;
@@ -209,12 +249,16 @@ api.onFocusAddress(() => { address.focus(); address.select(); });
 api.onShowFind(showFind);
 api.onFindResult(updateFindResult);
 api.onBookmarks(bookmarks => { element('bookmarks').title = `Shared bookmarks (${bookmarks.length})`; });
+api.onAnnouncements(renderAnnouncements);
+// The page view sits below the toolbar, so the main process needs to know when banners change its height.
+new ResizeObserver(() => api.setChromeHeight(Math.ceil(document.querySelector('header').getBoundingClientRect().height))).observe(document.querySelector('header'));
 
 api.bootstrap().then(state => {
   currentConfig = state.config;
   renderTabs(state.tabs);
   updateUpdate(state.update);
   element('bookmarks').title = `Shared bookmarks (${state.bookmarks?.length || 0})`;
+  renderAnnouncements(state.announcements || []);
   // The main process opens Settings when it is actually needed (no credentials, or enrollment failed).
   // Opening it here as well would cover the browser while a saved enrollment token is still being used.
 });

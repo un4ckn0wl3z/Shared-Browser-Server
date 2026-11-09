@@ -13,6 +13,9 @@ public sealed partial class SharedStateStore
     public const string AdminSource = "admin";
     private const int MaxCookiesPerRequest = 200;
     private const int MaxBookmarks = 200;
+    private const int MaxAnnouncements = 50;
+    private static readonly TimeSpan ExpiredAnnouncementRetention = TimeSpan.FromDays(7);
+    private static readonly string[] AnnouncementLevels = ["info", "warning", "critical"];
     private const string CodeAlphabet = "ABCDEFGHJKMNPQRSTVWXYZ23456789";
     private static readonly TimeSpan LastSeenPersistInterval = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan CodeRetention = TimeSpan.FromDays(7);
@@ -61,8 +64,12 @@ public sealed partial class SharedStateStore
     public SharedSnapshot SnapshotFor(string deviceId)
     {
         var snapshot = _snapshot;
-        if (snapshot.Profiles.All(profile => profile.ShareWithAllDevices)) return snapshot;
-        return snapshot with { Profiles = snapshot.Profiles.Where(profile => profile.ShareWithAllDevices || profile.AllowedDeviceIds.Contains(deviceId)).ToList() };
+        if (snapshot.Profiles.All(profile => profile.ShareWithAllDevices) && snapshot.Announcements.All(item => item.ShareWithAllDevices)) return snapshot;
+        return snapshot with
+        {
+            Profiles = snapshot.Profiles.Where(profile => profile.ShareWithAllDevices || profile.AllowedDeviceIds.Contains(deviceId)).ToList(),
+            Announcements = snapshot.Announcements.Where(item => item.ShareWithAllDevices || item.AllowedDeviceIds.Contains(deviceId)).ToList()
+        };
     }
 
     /// <summary>Completes when the revision differs from <paramref name="known"/>, or after the timeout.</summary>
@@ -116,6 +123,25 @@ public sealed partial class SharedStateStore
                 }).ToList(),
                 devices = _state.Devices.Select(device => new { device.Id, device.Name, device.EnrolledAt, device.LastSeenAt, device.Revoked, primary = device.Id == _state.Settings.PrimaryDeviceId, live = _liveConnections.GetValueOrDefault(device.Id) > 0 }).ToList(),
                 bookmarks = _state.Bookmarks.Select(CloneBookmark).ToList(),
+                announcements = _state.Announcements.OrderByDescending(item => item.CreatedAt).Select(item =>
+                {
+                    var recipients = _state.Devices.Where(device => !device.Revoked && (item.ShareWithAllDevices || item.AllowedDeviceIds.Contains(device.Id))).ToList();
+                    return new
+                    {
+                        item.Id,
+                        item.Title,
+                        item.Message,
+                        item.Level,
+                        item.Url,
+                        item.CreatedAt,
+                        item.ExpiresAt,
+                        item.ShareWithAllDevices,
+                        item.AllowedDeviceIds,
+                        expired = item.ExpiresAt is { } expires && expires <= now,
+                        recipients = recipients.Select(device => device.Name).ToList(),
+                        acknowledgedBy = item.Acknowledgements.OrderBy(entry => entry.Value).Select(entry => new { deviceId = entry.Key, name = DeviceName(entry.Key), at = entry.Value }).ToList()
+                    };
+                }).ToList(),
                 enrollmentCodes = _state.EnrollmentCodes.OrderByDescending(code => code.CreatedAt).Select(code => new
                 {
                     code.Id,
@@ -432,9 +458,85 @@ public sealed partial class SharedStateStore
             // A profile limited to browsers that no longer exist stays limited (to nobody) rather than
             // silently widening to every browser.
             foreach (var profile in _state.Profiles.Where(item => item.AllowedDeviceIds.Remove(id))) bump = true;
+            foreach (var announcement in _state.Announcements)
+            {
+                if (announcement.AllowedDeviceIds.Remove(id)) bump = true;
+                announcement.Acknowledgements.Remove(id);
+            }
             if (bump) BumpRevision();
             await SaveLockedAsync();
             return device.Name;
+        }
+        finally { _gate.Release(); }
+    }
+
+    // ---- Announcements ----------------------------------------------------------------------------
+
+    public async Task<Announcement> CreateAnnouncementAsync(AnnouncementRequest request)
+    {
+        var title = (request.Title ?? "").Trim();
+        var message = (request.Message ?? "").Replace("\r\n", "\n").Trim();
+        if (title.Length == 0 && message.Length == 0) throw new InvalidOperationException("Enter a title or a message");
+        if (title.Length > 120 || title.Any(char.IsControl)) throw new InvalidOperationException("The title must be one line of at most 120 characters");
+        if (message.Length > 2000 || message.Any(character => char.IsControl(character) && character != '\n')) throw new InvalidOperationException("The message must be at most 2000 characters");
+        var level = (request.Level ?? "info").Trim().ToLowerInvariant();
+        if (!AnnouncementLevels.Contains(level)) throw new InvalidOperationException("Level must be info, warning or critical");
+        var url = (request.Url ?? "").Trim();
+        if (url.Length > 0 && (url.Length > 2000 || !Uri.TryCreate(url, UriKind.Absolute, out var link) || link.Scheme is not ("http" or "https"))) throw new InvalidOperationException("The link must be an HTTP or HTTPS URL");
+        if (request.ExpiresInMinutes is < 1 or > 30 * 24 * 60) throw new InvalidOperationException("An announcement can expire after 1 minute to 30 days, or never");
+        var allowed = (request.AllowedDeviceIds ?? []).Select(NormalizeId).Distinct().ToList();
+        if (!request.ShareWithAllDevices && allowed.Count == 0) throw new InvalidOperationException("Select at least one browser, or send the announcement to all browsers");
+        var now = DateTimeOffset.UtcNow;
+        var announcement = new Announcement
+        {
+            Id = Guid.NewGuid().ToString("N"),
+            Title = title,
+            Message = message,
+            Level = level,
+            Url = url.Length > 0 ? new Uri(url).AbsoluteUri : "",
+            CreatedAt = now,
+            ExpiresAt = request.ExpiresInMinutes is { } minutes ? now.AddMinutes(minutes) : null,
+            ShareWithAllDevices = request.ShareWithAllDevices,
+            AllowedDeviceIds = request.ShareWithAllDevices ? [] : allowed
+        };
+        await _gate.WaitAsync();
+        try
+        {
+            if (allowed.Any(device => !_state.Devices.Any(item => item.Id == device))) throw new InvalidOperationException("A selected browser is not enrolled");
+            if (_state.Announcements.Count(item => item.ExpiresAt is null || item.ExpiresAt > now) >= MaxAnnouncements) throw new InvalidOperationException($"At most {MaxAnnouncements} announcements can be active. Delete old ones first");
+            _state.Announcements.Add(announcement);
+            BumpRevision();
+            await SaveLockedAsync();
+            return announcement;
+        }
+        finally { _gate.Release(); }
+    }
+
+    public async Task<Announcement?> DeleteAnnouncementAsync(string id)
+    {
+        await _gate.WaitAsync();
+        try
+        {
+            var announcement = _state.Announcements.FirstOrDefault(item => item.Id == id);
+            if (announcement is null) return null;
+            _state.Announcements.Remove(announcement);
+            BumpRevision();
+            await SaveLockedAsync();
+            return announcement;
+        }
+        finally { _gate.Release(); }
+    }
+
+    /// <summary>Records that a browser's user dismissed an announcement it was sent. Returns false if it cannot see it.</summary>
+    public async Task<bool> AcknowledgeAnnouncementAsync(string deviceId, string id)
+    {
+        await _gate.WaitAsync();
+        try
+        {
+            var announcement = _state.Announcements.FirstOrDefault(item => item.Id == id);
+            if (announcement is null || !(announcement.ShareWithAllDevices || announcement.AllowedDeviceIds.Contains(deviceId))) return false;
+            if (announcement.Acknowledgements.TryAdd(deviceId, DateTimeOffset.UtcNow)) await SaveLockedAsync(publish: false);
+            return true;
         }
         finally { _gate.Release(); }
     }
@@ -601,6 +703,12 @@ public sealed partial class SharedStateStore
         disk.Devices ??= [];
         disk.Bookmarks ??= [];
         disk.EnrollmentCodes ??= [];
+        disk.Announcements ??= [];
+        foreach (var announcement in disk.Announcements)
+        {
+            announcement.AllowedDeviceIds ??= [];
+            announcement.Acknowledgements ??= [];
+        }
         foreach (var profile in disk.Profiles)
         {
             profile.Cookies ??= [];
@@ -620,7 +728,8 @@ public sealed partial class SharedStateStore
             Devices = _state.Devices.Select(device => new DeviceRecord { Id = device.Id, Name = device.Name, TokenHash = device.TokenHash, EnrolledAt = device.EnrolledAt, LastSeenAt = device.LastSeenAt, Revoked = device.Revoked }).ToList(),
             Profiles = _state.Profiles.Select(CloneProfile).ToList(),
             Bookmarks = _state.Bookmarks.Select(CloneBookmark).ToList(),
-            EnrollmentCodes = _state.EnrollmentCodes.Select(code => new EnrollmentCode { Id = code.Id, CodeHash = code.CodeHash, Label = code.Label, CreatedAt = code.CreatedAt, ExpiresAt = code.ExpiresAt, UsedAt = code.UsedAt, UsedByDeviceId = code.UsedByDeviceId, Revoked = code.Revoked }).ToList()
+            EnrollmentCodes = _state.EnrollmentCodes.Select(code => new EnrollmentCode { Id = code.Id, CodeHash = code.CodeHash, Label = code.Label, CreatedAt = code.CreatedAt, ExpiresAt = code.ExpiresAt, UsedAt = code.UsedAt, UsedByDeviceId = code.UsedByDeviceId, Revoked = code.Revoked }).ToList(),
+            Announcements = _state.Announcements.Select(item => new Announcement { Id = item.Id, Title = item.Title, Message = item.Message, Level = item.Level, Url = item.Url, CreatedAt = item.CreatedAt, ExpiresAt = item.ExpiresAt, ShareWithAllDevices = item.ShareWithAllDevices, AllowedDeviceIds = [.. item.AllowedDeviceIds], Acknowledgements = new(item.Acknowledgements) }).ToList()
         };
         disk.Settings.Proxy.CertificateSha256 = "";
         foreach (var cookie in disk.Profiles.SelectMany(profile => profile.Cookies)) cookie.Value = Encrypt(cookie.Value);
@@ -651,7 +760,12 @@ public sealed partial class SharedStateStore
                 clone.Cookies.RemoveAll(cookie => cookie.ExpiresAt is { } expires && expires < now);
                 return clone;
             }).ToList(),
-            _state.Bookmarks.Select(CloneBookmark).ToList());
+            _state.Bookmarks.Select(CloneBookmark).ToList(),
+            _state.Announcements
+                .Where(item => item.ExpiresAt is null || item.ExpiresAt > DateTimeOffset.UtcNow)
+                .OrderByDescending(item => item.CreatedAt)
+                .Select(item => new ClientAnnouncement(item.Id, item.Title, item.Message, item.Level, item.Url, item.CreatedAt, item.ExpiresAt) { ShareWithAllDevices = item.ShareWithAllDevices, AllowedDeviceIds = [.. item.AllowedDeviceIds] })
+                .ToList());
         _deviceIndex = _state.Devices.ToDictionary(device => device.Id, device => new DeviceAuth(device.Id, device.Name, device.TokenHash, device.Revoked));
         if (_state.Revision != _publishedRevision)
         {
@@ -668,6 +782,8 @@ public sealed partial class SharedStateStore
         _state.UpdatedAt = DateTimeOffset.UtcNow;
         var now = _state.UpdatedAt.ToUnixTimeSeconds();
         foreach (var profile in _state.Profiles) profile.Cookies.RemoveAll(cookie => cookie.ExpiresAt is { } expires && expires < now);
+        // Expired announcements stay visible in the dashboard for a week, then go.
+        _state.Announcements.RemoveAll(item => item.ExpiresAt is { } expires && expires < _state.UpdatedAt - ExpiredAnnouncementRetention);
     }
 
     private void PruneCodesLocked()

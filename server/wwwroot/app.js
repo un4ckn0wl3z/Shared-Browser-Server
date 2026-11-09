@@ -100,6 +100,7 @@ function render() {
   renderProfiles();
   renderBookmarks();
   renderCodes();
+  renderAnnouncements();
   renderBackups();
   renderAudit();
 }
@@ -224,6 +225,53 @@ function bookmarkRow(bookmark = {}) {
   row.querySelector('.remove').onclick = () => row.remove();
   row.querySelector('.move-up').onclick = () => { if (row.previousElementSibling) row.parentElement.insertBefore(row, row.previousElementSibling); };
   return row;
+}
+
+function renderAnnouncementDevices() {
+  const container = $('#announcement-devices');
+  const selected = new Set([...container.querySelectorAll('input:checked')].map(input => input.value));
+  container.replaceChildren(...state.devices.filter(device => !device.revoked).map(device => {
+    const label = document.createElement('label');
+    label.className = 'check';
+    label.innerHTML = `<input type="checkbox" value="${esc(device.id)}"${selected.has(device.id) ? ' checked' : ''}>${esc(device.name)}`;
+    return label;
+  }));
+  updateAnnouncementDevices();
+}
+
+function updateAnnouncementDevices() {
+  const some = $('#announcement-some').checked;
+  for (const input of document.querySelectorAll('#announcement-devices input')) input.disabled = !some;
+  $('#announcement-devices').style.opacity = some ? '1' : '.5';
+}
+
+function renderAnnouncements() {
+  renderAnnouncementDevices();
+  const container = $('#announcements');
+  container.replaceChildren(...(state.announcements || []).map(item => {
+    const element = document.createElement('article');
+    element.className = `announcement ${item.level}${item.expired ? ' expired' : ''}`;
+    const audience = item.shareWithAllDevices ? 'all browsers' : item.recipients.join(', ') || 'no active browsers';
+    const read = item.acknowledgedBy.map(entry => entry.name);
+    const expiry = item.expired ? 'expired' : item.expiresAt ? `expires ${relativeFuture(item.expiresAt)}` : 'no expiry';
+    element.innerHTML = `<header><div><span class="level ${esc(item.level)}">${esc(item.level.toUpperCase())}</span><strong></strong></div><button class="ghost" type="button">Delete</button></header>`
+      + `<p></p>${item.url ? `<small>Link: <a target="_blank" rel="noopener noreferrer"></a></small>` : ''}`
+      + `<small>Sent ${esc(relativeTime(item.createdAt))} to ${esc(audience)} · ${esc(expiry)} · dismissed by ${read.length} of ${item.recipients.length}${read.length ? ` (${esc(read.join(', '))})` : ''}</small>`;
+    element.querySelector('strong').textContent = item.title || '(no title)';
+    element.querySelector('p').textContent = item.message;
+    const link = element.querySelector('a');
+    if (link) { link.href = item.url; link.textContent = item.url; }
+    element.querySelector('button').onclick = async () => {
+      if (!confirm('Delete this announcement? Browsers remove its banner.')) return;
+      try {
+        await api(`/announcements/${item.id}`, { method: 'DELETE' });
+        await load();
+        toast('Announcement deleted');
+      } catch (error) { toast(error.message, true); }
+    };
+    return element;
+  }));
+  if (!container.children.length) container.innerHTML = '<p class="empty">No announcements yet.</p>';
 }
 
 function updateShareDevices() {
@@ -374,6 +422,30 @@ $('#add-bookmark').onclick = () => {
 
 $('#refresh').onclick = () => load().catch(error => toast(error.message, true));
 $('#share-all').onchange = updateShareDevices;
+$('#announcement-all').onchange = updateAnnouncementDevices;
+$('#announcement-some').onchange = updateAnnouncementDevices;
+
+$('#announcement-form').onsubmit = async event => {
+  event.preventDefault();
+  const expiry = $('#announcement-expiry').value;
+  try {
+    await api('/announcements', {
+      method: 'POST',
+      body: JSON.stringify({
+        title: $('#announcement-title').value,
+        message: $('#announcement-message').value,
+        level: $('#announcement-level').value,
+        url: $('#announcement-url').value,
+        expiresInMinutes: expiry ? Number(expiry) : null,
+        shareWithAllDevices: $('#announcement-all').checked,
+        allowedDeviceIds: [...document.querySelectorAll('#announcement-devices input:checked')].map(input => input.value)
+      })
+    });
+    for (const id of ['#announcement-title', '#announcement-message', '#announcement-url']) $(id).value = '';
+    await load();
+    toast('Announcement sent');
+  } catch (error) { toast(error.message, true); }
+};
 $('#share-some').onchange = updateShareDevices;
 
 $('#code-form').onsubmit = async event => {

@@ -147,6 +147,13 @@ app.MapGet("/api/client/events", async (HttpContext context, SharedStateStore st
     catch (OperationCanceledException) { }
 });
 
+app.MapPost("/api/client/announcements/{id}/ack", async (HttpContext context, string id, SharedStateStore store) =>
+{
+    var device = DeviceAuthorized(context.Request, store);
+    if (device is null) return Results.Unauthorized();
+    return await store.AcknowledgeAnnouncementAsync(device.Id, id) ? Results.NoContent() : Results.NotFound(new { error = "Announcement not found" });
+});
+
 app.MapPost("/api/client/sync", async (HttpContext context, SyncRequest request, SharedStateStore store) =>
 {
     var device = DeviceAuthorized(context.Request, store);
@@ -196,6 +203,28 @@ app.MapDelete("/api/admin/enrollment-codes/{id}", async (HttpContext context, st
     if (!Admin(context)) return Results.Unauthorized();
     if (!await store.RevokeEnrollmentCodeAsync(id)) return Results.NotFound(new { error = "Enrollment code not found" });
     Record(context, "enrollment_code.revoked", id);
+    return Results.NoContent();
+});
+
+app.MapPost("/api/admin/announcements", async (HttpContext context, AnnouncementRequest request, SharedStateStore store) =>
+{
+    if (!Admin(context)) return Results.Unauthorized();
+    try
+    {
+        var announcement = await store.CreateAnnouncementAsync(request);
+        var audience = announcement.ShareWithAllDevices ? "all browsers" : string.Join(", ", announcement.AllowedDeviceIds.Select(store.DeviceName));
+        Record(context, "announcement.sent", announcement.Title.Length > 0 ? announcement.Title : announcement.Message, $"{announcement.Level}, to {audience}{(announcement.ExpiresAt is { } expires ? $", expires {expires:u}" : "")}");
+        return Results.Json(announcement, statusCode: StatusCodes.Status201Created);
+    }
+    catch (InvalidOperationException error) { return Results.BadRequest(new { error = error.Message }); }
+});
+
+app.MapDelete("/api/admin/announcements/{id}", async (HttpContext context, string id, SharedStateStore store) =>
+{
+    if (!Admin(context)) return Results.Unauthorized();
+    var removed = await store.DeleteAnnouncementAsync(id);
+    if (removed is null) return Results.NotFound(new { error = "Announcement not found" });
+    Record(context, "announcement.deleted", removed.Title.Length > 0 ? removed.Title : removed.Message, $"dismissed by {removed.Acknowledgements.Count} browser(s)");
     return Results.NoContent();
 });
 

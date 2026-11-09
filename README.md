@@ -74,6 +74,7 @@ The primary-writer model prevents a logged-out secondary browser from replacing 
 - Per-profile access: share a domain with all browsers or only selected ones
 - Live updates over Server-Sent Events
 - Audit log, automatic vault backups, and vault export/import
+- Announcements from the administrator to all or selected browsers
 
 Session values are sensitive credentials. Use this only for domains and accounts you own or are explicitly authorized to administer.
 
@@ -319,9 +320,15 @@ The first version deliberately uses the central server as the authority. Direct 
 
 ## Administration
 
+### Announcements
+
+The dashboard's **Send an announcement** section sends a message to every browser or to selected ones. An announcement has a title and/or message, a level (info, warning, or critical), an optional link, and an optional expiry (1 hour to 30 days, or never). Connected browsers show it within a second or two as a banner below the toolbar, and the page moves down so nothing is covered. Warning and critical announcements also raise a desktop notification.
+
+The banner is plain text: nothing in an announcement is interpreted as HTML. **Open link** opens the link in a new tab, and **×** dismisses the banner on that browser. The dismissal is remembered across restarts and reported to the server, so the dashboard lists which browsers have dismissed each announcement. Deleting an announcement removes its banner everywhere; expired announcements disappear from browsers and stay listed in the dashboard for a week.
+
 ### Audit log
 
-The dashboard's **Activity** section lists enrollments, enrollment codes, settings and proxy changes, profile, bookmark and device changes, vault exports, imports and restores, and failed administrator sign-ins or enrollments (at most one entry per address every five minutes). Entries are also written to `audit.jsonl` in the data directory and to the server log. Set `SHARED_BROWSER_TRUST_FORWARDED_HEADERS=true` behind a reverse proxy so the recorded address is the client's rather than the proxy's.
+The dashboard's **Activity** section lists enrollments, enrollment codes, settings and proxy changes, announcements, profile, bookmark and device changes, vault exports, imports and restores, and failed administrator sign-ins or enrollments (at most one entry per address every five minutes). Entries are also written to `audit.jsonl` in the data directory and to the server log. Set `SHARED_BROWSER_TRUST_FORWARDED_HEADERS=true` behind a reverse proxy so the recorded address is the client's rather than the proxy's.
 
 ### Backups, export and import
 

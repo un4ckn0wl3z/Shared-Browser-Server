@@ -1,4 +1,4 @@
-const { app, BrowserWindow, WebContentsView, Menu, clipboard, ipcMain, net, screen, session, safeStorage, shell } = require('electron');
+const { app, BrowserWindow, WebContentsView, Menu, Notification, clipboard, ipcMain, net, screen, session, safeStorage, shell } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const crypto = require('node:crypto');
@@ -45,6 +45,8 @@ let eventsConnected = false;
 let eventsController;
 let sessionSaveTimer;
 let quitting = false;
+let chromeHeight = TOOLBAR_HEIGHT;
+let announcementTimer;
 const closedTabs = [];
 let autoUpdater;
 let updateTimer;
@@ -86,7 +88,8 @@ function defaultSnapshot() {
       proxy: { enabled: false, host: '127.0.0.1', port: 8899, allowedPorts: '80,443', bypassList: 'localhost;127.0.0.1' }
     },
     profiles: [],
-    bookmarks: []
+    bookmarks: [],
+    announcements: []
   };
 }
 
@@ -98,6 +101,7 @@ function defaultConfig() {
     networkMode: 'direct',
     strictPrivacy: false,
     window: undefined,
+    announcements: { dismissed: [], notified: [], pendingAcks: [] },
     secrets: { deviceToken: '', enrollmentToken: '', cache: defaultSnapshot(), session: { tabs: [], active: 0 } }
   };
 }
@@ -137,6 +141,11 @@ function loadConfig() {
       networkMode: disk.networkMode === 'managed' ? 'managed' : 'direct',
       strictPrivacy: disk.strictPrivacy === true,
       window: normalizeWindowState(disk.window),
+      announcements: {
+        dismissed: stringList(disk.announcements?.dismissed),
+        notified: stringList(disk.announcements?.notified),
+        pendingAcks: stringList(disk.announcements?.pendingAcks)
+      },
       secrets: {
         deviceToken: String(secrets?.deviceToken || ''),
         enrollmentToken: String(secrets?.enrollmentToken || ''),
@@ -161,6 +170,7 @@ function saveConfig() {
     networkMode: config.networkMode,
     strictPrivacy: config.strictPrivacy,
     window: config.window,
+    announcements: config.announcements,
     // Open tab addresses can contain tokens, so they are encrypted along with the device credentials.
     protected: encrypt(config.secrets)
   };
@@ -180,8 +190,73 @@ function normalizeSnapshot(input) {
   input.settings.proxy ||= fallback.settings.proxy;
   input.profiles = Array.isArray(input.profiles) ? input.profiles : [];
   input.bookmarks = Array.isArray(input.bookmarks) ? input.bookmarks.filter(item => item && /^https?:\/\//i.test(item.url || '')) : [];
+  input.announcements = Array.isArray(input.announcements)
+    ? input.announcements.filter(item => item && typeof item.id === 'string' && ['info', 'warning', 'critical'].includes(item.level))
+      .map(item => ({ ...item, title: String(item.title || ''), message: String(item.message || ''), url: /^https?:\/\//i.test(item.url || '') ? item.url : '' }))
+    : [];
   input.revision = Number(input.revision) || 0;
   return input;
+}
+
+function stringList(value) {
+  return Array.isArray(value) ? value.filter(item => typeof item === 'string').slice(-500) : [];
+}
+
+// ---- Announcements ------------------------------------------------------------------------------
+
+function visibleAnnouncements() {
+  const dismissed = new Set(config.announcements.dismissed);
+  const now = Date.now();
+  return config.secrets.cache.announcements.filter(item => !dismissed.has(item.id) && !(item.expiresAt && Date.parse(item.expiresAt) <= now));
+}
+
+// Sends the banners to the toolbar, raises a desktop notification for new warning and critical
+// announcements, and schedules a refresh for the next one that expires.
+function publishAnnouncements() {
+  const visible = visibleAnnouncements();
+  send('browser:announcements', visible);
+  const known = new Set(config.secrets.cache.announcements.map(item => item.id));
+  const notified = new Set(config.announcements.notified);
+  let changed = false;
+  for (const item of visible) {
+    if (notified.has(item.id)) continue;
+    notified.add(item.id);
+    changed = true;
+    if (item.level !== 'info' && Notification.isSupported()) {
+      const notification = new Notification({ title: item.title || 'Announcement', body: item.message || item.title, urgency: item.level === 'critical' ? 'critical' : 'normal' });
+      notification.on('click', () => { if (mainWindow) { if (mainWindow.isMinimized()) mainWindow.restore(); mainWindow.focus(); } });
+      notification.show();
+    }
+  }
+  // Forget ids the server no longer sends so the lists cannot grow without bound.
+  const prune = list => list.filter(id => known.has(id));
+  const before = JSON.stringify(config.announcements);
+  config.announcements = { dismissed: prune(config.announcements.dismissed), notified: prune([...notified]), pendingAcks: config.announcements.pendingAcks };
+  if (changed || before !== JSON.stringify(config.announcements)) saveConfig();
+  clearTimeout(announcementTimer);
+  const next = Math.min(...visible.filter(item => item.expiresAt).map(item => Date.parse(item.expiresAt) - Date.now()));
+  if (Number.isFinite(next)) announcementTimer = setTimeout(publishAnnouncements, Math.max(1000, Math.min(next + 500, 2 ** 31 - 1)));
+}
+
+async function dismissAnnouncement(id) {
+  const value = String(id);
+  if (!config.announcements.dismissed.includes(value)) config.announcements.dismissed.push(value);
+  if (!config.announcements.pendingAcks.includes(value)) config.announcements.pendingAcks.push(value);
+  saveConfig();
+  publishAnnouncements();
+  await sendAnnouncementAcks();
+}
+
+// Tells the server which announcements were dismissed; anything that fails is retried after the next sync.
+async function sendAnnouncementAcks() {
+  if (!config.secrets.deviceToken || !config.announcements.pendingAcks.length) return;
+  const remaining = [];
+  for (const id of config.announcements.pendingAcks) {
+    try { await api(`/api/client/announcements/${encodeURIComponent(id)}/ack`, { method: 'POST' }); }
+    catch (error) { if (!/not found/i.test(error.message)) remaining.push(id); }
+  }
+  config.announcements.pendingAcks = remaining;
+  saveConfig();
 }
 
 function normalizeWindowState(value) {
@@ -309,7 +384,7 @@ function layoutActiveView() {
   const tab = tabs.get(activeTabId);
   if (!tab || !mainWindow || mainWindow.isDestroyed()) return;
   const [width, height] = mainWindow.getContentSize();
-  tab.view.setBounds({ x: 0, y: TOOLBAR_HEIGHT, width, height: Math.max(0, height - TOOLBAR_HEIGHT) });
+  tab.view.setBounds({ x: 0, y: chromeHeight, width, height: Math.max(0, height - chromeHeight) });
 }
 
 function publishAll() {
@@ -706,6 +781,8 @@ async function installSnapshot(snapshot, previous) {
     }
   }
   if (JSON.stringify(previous.bookmarks) !== JSON.stringify(snapshot.bookmarks)) send('browser:bookmarks', snapshot.bookmarks);
+  if (JSON.stringify(previous.announcements) !== JSON.stringify(snapshot.announcements)) publishAnnouncements();
+  sendAnnouncementAcks().catch(() => { });
   const primary = isPrimary();
   // A browser that has just been made primary publishes everything it holds right away.
   if (primary && !wasPrimary) {
@@ -945,6 +1022,7 @@ async function pushCookies(pageUrl, cookies, complete) {
       }
     }
     if (JSON.stringify(previous.bookmarks) !== JSON.stringify(config.secrets.cache.bookmarks)) send('browser:bookmarks', config.secrets.cache.bookmarks);
+    if (JSON.stringify(previous.announcements) !== JSON.stringify(config.secrets.cache.announcements)) publishAnnouncements();
   }
 }
 
@@ -1055,6 +1133,8 @@ async function startClient() {
     await applyAllCookies();
     watchCookies();
     await openInitialTabs();
+    publishAnnouncements();
+    sendAnnouncementAcks().catch(() => { });
     wasPrimary = isPrimary();
     await pushAllStoredCookies();
     scheduleSync();
@@ -1063,6 +1143,7 @@ async function startClient() {
     status(error.message, true);
     try { await applyAllCookies(); } catch { }
     await openInitialTabs();
+    publishAnnouncements();
     send('browser:show-settings');
     // Keep retrying in the background (for example when the server was briefly unreachable at startup).
     if (config.secrets.deviceToken) {
@@ -1099,7 +1180,7 @@ function showBookmarksMenu(position) {
   Menu.buildFromTemplate(template).popup({
     window: mainWindow,
     x: Math.round(Number(position?.x) || 0),
-    y: Math.round(Number(position?.y) || TOOLBAR_HEIGHT)
+    y: Math.round(Number(position?.y) || chromeHeight)
   });
 }
 
@@ -1240,7 +1321,18 @@ function publicConfig() {
 function registerIpc() {
   ipcMain.handle('browser:check-updates', checkForUpdates);
   ipcMain.handle('browser:install-update', installUpdate);
-  ipcMain.handle('browser:bootstrap', () => ({ config: publicConfig(), update: updateState, tabs: tabSummaries(), bookmarks: config.secrets.cache.bookmarks }));
+  ipcMain.handle('browser:bootstrap', () => ({ config: publicConfig(), update: updateState, tabs: tabSummaries(), bookmarks: config.secrets.cache.bookmarks, announcements: visibleAnnouncements() }));
+  ipcMain.handle('browser:dismiss-announcement', (_, id) => dismissAnnouncement(id));
+  ipcMain.handle('browser:open-announcement-link', (_, id) => {
+    const item = config.secrets.cache.announcements.find(entry => entry.id === String(id));
+    if (item?.url) return addTab(item.url);
+  });
+  ipcMain.handle('browser:chrome-height', (_, height) => {
+    const value = Math.round(Number(height));
+    if (!Number.isFinite(value)) return;
+    chromeHeight = Math.min(Math.max(value, TOOLBAR_HEIGHT), 420);
+    layoutActiveView();
+  });
   ipcMain.handle('browser:show-bookmarks', (_, position) => showBookmarksMenu(position));
   ipcMain.handle('browser:reopen-tab', reopenClosedTab);
   ipcMain.handle('browser:find', (_, text, options) => {
