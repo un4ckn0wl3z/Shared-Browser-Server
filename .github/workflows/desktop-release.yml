@@ -31,7 +31,7 @@ jobs:
               electron-client/dist/*.exe.blockmap
               electron-client/dist/latest.yml
           - name: macOS universal
-            os: macos-14
+            os: macos-15
             command: dist:mac
             artifact: shared-browser-macos-universal
             files: electron-client/dist/*.dmg
