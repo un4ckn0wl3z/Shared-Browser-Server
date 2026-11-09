@@ -126,3 +126,6 @@ public sealed record ClientAnnouncement(string Id, string Title, string Message,
     [JsonIgnore] public IReadOnlyList<string> AllowedDeviceIds { get; init; } = [];
 }
 public sealed record BackupInfo(string Name, long Size, DateTimeOffset CreatedAt);
+public sealed record DeleteProfilesRequest(List<string>? Ids);
+/// <summary>Purging every profile must be confirmed explicitly, so a stray request cannot do it.</summary>
+public sealed record PurgeProfilesRequest(bool Confirm);

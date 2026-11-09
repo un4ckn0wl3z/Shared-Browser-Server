@@ -1,6 +1,8 @@
 const $ = selector => document.querySelector(selector);
 let token = sessionStorage.getItem('sharedBrowserAdmin') || '';
 let state = null;
+// Profile ids ticked for bulk deletion; kept across re-renders so the auto-refresh does not clear them.
+const selectedProfiles = new Set();
 
 function toast(message, error = false) {
   const element = $('#toast');
@@ -97,7 +99,11 @@ function render() {
   primary.value = settings.primaryDeviceId || '';
 
   renderDevices();
+  // Forget selections for profiles that no longer exist (deleted elsewhere or by a restore).
+  const existing = new Set(state.profiles.map(profile => profile.id));
+  for (const id of [...selectedProfiles]) if (!existing.has(id)) selectedProfiles.delete(id);
   renderProfiles();
+  updateBulkBar();
   renderBookmarks();
   renderCodes();
   renderAnnouncements();
@@ -149,11 +155,35 @@ function renderProfiles() {
   }
   for (const profile of [...state.profiles].sort((a, b) => a.domain.localeCompare(b.domain))) {
     const element = document.createElement('div');
-    element.className = 'profile';
-    element.innerHTML = `<div><strong>${profile.enabled ? '●' : '○'} ${esc(profile.name)}</strong><span>${esc(profile.domain)} · ${profile.cookieCount} cookie(s)${profile.enabled ? '' : ' · disabled'}</span></div><button class="secondary">Edit</button>`;
+    element.className = `profile${selectedProfiles.has(profile.id) ? ' selected' : ''}`;
+    element.innerHTML = `<label class="pick"><input type="checkbox" aria-label="Select ${esc(profile.domain)}"${selectedProfiles.has(profile.id) ? ' checked' : ''}><div><strong>${profile.enabled ? '●' : '○'} ${esc(profile.name)}</strong><span>${esc(profile.domain)} · ${profile.cookieCount} cookie(s)${profile.enabled ? '' : ' · disabled'}</span></div></label><button class="secondary">Edit</button>`;
+    element.querySelector('input').onchange = event => {
+      if (event.target.checked) selectedProfiles.add(profile.id); else selectedProfiles.delete(profile.id);
+      element.classList.toggle('selected', event.target.checked);
+      updateBulkBar();
+    };
     element.querySelector('button').onclick = () => edit(profile);
     container.append(element);
   }
+}
+
+function updateBulkBar() {
+  const total = state?.profiles.length || 0;
+  const count = selectedProfiles.size;
+  const button = $('#delete-selected');
+  button.disabled = count === 0;
+  button.textContent = count ? `Delete selected (${count})` : 'Delete selected';
+  $('#purge-profiles').disabled = total === 0;
+  const all = $('#select-all-profiles');
+  all.disabled = total === 0;
+  all.checked = total > 0 && count === total;
+  all.indeterminate = count > 0 && count < total;
+}
+
+async function deleteProfiles(ids) {
+  const result = await api('/profiles/delete', { method: 'POST', body: JSON.stringify({ ids }) });
+  for (const id of ids) selectedProfiles.delete(id);
+  return result;
 }
 
 function settingsPayload(proxy) {
@@ -421,6 +451,45 @@ $('#add-bookmark').onclick = () => {
 };
 
 $('#refresh').onclick = () => load().catch(error => toast(error.message, true));
+
+$('#select-all-profiles').onchange = event => {
+  selectedProfiles.clear();
+  if (event.target.checked) for (const profile of state.profiles) selectedProfiles.add(profile.id);
+  renderProfiles();
+  updateBulkBar();
+};
+
+$('#delete-selected').onclick = async () => {
+  const ids = [...selectedProfiles];
+  if (!ids.length) return;
+  const domains = state.profiles.filter(profile => selectedProfiles.has(profile.id)).map(profile => profile.domain);
+  const preview = domains.slice(0, 8).join('\n') + (domains.length > 8 ? `\n…and ${domains.length - 8} more` : '');
+  if (!confirm(`Delete ${ids.length} profile(s)?\n\n${preview}\n\nOther browsers remove these cookies. A backup of the vault is saved first.`)) return;
+  try {
+    const result = await deleteProfiles(ids);
+    $('#editor').hidden = true;
+    await load();
+    toast(`Deleted ${result.deleted} profile(s). Backup: ${result.backup}`);
+  } catch (error) { toast(error.message, true); }
+};
+
+$('#purge-profiles').onclick = async () => {
+  const total = state.profiles.length;
+  if (!total) return;
+  const typed = prompt(`Purge all ${total} profile(s) and their cookies from the vault?\n\nOther browsers remove these cookies. A backup of the vault is saved first and can be restored under Vault backups.\n\nType PURGE to confirm.`);
+  if (typed === null) return;
+  if (typed.trim() !== 'PURGE') {
+    toast('Nothing was deleted: type PURGE to confirm', true);
+    return;
+  }
+  try {
+    const result = await api('/profiles/purge', { method: 'POST', body: JSON.stringify({ confirm: true }) });
+    selectedProfiles.clear();
+    $('#editor').hidden = true;
+    await load();
+    toast(`Purged ${result.deleted} profile(s). Backup: ${result.backup}`);
+  } catch (error) { toast(error.message, true); }
+};
 $('#share-all').onchange = updateShareDevices;
 $('#announcement-all').onchange = updateAnnouncementDevices;
 $('#announcement-some').onchange = updateAnnouncementDevices;

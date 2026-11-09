@@ -274,6 +274,26 @@ app.MapDelete("/api/admin/profiles/{id}", async (HttpContext context, string id,
     return Results.NoContent();
 });
 
+app.MapPost("/api/admin/profiles/delete", async (HttpContext context, DeleteProfilesRequest request, SharedStateStore store) =>
+{
+    if (!Admin(context)) return Results.Unauthorized();
+    var ids = (request.Ids ?? []).Where(id => !string.IsNullOrWhiteSpace(id)).Distinct().ToList();
+    if (ids.Count == 0) return Results.BadRequest(new { error = "Select at least one profile" });
+    var (removed, backup) = await store.DeleteProfilesAsync(ids);
+    if (removed.Count == 0) return Results.NotFound(new { error = "None of the selected profiles exist" });
+    Record(context, "profiles.deleted", $"{removed.Count} profile(s)", $"{DomainList(removed)}; backup {backup}");
+    return Results.Ok(new { deleted = removed.Count, backup });
+});
+
+app.MapPost("/api/admin/profiles/purge", async (HttpContext context, PurgeProfilesRequest request, SharedStateStore store) =>
+{
+    if (!Admin(context)) return Results.Unauthorized();
+    if (!request.Confirm) return Results.BadRequest(new { error = "Purging every profile must be confirmed" });
+    var (removed, backup) = await store.DeleteProfilesAsync(null);
+    Record(context, "profiles.purged", $"{removed.Count} profile(s)", removed.Count == 0 ? "vault was already empty" : $"{DomainList(removed)}; backup {backup}");
+    return Results.Ok(new { deleted = removed.Count, backup });
+});
+
 app.MapPost("/api/admin/devices/{id}/revoke", async (HttpContext context, string id, SharedStateStore store) =>
 {
     if (!Admin(context)) return Results.Unauthorized();
@@ -337,6 +357,12 @@ app.MapPost("/api/admin/backups/{name}/restore", async (HttpContext context, str
 });
 
 app.Run();
+
+static string DomainList(IReadOnlyList<SessionProfile> profiles)
+{
+    var names = profiles.Select(item => item.Domain).Take(10).ToList();
+    return string.Join(", ", names) + (profiles.Count > names.Count ? $" and {profiles.Count - names.Count} more" : "");
+}
 
 static string ProfileSummary(SessionProfile profile, SharedStateStore store)
 {

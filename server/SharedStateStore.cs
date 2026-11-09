@@ -426,6 +426,28 @@ public sealed partial class SharedStateStore
         finally { _gate.Release(); }
     }
 
+    /// <summary>
+    /// Deletes several profiles (or every profile when <paramref name="ids"/> is null) in one revision,
+    /// after saving a backup so a mistaken purge can be restored from the dashboard.
+    /// Returns the deleted profiles and the name of that backup.
+    /// </summary>
+    public async Task<(List<SessionProfile> Removed, string Backup)> DeleteProfilesAsync(IReadOnlyCollection<string>? ids)
+    {
+        await _gate.WaitAsync();
+        try
+        {
+            var wanted = ids is null ? null : new HashSet<string>(ids);
+            var removed = _state.Profiles.Where(item => wanted is null || wanted.Contains(item.Id)).ToList();
+            if (removed.Count == 0) return ([], "");
+            var backup = await BackupLockedAsync(ids is null ? "before-purge" : "before-delete");
+            _state.Profiles.RemoveAll(removed.Contains);
+            BumpRevision();
+            await SaveLockedAsync();
+            return (removed.Select(PublicProfile).ToList(), backup);
+        }
+        finally { _gate.Release(); }
+    }
+
     public async Task<string?> SetRevokedAsync(string id, bool revoked)
     {
         await _gate.WaitAsync();

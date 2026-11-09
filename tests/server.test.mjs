@@ -204,6 +204,47 @@ describe('management API', () => {
   });
 });
 
+describe('bulk profile deletion', () => {
+  let server;
+  before(async () => { server = await startServer(); });
+  after(async () => { await server?.stop(); });
+
+  test('deletes selected profiles and purges the rest, backing up first', async () => {
+    const reader = await server.enroll(randomDeviceId(), 'reader');
+    const ids = [];
+    for (const domain of ['one.example', 'two.example', 'three.example']) {
+      ids.push((await server.admin('/profiles', 'POST', { name: domain, domain, enabled: true, cookies: [cookie('c', '1', domain)] })).id);
+    }
+    const domains = async () => (await (await server.device(reader, '/snapshot')).json()).profiles.map(item => item.domain).sort();
+    assert.deepEqual(await domains(), ['one.example', 'three.example', 'two.example']);
+
+    const revision = (await server.status()).revision;
+    const deleted = await server.admin('/profiles/delete', 'POST', { ids: [ids[0], ids[1], 'missing-id'] });
+    assert.equal(deleted.deleted, 2);
+    assert.match(deleted.backup, /before-delete/);
+    assert.deepEqual(await domains(), ['three.example']);
+    // One bulk delete is one revision, so browsers apply it in a single step.
+    assert.equal((await server.status()).revision, revision + 1);
+    await assert.rejects(server.admin('/profiles/delete', 'POST', { ids: [] }), /Select at least one/);
+    await assert.rejects(server.admin('/profiles/delete', 'POST', { ids: ['missing-id'] }), { status: 404 });
+
+    await assert.rejects(server.admin('/profiles/purge', 'POST', { confirm: false }), /confirmed/);
+    const purged = await server.admin('/profiles/purge', 'POST', { confirm: true });
+    assert.equal(purged.deleted, 1);
+    assert.match(purged.backup, /before-purge/);
+    assert.deepEqual(await domains(), []);
+    assert.equal((await server.admin('/profiles/purge', 'POST', { confirm: true })).deleted, 0);
+
+    const status = await server.status();
+    assert.ok(status.backups.some(item => item.name === purged.backup));
+    const actions = status.audit.map(item => item.action);
+    assert.ok(actions.includes('profiles.deleted') && actions.includes('profiles.purged'));
+    // The purge can be undone from its backup.
+    await server.admin(`/backups/${purged.backup}/restore`, 'POST', {});
+    assert.deepEqual(await domains(), ['three.example']);
+  });
+});
+
 describe('forward proxy', () => {
   let server;
   let device;
