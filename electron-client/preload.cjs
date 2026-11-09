@@ -16,10 +16,17 @@ contextBridge.exposeInMainWorld('sharedBrowser', {
   saveSettings: (settings) => ipcRenderer.invoke('browser:save-settings', settings),
   checkForUpdates: () => ipcRenderer.invoke('browser:check-updates'),
   installUpdate: () => ipcRenderer.invoke('browser:install-update'),
+  showBookmarks: (position) => ipcRenderer.invoke('browser:show-bookmarks', position),
+  reopenTab: () => ipcRenderer.invoke('browser:reopen-tab'),
+  find: (text, options) => ipcRenderer.invoke('browser:find', text, options),
+  stopFind: () => ipcRenderer.invoke('browser:stop-find'),
   onState: (callback) => ipcRenderer.on('browser:state', (_, value) => callback(value)),
   onTabs: (callback) => ipcRenderer.on('browser:tabs', (_, value) => callback(value)),
   onStatus: (callback) => ipcRenderer.on('browser:status', (_, value) => callback(value)),
   onShowSettings: (callback) => ipcRenderer.on('browser:show-settings', () => callback()),
   onFocusAddress: (callback) => ipcRenderer.on('browser:focus-address', () => callback()),
-  onUpdate: (callback) => ipcRenderer.on('browser:update', (_, value) => callback(value))
+  onUpdate: (callback) => ipcRenderer.on('browser:update', (_, value) => callback(value)),
+  onBookmarks: (callback) => ipcRenderer.on('browser:bookmarks', (_, value) => callback(value)),
+  onShowFind: (callback) => ipcRenderer.on('browser:show-find', (_, value) => callback(value)),
+  onFindResult: (callback) => ipcRenderer.on('browser:find-result', (_, value) => callback(value))
 });

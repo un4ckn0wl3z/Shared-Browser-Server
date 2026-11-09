@@ -15,8 +15,16 @@
       <button id="back" title="Back">←</button>
       <button id="forward" title="Forward">→</button>
       <button id="reload" title="Reload">↻</button>
-      <input id="address" aria-label="Address" autocomplete="off" spellcheck="false">
+      <input id="address" aria-label="Address" placeholder="Search or enter address" autocomplete="off" spellcheck="false">
       <button id="go">Go</button>
+      <button id="bookmarks" title="Shared bookmarks">★</button>
+      <div id="find-bar" class="find-bar" hidden>
+        <input id="find-text" aria-label="Find in page" placeholder="Find in page" autocomplete="off" spellcheck="false">
+        <span id="find-count"></span>
+        <button id="find-previous" class="compact-small" title="Previous match (Shift+Enter)">↑</button>
+        <button id="find-next" class="compact-small" title="Next match (Enter)">↓</button>
+        <button id="find-close" class="compact-small" title="Close (Esc)">×</button>
+      </div>
       <button id="update" class="update" hidden></button>
       <button id="sync">Sync now</button>
       <button id="settings">Settings</button>

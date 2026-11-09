@@ -5,6 +5,12 @@ using System.Text;
 public sealed class ForwardProxyService : BackgroundService
 {
     private const int MaxHeaderBytes = 64 * 1024;
+    private const int MaxActiveConnections = 2048;
+    private static readonly TimeSpan HeaderTimeout = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan ConnectTimeout = TimeSpan.FromSeconds(20);
+    // Tunnels stay open while data flows (downloads, WebSockets, streaming) and close after this much silence.
+    private static readonly TimeSpan IdleTimeout = TimeSpan.FromMinutes(10);
+    private static readonly TimeSpan RevocationCheckInterval = TimeSpan.FromSeconds(5);
     private readonly SharedStateStore _store;
     private readonly ILogger<ForwardProxyService> _logger;
     private long _totalConnections;
@@ -72,7 +78,13 @@ public sealed class ForwardProxyService : BackgroundService
                         continue;
                     }
                     var client = await accept;
-                    _ = HandleClientAsync(client, proxy.AllowedPorts, stoppingToken);
+                    if (Interlocked.Read(ref _activeConnections) >= MaxActiveConnections)
+                    {
+                        _logger.LogWarning("Forward proxy rejected a connection because {Limit} connections are already open", MaxActiveConnections);
+                        client.Dispose();
+                        continue;
+                    }
+                    _ = HandleClientAsync(client, stoppingToken);
                 }
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { }
@@ -91,7 +103,7 @@ public sealed class ForwardProxyService : BackgroundService
         }
     }
 
-    private async Task HandleClientAsync(TcpClient client, string allowedPorts, CancellationToken serverToken)
+    private async Task HandleClientAsync(TcpClient client, CancellationToken serverToken)
     {
         Interlocked.Increment(ref _totalConnections);
         Interlocked.Increment(ref _activeConnections);
@@ -101,13 +113,14 @@ public sealed class ForwardProxyService : BackgroundService
             {
                 client.NoDelay = true;
                 using var timeout = CancellationTokenSource.CreateLinkedTokenSource(serverToken);
-                timeout.CancelAfter(TimeSpan.FromMinutes(5));
+                timeout.CancelAfter(HeaderTimeout);
                 var clientStream = client.GetStream();
                 var request = await ReadRequestAsync(clientStream, timeout.Token);
                 if (request is null) return;
                 Interlocked.Add(ref _bytesFromClients, request.Header.Length + request.Remainder.Length);
 
-                if (!Authorized(request.Headers))
+                var deviceId = AuthorizedDevice(request.Headers);
+                if (deviceId is null)
                 {
                     await WriteAsciiAsync(clientStream, "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"Shared Browser Proxy\"\r\nConnection: close\r\nContent-Length: 0\r\n\r\n", timeout.Token);
                     return;
@@ -118,7 +131,7 @@ public sealed class ForwardProxyService : BackgroundService
                     await WriteErrorAsync(clientStream, 400, "Bad proxy request", timeout.Token);
                     return;
                 }
-                if (!ParseAllowedPorts(allowedPorts).Contains(port))
+                if (!ParseAllowedPorts(_store.Settings.Proxy.AllowedPorts).Contains(port))
                 {
                     await WriteErrorAsync(clientStream, 403, "Destination port is not allowed", timeout.Token);
                     return;
@@ -132,7 +145,14 @@ public sealed class ForwardProxyService : BackgroundService
                 }
 
                 using var remote = new TcpClient(address.AddressFamily) { NoDelay = true };
-                await remote.ConnectAsync(address, port, timeout.Token);
+                timeout.CancelAfter(ConnectTimeout);
+                try { await remote.ConnectAsync(address, port, timeout.Token); }
+                catch (Exception error) when (error is SocketException || (error is OperationCanceledException && !serverToken.IsCancellationRequested))
+                {
+                    await WriteErrorAsync(clientStream, 502, "Destination is unreachable", CancellationToken.None);
+                    return;
+                }
+                timeout.CancelAfter(IdleTimeout);
                 var remoteStream = remote.GetStream();
 
                 if (request.Method.Equals("CONNECT", StringComparison.OrdinalIgnoreCase))
@@ -146,11 +166,12 @@ public sealed class ForwardProxyService : BackgroundService
                     if (request.Remainder.Length > 0) await remoteStream.WriteAsync(request.Remainder, timeout.Token);
                 }
 
-                var upload = PumpAsync(clientStream, remoteStream, true, timeout.Token);
-                var download = PumpAsync(remoteStream, clientStream, false, timeout.Token);
-                await Task.WhenAny(upload, download);
+                var upload = PumpAsync(clientStream, remoteStream, true, timeout);
+                var download = PumpAsync(remoteStream, clientStream, false, timeout);
+                var revocation = WatchRevocationAsync(deviceId, timeout.Token);
+                await Task.WhenAny(upload, download, revocation);
                 timeout.Cancel();
-                try { await Task.WhenAll(upload, download); } catch (OperationCanceledException) { }
+                try { await Task.WhenAll(upload, download, revocation); } catch (Exception error) when (error is OperationCanceledException or IOException or SocketException) { }
             }
             catch (OperationCanceledException) { }
             catch (Exception error) { _logger.LogDebug(error, "Proxy connection ended with an error"); }
@@ -158,17 +179,25 @@ public sealed class ForwardProxyService : BackgroundService
         }
     }
 
-    private bool Authorized(Dictionary<string, string> headers)
+    private string? AuthorizedDevice(Dictionary<string, string> headers)
     {
-        if (!headers.TryGetValue("Proxy-Authorization", out var value) || !value.StartsWith("Basic ", StringComparison.OrdinalIgnoreCase)) return false;
+        if (!headers.TryGetValue("Proxy-Authorization", out var value) || !value.StartsWith("Basic ", StringComparison.OrdinalIgnoreCase)) return null;
         try
         {
             var decoded = Encoding.UTF8.GetString(Convert.FromBase64String(value[6..].Trim()));
             var separator = decoded.IndexOf(':');
-            if (separator < 1) return false;
-            return _store.AuthorizeDevice(decoded[..separator], decoded[(separator + 1)..]) is not null;
+            if (separator < 1) return null;
+            return _store.AuthorizeDevice(decoded[..separator], decoded[(separator + 1)..])?.Id;
         }
-        catch { return false; }
+        catch { return null; }
+    }
+
+    // Revoking a device in the dashboard also ends the tunnels it already has open, instead of letting
+    // them run until they go idle.
+    private async Task WatchRevocationAsync(string deviceId, CancellationToken cancellationToken)
+    {
+        while (_store.IsDeviceActive(deviceId) && _store.Settings.Proxy.Enabled)
+            await Task.Delay(RevocationCheckInterval, cancellationToken);
     }
 
     private static async Task<ProxyRequest?> ReadRequestAsync(NetworkStream stream, CancellationToken cancellationToken)
@@ -247,26 +276,44 @@ public sealed class ForwardProxyService : BackgroundService
         return addresses.FirstOrDefault(IsPublicAddress);
     }
 
-    private static bool IsPublicAddress(IPAddress address)
+    internal static bool IsPublicAddress(IPAddress address)
     {
         if (address.IsIPv4MappedToIPv6) address = address.MapToIPv4();
-        if (IPAddress.IsLoopback(address) || address.Equals(IPAddress.Any) || address.Equals(IPAddress.IPv6Any) || address.IsIPv6LinkLocal || address.IsIPv6Multicast || address.IsIPv6SiteLocal) return false;
+        if (IPAddress.IsLoopback(address) || address.Equals(IPAddress.Any) || address.Equals(IPAddress.IPv6Any) || address.Equals(IPAddress.IPv6None) || address.IsIPv6LinkLocal || address.IsIPv6Multicast || address.IsIPv6SiteLocal || address.IsIPv6UniqueLocal) return false;
         var bytes = address.GetAddressBytes();
         if (address.AddressFamily == AddressFamily.InterNetwork)
         {
-            return !(bytes[0] is 0 or 10 or 127 || bytes[0] == 169 && bytes[1] == 254 || bytes[0] == 172 && bytes[1] is >= 16 and <= 31 || bytes[0] == 192 && bytes[1] == 168 || bytes[0] >= 224);
+            return !(bytes[0] is 0 or 10 or 127
+                || bytes[0] == 100 && bytes[1] is >= 64 and <= 127          // 100.64.0.0/10 carrier-grade NAT (also Tailscale)
+                || bytes[0] == 169 && bytes[1] == 254                       // link-local, including cloud metadata endpoints
+                || bytes[0] == 172 && bytes[1] is >= 16 and <= 31
+                || bytes[0] == 192 && bytes[1] == 0 && bytes[2] is 0 or 2   // IETF protocol assignments, TEST-NET-1
+                || bytes[0] == 192 && bytes[1] == 168
+                || bytes[0] == 198 && bytes[1] is 18 or 19                  // benchmarking
+                || bytes[0] == 198 && bytes[1] == 51 && bytes[2] == 100     // TEST-NET-2
+                || bytes[0] == 203 && bytes[1] == 0 && bytes[2] == 113      // TEST-NET-3
+                || bytes[0] >= 224);                                        // multicast, reserved, broadcast
         }
-        return !(bytes[0] is 0xFC or 0xFD);
+        // NAT64 (64:ff9b::/96) embeds an IPv4 address, which must pass the IPv4 rules as well.
+        if (bytes[0] == 0x00 && bytes[1] == 0x64 && bytes[2] == 0xFF && bytes[3] == 0x9B && bytes[4..12].All(value => value == 0))
+            return IsPublicAddress(new IPAddress(bytes[12..16]));
+        // ::/96 (deprecated IPv4-compatible), 2001:db8::/32 documentation, 6to4 relays to private space.
+        if (bytes[..12].All(value => value == 0)) return false;
+        if (bytes[0] == 0x20 && bytes[1] == 0x01 && bytes[2] == 0x0D && bytes[3] == 0xB8) return false;
+        if (bytes[0] == 0x20 && bytes[1] == 0x02) return IsPublicAddress(new IPAddress(bytes[2..6]));
+        return true;
     }
 
-    private async Task PumpAsync(Stream source, Stream destination, bool fromClient, CancellationToken cancellationToken)
+    private async Task PumpAsync(Stream source, Stream destination, bool fromClient, CancellationTokenSource idle)
     {
         var buffer = new byte[32 * 1024];
         while (true)
         {
-            var read = await source.ReadAsync(buffer, cancellationToken);
+            var read = await source.ReadAsync(buffer, idle.Token);
             if (read == 0) break;
-            await destination.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
+            await destination.WriteAsync(buffer.AsMemory(0, read), idle.Token);
+            // Any traffic in either direction pushes the idle deadline back.
+            try { idle.CancelAfter(IdleTimeout); } catch (ObjectDisposedException) { break; }
             if (fromClient) Interlocked.Add(ref _bytesFromClients, read); else Interlocked.Add(ref _bytesToClients, read);
         }
     }

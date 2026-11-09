@@ -5,6 +5,12 @@ const crypto = require('node:crypto');
 
 const TOOLBAR_HEIGHT = 112;
 const SYNC_INTERVAL_MS = 2500;
+const MAX_SYNC_BACKOFF_MS = 60 * 1000;
+const MAX_COOKIES_PER_DOMAIN = 200;
+const MAX_CLOSED_TABS = 25;
+// The server ignores expiry shifts smaller than a day, so the client does not re-push them either.
+const EXPIRY_BUCKET_SECONDS = 24 * 60 * 60;
+const DEFAULT_SEARCH_URL = 'https://duckduckgo.com/?q=%s';
 const UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000;
 const RELEASE_REPOSITORY = 'un4ckn0wl3z/Shared-Browser-Server';
 // electron-updater downloads through this partition (its NET_SESSION_NAME); it gets the same proxy as
@@ -18,11 +24,20 @@ let mainWindow;
 let browserSession;
 let config;
 let syncTimer;
+let syncFailures = 0;
+let authPrompted = false;
 let serverQueue = Promise.resolve();
 let pullPending = false;
 let pushPending = false;
 let cookiePushTimer;
+// key -> { name, domain, path, value, applied }. `applied` is false for entries seeded from the offline
+// cache at startup: they are only used to notice cookies that were removed from the vault meanwhile.
 let appliedCookies = new Map();
+// Cookie domain -> signature of the cookie list last published by this (primary) browser.
+let pushedDomains = new Map();
+let wasPrimary = false;
+let watchingCookies = false;
+const closedTabs = [];
 let autoUpdater;
 let updateTimer;
 let updateState = { state: 'idle', currentVersion: app.getVersion() };
@@ -57,6 +72,7 @@ function defaultSnapshot() {
     updatedAt: new Date(0).toISOString(),
     settings: {
       homePage: '',
+      searchUrl: DEFAULT_SEARCH_URL,
       primaryDeviceId: '',
       autoShareCookies: true,
       proxy: { enabled: false, host: '127.0.0.1', port: 8899, allowedPorts: '80,443', bypassList: 'localhost;127.0.0.1' }
@@ -144,9 +160,10 @@ function normalizeSnapshot(input) {
   input.settings ||= fallback.settings;
   if (input.settings.homePage === 'https://example.com/' || input.settings.homePage === 'https://example.com') input.settings.homePage = '';
   if (typeof input.settings.homePage !== 'string') input.settings.homePage = fallback.settings.homePage;
+  if (typeof input.settings.searchUrl !== 'string') input.settings.searchUrl = fallback.settings.searchUrl;
   input.settings.proxy ||= fallback.settings.proxy;
   input.profiles = Array.isArray(input.profiles) ? input.profiles : [];
-  input.bookmarks = Array.isArray(input.bookmarks) ? input.bookmarks : [];
+  input.bookmarks = Array.isArray(input.bookmarks) ? input.bookmarks.filter(item => item && /^https?:\/\//i.test(item.url || '')) : [];
   input.revision = Number(input.revision) || 0;
   return input;
 }
@@ -190,7 +207,7 @@ function createWindow() {
   mainWindow.loadFile(path.join(__dirname, 'index.html'));
   mainWindow.on('resize', layoutActiveView);
   mainWindow.on('closed', () => {
-    clearInterval(syncTimer);
+    clearTimeout(syncTimer);
     clearInterval(updateTimer);
     clearTimeout(cookiePushTimer);
     for (const tab of tabs.values()) {
@@ -219,8 +236,18 @@ function publishAll() {
   status(config?.secrets.deviceToken ? `Synced r${config.secrets.cache.revision}` : 'Not enrolled', !config?.secrets.deviceToken);
 }
 
+function tabSummaries() {
+  return [...tabs.values()].map(tab => ({
+    id: tab.id,
+    title: tab.title,
+    url: tab.view.webContents.isDestroyed() ? '' : tab.view.webContents.getURL(),
+    loading: !tab.view.webContents.isDestroyed() && tab.view.webContents.isLoading(),
+    active: tab.id === activeTabId
+  }));
+}
+
 function publishTabs() {
-  send('browser:tabs', [...tabs.values()].map(tab => ({ id: tab.id, title: tab.title, active: tab.id === activeTabId })));
+  send('browser:tabs', tabSummaries());
 }
 
 function publishNavigationState() {
@@ -234,13 +261,24 @@ function publishNavigationState() {
   });
 }
 
+// Turns address-bar text into a URL: full http(s) URLs pass through, bare host names get https://
+// (http:// for localhost and IP addresses), and anything else becomes a search when one is configured.
 function normalizeAddress(value) {
-  let text = String(value || '').trim();
+  const text = String(value || '').trim();
   if (!text || text.toLowerCase() === 'about:blank') return 'about:blank';
-  if (!text.includes('://')) text = `https://${text}`;
-  const url = new URL(text);
-  if (!['http:', 'https:'].includes(url.protocol)) throw new Error('Enter a valid HTTP or HTTPS address.');
-  return url.toString();
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(text)) {
+    const url = new URL(text);
+    if (!['http:', 'https:'].includes(url.protocol)) throw new Error('Only HTTP and HTTPS addresses can be opened.');
+    return url.toString();
+  }
+  const local = /^(localhost|\d{1,3}(\.\d{1,3}){3}|\[[0-9a-f:.]+\])(:\d+)?(\/|$)/i.test(text);
+  const looksLikeHost = !/\s/.test(text) && (local || /^[^/?#:]+\.[a-z][a-z0-9-]*\.?(:\d+)?([/?#]|$)/i.test(text));
+  if (looksLikeHost) {
+    try { return new URL(`${local ? 'http' : 'https'}://${text}`).toString(); } catch { }
+  }
+  const search = config?.secrets.cache.settings.searchUrl;
+  if (search && search.includes('%s')) return search.replace('%s', encodeURIComponent(text));
+  throw new Error('Enter a valid web address. Searching from the address bar is disabled on the server.');
 }
 
 async function addTab(url, details) {
@@ -265,11 +303,14 @@ async function addTab(url, details) {
   for (const eventName of ['did-navigate', 'did-navigate-in-page', 'did-start-loading', 'did-stop-loading']) {
     view.webContents.on(eventName, () => {
       if (activeTabId === id) publishNavigationState();
+      if (eventName === 'did-start-loading' || eventName === 'did-stop-loading') publishTabs();
     });
   }
-  view.webContents.on('did-finish-load', async () => {
+  view.webContents.on('did-finish-load', () => {
     if (activeTabId === id) publishNavigationState();
-    await pushCurrentDomain(view.webContents.getURL());
+  });
+  view.webContents.on('found-in-page', (_, result) => {
+    if (activeTabId === id) send('browser:find-result', { active: result.activeMatchOrdinal, matches: result.matches });
   });
   view.webContents.on('did-fail-load', (_, code, description, failedUrl, isMainFrame) => {
     if (isMainFrame && code !== -3) status(`Page failed: ${description} (${failedUrl})`, true);
@@ -365,6 +406,10 @@ function handleShortcut(input, source) {
   }
   if (isPopup) return false;
   if (command && !input.shift && !input.alt && key === 't') return run(() => addTab(config.secrets.cache.settings.homePage));
+  if (command && input.shift && !input.alt && key === 't') return run(reopenClosedTab);
+  if ((command && !input.alt && key === 'f') || key === 'f3') {
+    return run(() => { mainWindow?.webContents.focus(); send('browser:show-find', { next: key === 'f3', backward: input.shift }); });
+  }
   if ((command && key === 'l') || (input.alt && key === 'd' && !mac)) {
     return run(() => { mainWindow?.webContents.focus(); send('browser:focus-address'); });
   }
@@ -388,7 +433,11 @@ async function selectTab(id) {
   const next = tabs.get(Number(id));
   if (!next || !mainWindow) return;
   const current = tabs.get(activeTabId);
-  if (current) mainWindow.contentView.removeChildView(current.view);
+  if (current && current !== next) {
+    mainWindow.contentView.removeChildView(current.view);
+    if (!current.view.webContents.isDestroyed()) current.view.webContents.stopFindInPage('clearSelection');
+    send('browser:find-result', { active: 0, matches: 0, reset: true });
+  }
   activeTabId = next.id;
   if (!settingsOpen) mainWindow.contentView.addChildView(next.view);
   layoutActiveView();
@@ -405,11 +454,21 @@ async function closeTab(id) {
   const index = ids.indexOf(numericId);
   if (mainWindow) mainWindow.contentView.removeChildView(tab.view);
   tabs.delete(numericId);
+  const closedUrl = tab.view.webContents.isDestroyed() ? '' : tab.view.webContents.getURL();
+  if (/^https?:/i.test(closedUrl)) {
+    closedTabs.push(closedUrl);
+    if (closedTabs.length > MAX_CLOSED_TABS) closedTabs.shift();
+  }
   if (!tab.view.webContents.isDestroyed()) tab.view.webContents.close();
   if (activeTabId === numericId) activeTabId = undefined;
   if (tabs.size === 0) await addTab(config.secrets.cache.settings.homePage);
   else if (!activeTabId) await selectTab(ids[index - 1] || ids[index + 1] || [...tabs.keys()][0]);
   publishTabs();
+}
+
+async function reopenClosedTab() {
+  const url = closedTabs.pop();
+  if (url) await addTab(url);
 }
 
 function shortTitle(value) {
@@ -448,7 +507,6 @@ async function ensureEnrolled() {
     headers: { authorization: `Bearer ${config.secrets.enrollmentToken}` },
     body: JSON.stringify({ deviceId: config.deviceId, deviceName: config.deviceName })
   }, false);
-  config.secrets.deviceId = result.deviceId;
   config.deviceId = result.deviceId;
   config.secrets.deviceToken = result.deviceToken;
   config.secrets.enrollmentToken = '';
@@ -463,44 +521,75 @@ function serialized(task) {
   return run;
 }
 
+// Returns true when the server was reachable. `since` lets the server answer 204 when nothing changed,
+// so idle polling neither downloads the vault nor rewrites the encrypted local cache.
 async function pullSnapshot(notify = false) {
-  if (!config.secrets.deviceToken || pullPending) return;
+  if (!config.secrets.deviceToken || pullPending) return false;
   pullPending = true;
   return serialized(async () => {
     pullPending = false;
     try {
-      const snapshot = normalizeSnapshot(await api(`/api/client/snapshot?deviceName=${encodeURIComponent(config.deviceName)}`));
-      const changed = snapshot.revision !== config.secrets.cache.revision;
-      config.secrets.cache = snapshot;
-      saveConfig();
-      // Cookies are installed in place. Reloading the page here would wipe whatever the user is in
-      // the middle of (an open dialog, a half-filled form, a deployment approval).
-      if (changed) await applyAllCookies();
-      status(`${notify ? 'Synchronization complete — ' : ''}Synced r${snapshot.revision}`);
-      publishTabs();
-      publishNavigationState();
+      const previous = config.secrets.cache;
+      const since = previous.revision > 0 && !notify ? `&since=${previous.revision}` : '';
+      const response = await api(`/api/client/snapshot?deviceName=${encodeURIComponent(config.deviceName)}${since}`);
+      if (response) {
+        const snapshot = normalizeSnapshot(response);
+        if (snapshot.revision !== previous.revision || notify) await installSnapshot(snapshot, previous);
+      }
+      syncFailures = 0;
+      authPrompted = false;
+      status(`${notify ? 'Synchronization complete — ' : ''}Synced r${config.secrets.cache.revision}`);
+      return true;
     } catch (error) {
+      syncFailures++;
       status(`Offline cache — ${error.message}`, true);
-      if (/unauthorized|revoked/i.test(error.message)) send('browser:show-settings');
+      // Ask once. Re-opening the dialog on every poll would reset whatever the user is typing in it.
+      if (/unauthorized|revoked/i.test(error.message) && !authPrompted) {
+        authPrompted = true;
+        send('browser:show-settings');
+      }
+      return false;
     }
   });
+}
+
+async function installSnapshot(snapshot, previous) {
+  config.secrets.cache = snapshot;
+  saveConfig();
+  // Cookies are installed in place. Reloading the page here would wipe whatever the user is in
+  // the middle of (an open dialog, a half-filled form, a deployment approval).
+  await applyAllCookies();
+  if (JSON.stringify(previous.settings.proxy) !== JSON.stringify(snapshot.settings.proxy) && config.networkMode === 'managed') {
+    try {
+      await configureProxy();
+      await browserSession.closeAllConnections();
+    } catch (error) {
+      status(error.message, true);
+    }
+  }
+  if (JSON.stringify(previous.bookmarks) !== JSON.stringify(snapshot.bookmarks)) send('browser:bookmarks', snapshot.bookmarks);
+  const primary = isPrimary();
+  // A browser that has just been made primary publishes everything it holds right away.
+  if (primary && !wasPrimary) {
+    pushedDomains = new Map();
+    setImmediate(() => pushAllStoredCookies());
+  }
+  wasPrimary = primary;
+  publishTabs();
+  publishNavigationState();
+}
+
+function scheduleSync() {
+  clearTimeout(syncTimer);
+  const delay = syncFailures ? Math.min(SYNC_INTERVAL_MS * 2 ** Math.min(syncFailures, 6), MAX_SYNC_BACKOFF_MS) : SYNC_INTERVAL_MS;
+  syncTimer = setTimeout(async () => {
+    try { await pullSnapshot(false); } finally { if (mainWindow) scheduleSync(); }
+  }, delay);
 }
 
 function isPrimary() {
   const settings = config.secrets.cache.settings;
   return (settings.autoShareCookies && !settings.primaryDeviceId) || settings.primaryDeviceId?.toLowerCase() === config.deviceId.toLowerCase();
-}
-
-function domainMatches(host, domain) {
-  const a = String(host || '').replace(/^\./, '').toLowerCase();
-  const b = String(domain || '').replace(/^\./, '').toLowerCase();
-  return a === b || a.endsWith(`.${b}`);
-}
-
-function findProfile(host) {
-  return config.secrets.cache.profiles
-    .filter(profile => profile.enabled && domainMatches(host, profile.domain))
-    .sort((a, b) => b.domain.length - a.domain.length)[0];
 }
 
 function electronSameSite(value) {
@@ -526,19 +615,59 @@ function cookieKey(cookie, fallbackDomain) {
 // The primary browser is the source of truth: it only receives cookies it does not have yet, so a
 // stale server copy can never overwrite a session cookie the site has just rotated. Other browsers
 // only install cookies whose shared value actually changed, so their own session state is left alone.
+// A cookie that disappears from the vault (the primary browser signed out, or an administrator removed
+// it) is deleted here too, but only while it still holds the value this browser received; a value the
+// site has since rotated locally is left alone.
 async function applyAllCookies() {
   const primary = isPrimary();
   const local = primary ? new Set((await browserSession.cookies.get({})).map(cookie => cookieKey(cookie))) : undefined;
+  const now = Date.now() / 1000;
   const shared = new Map();
   for (const profile of config.secrets.cache.profiles.filter(item => item.enabled)) {
     for (const cookie of profile.cookies || []) {
+      if (cookie.expiresAt && cookie.expiresAt < now) continue;
       const key = cookieKey(cookie, profile.domain);
-      shared.set(key, cookie.value);
-      if (primary ? local.has(key) : appliedCookies.get(key) === cookie.value) continue;
-      try { await setSharedCookie(cookie, profile.domain); } catch { }
+      const entry = { name: cookie.name, domain: normalizedDomain(cookie.domain || profile.domain), path: cookie.path || '/', value: cookie.value, applied: true };
+      shared.set(key, entry);
+      const previous = appliedCookies.get(key);
+      if (primary ? local.has(key) : previous?.applied && previous.value === cookie.value) continue;
+      try { await setSharedCookie(cookie, profile.domain); } catch { entry.applied = false; }
+    }
+  }
+  if (!primary) {
+    for (const [key, entry] of appliedCookies) {
+      if (shared.has(key)) continue;
+      try { await removeSharedCookie(entry); } catch { }
     }
   }
   appliedCookies = shared;
+}
+
+async function removeSharedCookie(entry) {
+  for (const scheme of ['https', 'http']) {
+    const url = `${scheme}://${entry.domain}${entry.path}`;
+    const matches = (await browserSession.cookies.get({ url, name: entry.name }))
+      .filter(item => normalizedDomain(item.domain) === entry.domain && item.path === entry.path && item.value === entry.value);
+    if (matches.length) {
+      await browserSession.cookies.remove(url, entry.name);
+      return;
+    }
+  }
+}
+
+// Remembers what the offline cache says this browser received, so a removal made on the server while
+// this browser was closed is still noticed on the first pull.
+function seedSyncState() {
+  appliedCookies = new Map();
+  pushedDomains = new Map();
+  for (const profile of config.secrets.cache.profiles) {
+    for (const cookie of profile.cookies || []) {
+      const domain = normalizedDomain(cookie.domain || profile.domain);
+      appliedCookies.set(cookieKey(cookie, profile.domain), { name: cookie.name, domain, path: cookie.path || '/', value: cookie.value, applied: false });
+      if (cookie.sourceDeviceId && cookie.sourceDeviceId !== 'admin') pushedDomains.set(domain, '');
+    }
+  }
+  wasPrimary = isPrimary();
 }
 
 async function setSharedCookie(cookie, profileDomain) {
@@ -564,7 +693,7 @@ async function setSharedCookie(cookie, profileDomain) {
     secure,
     httpOnly: Boolean(cookie.httpOnly),
     sameSite: sameSite === 'no_restriction' && !secure ? 'lax' : sameSite,
-    ...(existing[0]?.expirationDate ? { expirationDate: existing[0].expirationDate } : {})
+    ...(cookie.expiresAt ? { expirationDate: Number(cookie.expiresAt) } : existing[0]?.expirationDate ? { expirationDate: existing[0].expirationDate } : {})
   });
 }
 
@@ -615,30 +744,20 @@ function toSharedCookie(cookie) {
     path: cookie.path || '/',
     secure: Boolean(cookie.secure),
     httpOnly: Boolean(cookie.httpOnly),
-    sameSite: serverSameSite(cookie.sameSite)
+    sameSite: serverSameSite(cookie.sameSite),
+    ...(cookie.session || !cookie.expirationDate ? {} : { expiresAt: Math.floor(cookie.expirationDate) })
   };
 }
 
-async function pushCurrentDomain(pageUrl) {
-  if (!isPrimary() || !config.secrets.deviceToken) return;
-  let page;
-  try { page = new URL(pageUrl); } catch { return; }
-  if (!['http:', 'https:'].includes(page.protocol)) return;
-  const profile = findProfile(page.hostname);
-  if (!profile && !config.secrets.cache.settings.autoShareCookies) return;
-  return serialized(async () => {
-    try {
-      const cookies = (await browserSession.cookies.get({ url: page.toString() }))
-        .filter(cookie => validCookie(cookie) && domainMatches(page.hostname, cookie.domain))
-        .slice(0, 200)
-        .map(toSharedCookie);
-      await pushCookies(page.toString(), cookies);
-    } catch (error) {
-      status(`Cookie sync failed — ${error.message}`, true);
-    }
-  });
+function domainSignature(cookies) {
+  return JSON.stringify(cookies
+    .map(cookie => [cookie.name, cookie.path, cookie.value, cookie.secure, cookie.httpOnly, cookie.sameSite, cookie.expiresAt ? Math.floor(cookie.expiresAt / EXPIRY_BUCKET_SECONDS) : 0])
+    .sort((a, b) => `${a[0]}\n${a[1]}`.localeCompare(`${b[0]}\n${b[1]}`)));
 }
 
+// The primary browser publishes one complete cookie list per cookie domain, and only for domains whose
+// cookies changed since the last publish. A domain whose cookies are all gone (sign-out) is published
+// as an empty list so the server removes them from the vault as well.
 async function pushAllStoredCookies() {
   if (!isPrimary() || !config.secrets.deviceToken || pushPending) return;
   pushPending = true;
@@ -652,8 +771,16 @@ async function pushAllStoredCookies() {
         if (!groups.has(domain)) groups.set(domain, []);
         groups.get(domain).push(toSharedCookie(cookie));
       }
-      for (const [domain, values] of [...groups.entries()].slice(0, 500)) {
-        await pushCookies(`https://${domain}/`, values.slice(0, 200));
+      for (const domain of pushedDomains.keys()) if (!groups.has(domain)) groups.set(domain, []);
+      let published = 0;
+      for (const [domain, values] of groups) {
+        const signature = domainSignature(values);
+        if (pushedDomains.get(domain) === signature) continue;
+        if (!/^[a-z0-9.-]+$/.test(domain)) continue;
+        const complete = values.length <= MAX_COOKIES_PER_DOMAIN;
+        await pushCookies(`https://${domain}/`, values.slice(0, MAX_COOKIES_PER_DOMAIN), complete);
+        if (values.length) pushedDomains.set(domain, signature); else pushedDomains.delete(domain);
+        if (++published >= 500) break;
       }
       status(`Synced r${config.secrets.cache.revision}`);
     } catch (error) {
@@ -662,17 +789,23 @@ async function pushAllStoredCookies() {
   });
 }
 
-async function pushCookies(pageUrl, cookies) {
+async function pushCookies(pageUrl, cookies, complete) {
   const result = await api('/api/client/sync', {
     method: 'POST',
-    body: JSON.stringify({ knownRevision: config.secrets.cache.revision, pageUrl, cookies })
+    body: JSON.stringify({ knownRevision: config.secrets.cache.revision, pageUrl, cookies, complete })
   });
-  if (result?.snapshot) {
+  if (result?.snapshot && result.snapshot.revision !== config.secrets.cache.revision) {
+    const previous = config.secrets.cache;
     config.secrets.cache = normalizeSnapshot(result.snapshot);
     saveConfig();
+    // These values came from this browser, so they are already installed here.
+    appliedCookies = new Map();
     for (const profile of config.secrets.cache.profiles) {
-      for (const cookie of profile.cookies || []) appliedCookies.set(cookieKey(cookie, profile.domain), cookie.value);
+      for (const cookie of profile.cookies || []) {
+        appliedCookies.set(cookieKey(cookie, profile.domain), { name: cookie.name, domain: normalizedDomain(cookie.domain || profile.domain), path: cookie.path || '/', value: cookie.value, applied: true });
+      }
     }
+    if (JSON.stringify(previous.bookmarks) !== JSON.stringify(config.secrets.cache.bookmarks)) send('browser:bookmarks', config.secrets.cache.bookmarks);
   }
 }
 
@@ -756,21 +889,80 @@ async function privacyCheck() {
 
 async function startClient() {
   try {
+    seedSyncState();
     if (config.strictPrivacy) await blockBrowserTraffic();
     await ensureEnrolled();
     await pullSnapshot(false);
     await configureProxy();
     await applyAllCookies();
-    browserSession.cookies.on('changed', onCookieChanged);
+    watchCookies();
     if (tabs.size === 0) await addTab(config.secrets.cache.settings.homePage);
+    wasPrimary = isPrimary();
     await pushAllStoredCookies();
-    syncTimer = setInterval(() => pullSnapshot(false), SYNC_INTERVAL_MS);
+    scheduleSync();
   } catch (error) {
     status(error.message, true);
     try { await applyAllCookies(); } catch { }
     if (tabs.size === 0) await addTab(config.secrets.cache.settings.homePage);
     send('browser:show-settings');
+    // Keep retrying in the background (for example when the server was briefly unreachable at startup).
+    if (config.secrets.deviceToken) {
+      watchCookies();
+      syncFailures = Math.max(syncFailures, 1);
+      scheduleSync();
+    }
   }
+}
+
+function watchCookies() {
+  if (watchingCookies) return;
+  watchingCookies = true;
+  browserSession.cookies.on('changed', onCookieChanged);
+}
+
+function showBookmarksMenu(position) {
+  const bookmarks = config.secrets.cache.bookmarks;
+  const open = (url, event) => {
+    const newTab = Boolean(event?.ctrlKey || event?.metaKey || event?.shiftKey);
+    const web = tabs.get(activeTabId)?.view.webContents;
+    if (newTab || !web || web.isDestroyed()) addTab(url).catch(error => status(error.message, true));
+    else web.loadURL(normalizeAddress(url)).catch(error => status(error.message, true));
+  };
+  const template = bookmarks.length
+    ? bookmarks.map(item => ({ label: String(item.title || item.url).slice(0, 80).replace(/&/g, '&&'), toolTip: item.url, click: (_item, _window, event) => open(item.url, event) }))
+    : [{ label: 'No shared bookmarks yet', enabled: false }];
+  template.push(
+    { type: 'separator' },
+    { label: 'Hold Ctrl (⌘) or Shift to open in a new tab', enabled: false },
+    { label: 'Manage bookmarks in the dashboard…', enabled: validServerUrl(config.serverUrl), click: () => shell.openExternal(config.serverUrl) }
+  );
+  Menu.buildFromTemplate(template).popup({
+    window: mainWindow,
+    x: Math.round(Number(position?.x) || 0),
+    y: Math.round(Number(position?.y) || TOOLBAR_HEIGHT)
+  });
+}
+
+function activeWebContents() {
+  const web = tabs.get(activeTabId)?.view.webContents;
+  return web && !web.isDestroyed() ? web : undefined;
+}
+
+function configureDownloads() {
+  browserSession.on('will-download', (_event, item) => {
+    const name = item.getFilename();
+    status(`Downloading ${name}…`);
+    item.on('updated', (_e, state) => {
+      if (state !== 'progressing' || item.isPaused()) return;
+      const total = item.getTotalBytes();
+      if (total > 0) status(`Downloading ${name} (${Math.round(item.getReceivedBytes() / total * 100)}%)…`);
+    });
+    item.once('done', (_e, state) => {
+      if (state === 'completed') status(`Downloaded ${name}`);
+      else if (state === 'interrupted') status(`Download failed: ${name}`, true);
+      else status(`Download cancelled: ${name}`);
+    });
+  });
 }
 
 function proxyLogin(authInfo, callback) {
@@ -888,8 +1080,35 @@ function publicConfig() {
 function registerIpc() {
   ipcMain.handle('browser:check-updates', checkForUpdates);
   ipcMain.handle('browser:install-update', installUpdate);
-  ipcMain.handle('browser:bootstrap', () => ({ config: publicConfig(), update: updateState, tabs: [...tabs.values()].map(tab => ({ id: tab.id, title: tab.title, active: tab.id === activeTabId })) }));
-  ipcMain.handle('browser:navigate', (_, url) => tabs.get(activeTabId)?.view.webContents.loadURL(normalizeAddress(url)));
+  ipcMain.handle('browser:bootstrap', () => ({ config: publicConfig(), update: updateState, tabs: tabSummaries(), bookmarks: config.secrets.cache.bookmarks }));
+  ipcMain.handle('browser:show-bookmarks', (_, position) => showBookmarksMenu(position));
+  ipcMain.handle('browser:reopen-tab', reopenClosedTab);
+  ipcMain.handle('browser:find', (_, text, options) => {
+    const web = activeWebContents();
+    const query = String(text || '');
+    if (!web) return;
+    if (!query) {
+      web.stopFindInPage('clearSelection');
+      send('browser:find-result', { active: 0, matches: 0 });
+      return;
+    }
+    // Electron's findNext means "start a new find session", which is what typing a new query needs.
+    web.findInPage(query, { forward: options?.forward !== false, findNext: !options?.next, matchCase: false });
+  });
+  ipcMain.handle('browser:stop-find', () => {
+    const web = activeWebContents();
+    if (web) {
+      web.stopFindInPage('keepSelection');
+      web.focus();
+    }
+  });
+  ipcMain.handle('browser:navigate', async (_, url) => {
+    const target = normalizeAddress(url);
+    const web = activeWebContents();
+    if (!web) return addTab(target);
+    // A failed or aborted load is reported through did-fail-load; only invalid input should reach the renderer.
+    web.loadURL(target).catch(() => { });
+  });
   ipcMain.handle('browser:back', () => { const web = tabs.get(activeTabId)?.view.webContents; if (web?.navigationHistory.canGoBack()) web.navigationHistory.goBack(); });
   ipcMain.handle('browser:forward', () => { const web = tabs.get(activeTabId)?.view.webContents; if (web?.navigationHistory.canGoForward()) web.navigationHistory.goForward(); });
   ipcMain.handle('browser:reload', () => tabs.get(activeTabId)?.view.webContents.reload());
@@ -965,6 +1184,7 @@ app.whenReady().then(async () => {
   browserSession = session.fromPartition('persist:shared-browser');
   browserSession.setUserAgent(app.userAgentFallback);
   configurePrivacyPermissions();
+  configureDownloads();
   registerIpc();
   setupUpdater();
   createWindow();
