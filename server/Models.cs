@@ -38,6 +38,13 @@ public sealed class BrowserSettings
     public bool AutoShareCookies { get; set; } = true;
     /// <summary>When false, browsers can only enroll with a one-time enrollment code from the dashboard.</summary>
     public bool AllowAdminTokenEnrollment { get; set; } = true;
+    /// <summary>
+    /// How browsers connect to websites: "choice" lets each browser pick Direct or Managed in its settings,
+    /// "managed" requires the managed proxy, and "strict" requires the managed proxy with Strict privacy.
+    /// </summary>
+    public string NetworkPolicy { get; set; } = "strict";
+    /// <summary>Service that answers with the caller's public IP, used by "Check egress IP" (empty disables it).</summary>
+    public string IpCheckUrl { get; set; } = "https://api64.ipify.org?format=json";
     public ProxySettings Proxy { get; set; } = new();
 }
 
@@ -52,6 +59,16 @@ public sealed class ProxySettings
     public bool Tls { get; set; }
     /// <summary>SHA-256 of the proxy's TLS certificate (hex). Set by the server; browsers pin it.</summary>
     public string CertificateSha256 { get; set; } = "";
+    /// <summary>any, ipv4 or ipv6: which address family the proxy uses to reach websites.</summary>
+    public string EgressAddressFamily { get; set; } = "any";
+    /// <summary>Optional local IP the proxy's outgoing connections are bound to, on servers with several addresses.</summary>
+    public string EgressSourceAddress { get; set; } = "";
+    /// <summary>Default per-browser limits; 0 means unlimited. Each browser can override them.</summary>
+    public int MaxConnectionsPerDevice { get; set; }
+    public double MonthlyQuotaGb { get; set; }
+    public double RateLimitMbps { get; set; }
+    /// <summary>Keep per-browser counts of the sites reached through the proxy (host names only).</summary>
+    public bool RecordDestinations { get; set; } = true;
 }
 
 public sealed class SessionProfile
@@ -91,6 +108,13 @@ public sealed class DeviceRecord
     public DateTimeOffset EnrolledAt { get; set; }
     public DateTimeOffset LastSeenAt { get; set; }
     public bool Revoked { get; set; }
+    /// <summary>Reported by the browser: its version and how it reaches websites (direct, managed or strict).</summary>
+    public string ClientVersion { get; set; } = "";
+    public string NetworkMode { get; set; } = "";
+    /// <summary>Per-browser proxy limits; null uses the default from the proxy settings, 0 is unlimited.</summary>
+    public int? MaxConnections { get; set; }
+    public double? MonthlyQuotaGb { get; set; }
+    public double? RateLimitMbps { get; set; }
 }
 
 /// <summary>A single-use code an administrator hands to one browser instead of the administrator token.</summary>
@@ -106,7 +130,14 @@ public sealed class EnrollmentCode
     public bool Revoked { get; set; }
 }
 
-public sealed record DeviceAuth(string Id, string Name, string TokenHash, bool Revoked);
+public sealed record DeviceAuth(string Id, string Name, string TokenHash, bool Revoked, int? MaxConnections, double? MonthlyQuotaGb, double? RateLimitMbps);
+public sealed record DeviceLimitsRequest(int? MaxConnections, double? MonthlyQuotaGb, double? RateLimitMbps);
+/// <summary>Effective proxy limits for one browser; 0 means unlimited.</summary>
+public sealed record ProxyLimits(int MaxConnections, double MonthlyQuotaGb, double RateLimitMbps)
+{
+    public long QuotaBytes => MonthlyQuotaGb > 0 ? (long)(MonthlyQuotaGb * 1_000_000_000) : 0;
+    public double BytesPerSecond => RateLimitMbps * 125_000;
+}
 public sealed record EnrollRequest(string DeviceId, string DeviceName);
 public sealed record EnrollResponse(string DeviceId, string DeviceToken, long Revision);
 public sealed record EnrollmentCodeRequest(string? Label, int? TtlMinutes);

@@ -71,7 +71,9 @@ The primary-writer model prevents a logged-out secondary browser from replacing 
 - Offline encrypted browser cache
 - Browser/device status in the management dashboard
 - Authenticated forward proxy built into the management server
-- Per-browser choice between direct client-IP traffic and management-server-IP traffic
+- Browsers use the management-server proxy with Strict privacy by default; the server can require it or let each browser choose
+- Fixed egress address (IPv4/IPv6 and source address) and an egress IP check
+- Per-browser proxy usage statistics and limits (open connections, monthly data, speed)
 - TLS between browsers and the proxy, with the certificate pinned by the browsers
 - Per-profile access: share a domain with all browsers or only selected ones
 - Live updates over Server-Sent Events
@@ -127,7 +129,7 @@ Revoke a device from the dashboard. A revoked device can no longer download or p
 5. Select WB1 as the primary session browser in the dashboard.
 6. Sign in to an authorized website on WB1.
 7. Open the same website on WB2 or WB3 after synchronization completes.
-8. Choose Direct, Managed proxy, or Strict Privacy independently on each browser.
+8. Browsers use the managed proxy with Strict privacy by default. To let them use Direct mode, change **Browser connection mode** in the dashboard.
 
 ## Docker deployment on Linux
 
@@ -200,6 +202,7 @@ docker compose up -d --build
 - The server reads vaults written by earlier versions as they are; there is nothing to migrate. Settings added later start with the previous behavior: profiles and announcements go to all browsers, the administrator token still enrolls browsers, and proxy TLS is off.
 - Older browsers keep working against a newer server. They do not show announcements, keep polling instead of receiving live updates, and (before 1.1) do not remove cookies from profiles they lose access to.
 - Update every browser that uses Managed proxy mode to 1.2 or newer before turning on proxy TLS.
+- With the server released alongside browser 1.3, **Browser connection mode** defaults to requiring the managed proxy with Strict privacy, also on existing installations. Enable the proxy before upgrading the server, or set the mode to **Let each browser choose** afterwards, otherwise 1.3 browsers stop loading websites until the proxy is on. Browsers before 1.3 keep their own setting.
 - Restarting the server briefly interrupts open proxy connections; browsers reconnect and resume syncing on their own.
 
 ## Start the server
@@ -288,9 +291,23 @@ macOS installers normally must be built and code-signed on macOS. Windows instal
 
 ## Direct IP or management-server IP
 
-The dashboard's **Forward proxy management** section controls the built-in proxy endpoint, advertised host, port, allowed destination ports, and browser bypass list.
+The dashboard's **Forward proxy management** section controls the built-in proxy endpoint, advertised host, port, allowed destination ports, browser bypass list, egress address, and per-browser limits.
 
-Each browser independently chooses its route in **Server settings**:
+### Required connection mode
+
+**Browser connection mode** decides whether browsers may choose their own route:
+
+| Setting | Effect |
+| --- | --- |
+| Require Managed proxy and Strict privacy (default) | Every browser sends all traffic through the proxy with Strict privacy. The choice is locked in each browser's settings. |
+| Require Managed proxy | Every browser uses the proxy; users may still turn Strict privacy on or off. |
+| Let each browser choose | Each browser picks Direct or Managed in its own settings, as before. |
+
+Browsers 1.3 and newer apply a change within a second or two, without restarting: routing moves to the proxy, open connections are closed, website permission prompts are denied, and pages stop using non-proxied WebRTC. A newly installed browser also starts in Managed proxy mode with Strict privacy. Browsers older than 1.3 ignore the setting; the dashboard marks them **UPDATE NEEDED**, and shows each browser's version and current mode so you can confirm everyone follows the policy.
+
+Strict privacy blocks all browsing while the proxy is disabled, so enable the proxy before requiring it (the dashboard warns when the combination would block browsers).
+
+When the policy allows it, each browser chooses its route in **Server settings**:
 
 - **Direct connection — use client IP**: websites connect directly and see the browser computer's public IP.
 - **Managed proxy — use server IP**: HTTP and HTTPS traffic goes through the authenticated management-server proxy, so websites see the management server's outbound IP.
@@ -311,6 +328,22 @@ The server generates a self-signed certificate on first use and keeps it in the 
 Proxy TLS requires Shared Browser 1.2 or newer on every browser that uses Managed mode. Update the browsers before turning it on; older browsers cannot connect to a TLS proxy.
 
 Plain-HTTP requests through the proxy are answered with `Connection: close`, so a browser never reuses the connection for a second request that the proxy would pass to the first origin unparsed.
+
+### Egress address
+
+Websites that see one session arrive from different addresses, for example alternating between the server's IPv4 and IPv6 address, often treat it as suspicious and ask the user to sign in again. **Address family** limits the proxy to IPv4 or IPv6, and **Source address** sends all proxy traffic from one of the server's IPs when it has several. A destination without an address of the selected family is refused with 502.
+
+**Check egress IP** asks the service in **IP check URL** (default `https://api64.ipify.org?format=json`; any service answering with the caller's IP as text or `{"ip": "..."}` works) which address the proxy's traffic comes from. Each browser's settings dialog has **What IP do websites see?**, which asks the same service over the browser's own route. Clear the URL to disable both checks.
+
+### Usage and limits per browser
+
+The **Managed browsers** table shows each browser's proxy traffic for the current month (sent, received, open connections, connections this month and, unless turned off, the sites it reached, by host name only), with a meter against its monthly quota. Counters are kept in `proxy-usage.json` in the data directory and start from zero each calendar month (UTC); the previous month's totals are kept.
+
+Default limits for every browser are set in the proxy card, and **Limits** in a browser's row overrides them (empty uses the default, 0 means unlimited):
+
+- **Open connections**: further connections are refused with 429 until one closes.
+- **Data per month (GB)**: once reached, new connections are refused with 403 and open ones are closed within about 5 seconds. The audit log records `proxy.quota_reached` once per month.
+- **Speed (Mbps)**: all of the browser's connections share this bandwidth, in both directions together.
 
 The default destination-port allowlist is `80,443`. To reduce server-side request-forgery risk, the proxy refuses private, loopback, link-local (including cloud metadata), carrier-grade NAT (`100.64.0.0/10`), documentation and benchmarking ranges, multicast and reserved addresses, and IPv6 NAT64 or 6to4 addresses that embed any of those.
 

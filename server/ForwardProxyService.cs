@@ -14,6 +14,8 @@ public sealed class ForwardProxyService : BackgroundService
     private static readonly TimeSpan RevocationCheckInterval = TimeSpan.FromSeconds(5);
     private readonly SharedStateStore _store;
     private readonly ProxyCertificate _certificate;
+    private readonly ProxyUsageTracker _usage;
+    private readonly AuditLog _audit;
     private readonly ILogger<ForwardProxyService> _logger;
     private DateTimeOffset _lastFingerprintCheck;
     private long _totalConnections;
@@ -24,10 +26,12 @@ public sealed class ForwardProxyService : BackgroundService
     private volatile int _listeningPort;
     private string _lastError = "";
 
-    public ForwardProxyService(SharedStateStore store, ProxyCertificate certificate, ILogger<ForwardProxyService> logger)
+    public ForwardProxyService(SharedStateStore store, ProxyCertificate certificate, ProxyUsageTracker usage, AuditLog audit, ILogger<ForwardProxyService> logger)
     {
         _store = store;
         _certificate = certificate;
+        _usage = usage;
+        _audit = audit;
         _logger = logger;
     }
 
@@ -39,6 +43,8 @@ public sealed class ForwardProxyService : BackgroundService
         tls = _store.Settings.Proxy.Tls,
         certificateSha256 = _store.Settings.Proxy.CertificateSha256,
         certificateSource = _certificate.OperatorSupplied ? "operator" : "generated",
+        egressAddressFamily = _store.Settings.Proxy.EgressAddressFamily,
+        egressSourceAddress = _store.Settings.Proxy.EgressSourceAddress,
         activeConnections = Interlocked.Read(ref _activeConnections),
         totalConnections = Interlocked.Read(ref _totalConnections),
         bytesFromClients = Interlocked.Read(ref _bytesFromClients),
@@ -46,10 +52,19 @@ public sealed class ForwardProxyService : BackgroundService
         lastError = _lastError
     };
 
+    public object UsageReport(string deviceId) => _usage.Report(deviceId, _store.LimitsFor(deviceId));
+
+    public override async Task StopAsync(CancellationToken cancellationToken)
+    {
+        await base.StopAsync(cancellationToken);
+        _usage.SaveIfDue(force: true);
+    }
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         while (!stoppingToken.IsCancellationRequested)
         {
+            _usage.SaveIfDue();
             var proxy = _store.Settings.Proxy;
             if (!proxy.Enabled)
             {
@@ -74,6 +89,7 @@ public sealed class ForwardProxyService : BackgroundService
                 while (!stoppingToken.IsCancellationRequested)
                 {
                     await RefreshFingerprintAsync();
+                    _usage.SaveIfDue();
                     var current = _store.Settings.Proxy;
                     if (!current.Enabled || current.Port != proxy.Port) break;
                     using var acceptCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
@@ -147,29 +163,44 @@ public sealed class ForwardProxyService : BackgroundService
                     await WriteErrorAsync(clientStream, 400, "Bad proxy request", timeout.Token);
                     return;
                 }
-                if (!ParseAllowedPorts(_store.Settings.Proxy.AllowedPorts).Contains(port))
+                var settings = _store.Settings.Proxy;
+                if (!ParseAllowedPorts(settings.AllowedPorts).Contains(port))
                 {
                     await WriteErrorAsync(clientStream, 403, "Destination port is not allowed", timeout.Token);
                     return;
                 }
 
-                var address = await ResolvePublicAddressAsync(host, timeout.Token);
-                if (address is null)
+                var limits = _store.LimitsFor(deviceId);
+                using var lease = _usage.TryOpen(deviceId, limits, out var refusalStatus, out var refusal);
+                if (lease is null)
                 {
-                    await WriteErrorAsync(clientStream, 403, "Private or unresolved destinations are blocked", timeout.Token);
+                    if (refusalStatus == 403 && _usage.ShouldReportQuota(deviceId))
+                        _audit.Record($"device:{_store.DeviceName(deviceId)}", "proxy.quota_reached", deviceId, $"{limits.MonthlyQuotaGb} GB this month");
+                    await WriteErrorAsync(clientStream, refusalStatus, refusal, timeout.Token);
                     return;
                 }
 
-                using var remote = new TcpClient(address.AddressFamily) { NoDelay = true };
+                var (address, resolveError) = await ResolveDestinationAsync(host, settings, timeout.Token);
+                if (address is null)
+                {
+                    await WriteErrorAsync(clientStream, resolveError.Status, resolveError.Message, timeout.Token);
+                    return;
+                }
+
                 timeout.CancelAfter(ConnectTimeout);
-                try { await remote.ConnectAsync(address, port, timeout.Token); }
+                Socket socket;
+                try { socket = await Egress.ConnectAsync(address, port, settings, timeout.Token); }
                 catch (Exception error) when (error is SocketException || (error is OperationCanceledException && !serverToken.IsCancellationRequested))
                 {
                     await WriteErrorAsync(clientStream, 502, "Destination is unreachable", CancellationToken.None);
                     return;
                 }
                 timeout.CancelAfter(IdleTimeout);
-                var remoteStream = remote.GetStream();
+                await using var remoteStream = new NetworkStream(socket, ownsSocket: true);
+                var record = settings.RecordDestinations;
+                _usage.RecordHost(deviceId, host, record);
+                var flow = new Flow(deviceId, host, limits, record);
+                _usage.AddBytes(deviceId, host, request.Header.Length + request.Remainder.Length, upload: true, record);
 
                 if (request.Method.Equals("CONNECT", StringComparison.OrdinalIgnoreCase))
                 {
@@ -182,11 +213,11 @@ public sealed class ForwardProxyService : BackgroundService
                     if (request.Remainder.Length > 0) await remoteStream.WriteAsync(request.Remainder, timeout.Token);
                 }
 
-                var upload = PumpAsync(clientStream, remoteStream, true, timeout);
+                var upload = PumpAsync(clientStream, remoteStream, true, timeout, flow);
                 var download = request.Method.Equals("CONNECT", StringComparison.OrdinalIgnoreCase)
-                    ? PumpAsync(remoteStream, clientStream, false, timeout)
-                    : ForwardResponseAsync(remoteStream, clientStream, timeout);
-                var revocation = WatchRevocationAsync(deviceId, timeout.Token);
+                    ? PumpAsync(remoteStream, clientStream, false, timeout, flow)
+                    : ForwardResponseAsync(remoteStream, clientStream, timeout, flow);
+                var revocation = WatchRevocationAsync(deviceId, limits, timeout.Token);
                 await Task.WhenAny(upload, download, revocation);
                 timeout.Cancel();
                 try { await Task.WhenAll(upload, download, revocation); } catch (Exception error) when (error is OperationCanceledException or IOException or SocketException) { }
@@ -212,10 +243,13 @@ public sealed class ForwardProxyService : BackgroundService
 
     // Revoking a device in the dashboard also ends the tunnels it already has open, instead of letting
     // them run until they go idle.
-    private async Task WatchRevocationAsync(string deviceId, CancellationToken cancellationToken)
+    // An exhausted monthly quota ends open tunnels the same way.
+    private async Task WatchRevocationAsync(string deviceId, ProxyLimits limits, CancellationToken cancellationToken)
     {
-        while (_store.IsDeviceActive(deviceId) && _store.Settings.Proxy.Enabled)
+        while (_store.IsDeviceActive(deviceId) && _store.Settings.Proxy.Enabled && !_usage.OverQuota(deviceId, _store.LimitsFor(deviceId)))
             await Task.Delay(RevocationCheckInterval, cancellationToken);
+        if (_usage.OverQuota(deviceId, _store.LimitsFor(deviceId)) && _usage.ShouldReportQuota(deviceId))
+            _audit.Record($"device:{_store.DeviceName(deviceId)}", "proxy.quota_reached", deviceId, $"{limits.MonthlyQuotaGb} GB this month");
     }
 
     private async Task RefreshFingerprintAsync()
@@ -231,7 +265,7 @@ public sealed class ForwardProxyService : BackgroundService
     /// reuse this connection, and its next request (carrying Proxy-Authorization, possibly for another
     /// site) would be pumped unparsed to the first origin. Interim 1xx responses pass through unchanged.
     /// </summary>
-    private async Task ForwardResponseAsync(Stream remote, Stream client, CancellationTokenSource idle)
+    private async Task ForwardResponseAsync(Stream remote, Stream client, CancellationTokenSource idle, Flow flow)
     {
         var pending = Array.Empty<byte>();
         while (true)
@@ -251,6 +285,7 @@ public sealed class ForwardProxyService : BackgroundService
             {
                 await client.WriteAsync(header, idle.Token);
                 Interlocked.Add(ref _bytesToClients, header.Length);
+                _usage.AddBytes(flow.DeviceId, flow.Host, header.Length, upload: false, flow.RecordHost);
                 pending = rest;
                 continue;
             }
@@ -267,7 +302,8 @@ public sealed class ForwardProxyService : BackgroundService
             await client.WriteAsync(rewritten, idle.Token);
             if (rest.Length > 0) await client.WriteAsync(rest, idle.Token);
             Interlocked.Add(ref _bytesToClients, rewritten.Length + rest.Length);
-            await PumpAsync(remote, client, false, idle);
+            _usage.AddBytes(flow.DeviceId, flow.Host, rewritten.Length + rest.Length, upload: false, flow.RecordHost);
+            await PumpAsync(remote, client, false, idle, flow);
             return;
         }
     }
@@ -359,12 +395,18 @@ public sealed class ForwardProxyService : BackgroundService
 
     private static HashSet<int> ParseAllowedPorts(string value) => value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Select(item => int.TryParse(item, out var port) ? port : 0).Where(port => port is > 0 and <= 65535).ToHashSet();
 
-    private static async Task<IPAddress?> ResolvePublicAddressAsync(string host, CancellationToken cancellationToken)
+    /// <summary>Picks a public address for the destination that the configured egress family can reach.</summary>
+    private static async Task<(IPAddress? Address, (int Status, string Message) Error)> ResolveDestinationAsync(string host, ProxySettings settings, CancellationToken cancellationToken)
     {
         IPAddress[] addresses;
         try { addresses = await Dns.GetHostAddressesAsync(host, cancellationToken); }
-        catch { return null; }
-        return addresses.FirstOrDefault(IsPublicAddress);
+        catch { return (null, (403, "Private or unresolved destinations are blocked")); }
+        var publicAddresses = addresses.Where(IsPublicAddress).ToList();
+        if (publicAddresses.Count == 0) return (null, (403, "Private or unresolved destinations are blocked"));
+        var usable = Egress.Usable(publicAddresses, settings).FirstOrDefault();
+        return usable is null
+            ? (null, (502, $"The destination has no {(Egress.RequiredFamily(settings) == AddressFamily.InterNetworkV6 ? "IPv6" : "IPv4")} address for the configured egress"))
+            : (usable, (0, ""));
     }
 
     internal static bool IsPublicAddress(IPAddress address)
@@ -395,19 +437,24 @@ public sealed class ForwardProxyService : BackgroundService
         return true;
     }
 
-    private async Task PumpAsync(Stream source, Stream destination, bool fromClient, CancellationTokenSource idle)
+    private async Task PumpAsync(Stream source, Stream destination, bool fromClient, CancellationTokenSource idle, Flow flow)
     {
-        var buffer = new byte[32 * 1024];
+        // Smaller reads keep a rate-limited browser's traffic smooth instead of bursting 32 KB at a time.
+        var buffer = new byte[flow.Limits.RateLimitMbps > 0 ? 8 * 1024 : 32 * 1024];
         while (true)
         {
             var read = await source.ReadAsync(buffer, idle.Token);
             if (read == 0) break;
+            await _usage.ThrottleAsync(flow.DeviceId, read, flow.Limits, idle.Token);
             await destination.WriteAsync(buffer.AsMemory(0, read), idle.Token);
             // Any traffic in either direction pushes the idle deadline back.
             try { idle.CancelAfter(IdleTimeout); } catch (ObjectDisposedException) { break; }
             if (fromClient) Interlocked.Add(ref _bytesFromClients, read); else Interlocked.Add(ref _bytesToClients, read);
+            _usage.AddBytes(flow.DeviceId, flow.Host, read, fromClient, flow.RecordHost);
         }
     }
+
+    private sealed record Flow(string DeviceId, string Host, ProxyLimits Limits, bool RecordHost);
 
     private static Task WriteAsciiAsync(Stream stream, string value, CancellationToken cancellationToken) => stream.WriteAsync(Encoding.ASCII.GetBytes(value), cancellationToken).AsTask();
     private static Task WriteErrorAsync(Stream stream, int status, string message, CancellationToken cancellationToken)

@@ -6,6 +6,7 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddSingleton<DataDirectory>();
 builder.Services.AddSingleton<AuditLog>();
 builder.Services.AddSingleton<ProxyCertificate>();
+builder.Services.AddSingleton<ProxyUsageTracker>();
 builder.Services.AddSingleton<SharedStateStore>();
 builder.Services.AddSingleton<ForwardProxyService>();
 builder.Services.AddHostedService(provider => provider.GetRequiredService<ForwardProxyService>());
@@ -106,7 +107,7 @@ app.MapGet("/api/client/snapshot", async (HttpContext context, SharedStateStore 
 {
     var device = DeviceAuthorized(context.Request, store);
     if (device is null) return Results.Unauthorized();
-    await store.TouchDeviceAsync(device.Id, context.Request.Query["deviceName"].ToString());
+    await store.TouchDeviceAsync(device.Id, context.Request.Query["deviceName"].ToString(), context.Request.Query["version"].ToString(), context.Request.Query["mode"].ToString());
     var snapshot = store.SnapshotFor(device.Id);
     if (long.TryParse(context.Request.Query["since"], out var since) && since == snapshot.Revision) return Results.NoContent();
     return Results.Json(snapshot);
@@ -140,7 +141,7 @@ app.MapGet("/api/client/events", async (HttpContext context, SharedStateStore st
             }
             else await context.Response.WriteAsync(": keep-alive\n\n", aborted);
             await context.Response.Body.FlushAsync(aborted);
-            await store.TouchDeviceAsync(device.Id, "");
+            await store.TouchDeviceAsync(device.Id, "", context.Request.Query["version"].ToString(), context.Request.Query["mode"].ToString());
             await store.WaitForRevisionChangeAsync(sent, TimeSpan.FromSeconds(25), aborted);
         }
     }
@@ -171,7 +172,7 @@ app.MapPost("/api/client/sync", async (HttpContext context, SyncRequest request,
 
 app.MapGet("/api/admin/status", async (HttpContext context, SharedStateStore store, ForwardProxyService proxy) =>
     Admin(context)
-        ? Results.Json(await store.AdminStatusAsync(proxy.PublicStatus(), audit.Recent(200)))
+        ? Results.Json(await store.AdminStatusAsync(proxy.PublicStatus(), audit.Recent(200), proxy.UsageReport))
         : Results.Unauthorized());
 
 app.MapPut("/api/admin/settings", async (HttpContext context, BrowserSettings settings, SharedStateStore store) =>
@@ -312,11 +313,41 @@ app.MapPost("/api/admin/devices/{id}/restore", async (HttpContext context, strin
     return Results.Ok(new { ok = true });
 });
 
-app.MapDelete("/api/admin/devices/{id}", async (HttpContext context, string id, SharedStateStore store) =>
+app.MapPut("/api/admin/devices/{id}/limits", async (HttpContext context, string id, DeviceLimitsRequest request, SharedStateStore store) =>
+{
+    if (!Admin(context)) return Results.Unauthorized();
+    try
+    {
+        var name = await store.SetDeviceLimitsAsync(id, request);
+        if (name is null) return Results.NotFound(new { error = "Device not found" });
+        static string Text(double? value) => value is null ? "default" : value == 0 ? "unlimited" : value.Value.ToString("0.###");
+        Record(context, "device.limits_updated", name, $"connections {Text(request.MaxConnections)}, quota {Text(request.MonthlyQuotaGb)} GB, rate {Text(request.RateLimitMbps)} Mbps");
+        return Results.Ok(new { ok = true });
+    }
+    catch (InvalidOperationException error) { return Results.BadRequest(new { error = error.Message }); }
+});
+
+app.MapPost("/api/admin/egress-ip", async (HttpContext context, SharedStateStore store) =>
+{
+    if (!Admin(context)) return Results.Unauthorized();
+    var settings = store.Settings;
+    try
+    {
+        var ip = await Egress.CheckAsync(settings.IpCheckUrl, settings.Proxy, context.RequestAborted);
+        return Results.Ok(new { ip, family = settings.Proxy.EgressAddressFamily, source = settings.Proxy.EgressSourceAddress, checkedAt = DateTimeOffset.UtcNow });
+    }
+    catch (Exception error) when (error is InvalidOperationException or HttpRequestException or TaskCanceledException or System.Text.Json.JsonException)
+    {
+        return Results.BadRequest(new { error = $"Egress check failed: {error.Message}" });
+    }
+});
+
+app.MapDelete("/api/admin/devices/{id}", async (HttpContext context, string id, SharedStateStore store, ProxyUsageTracker usage) =>
 {
     if (!Admin(context)) return Results.Unauthorized();
     var name = await store.DeleteDeviceAsync(id);
     if (name is null) return Results.NotFound(new { error = "Device not found" });
+    usage.Forget(id);
     Record(context, "device.deleted", name);
     return Results.NoContent();
 });

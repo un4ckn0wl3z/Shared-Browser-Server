@@ -105,6 +105,34 @@ describe('dashboard', () => {
     assert.ok(await page.isDisabled('#purge-profiles'));
   });
 
+  test('connection policy, egress settings and per-browser limits', async () => {
+    assert.equal(await page.inputValue('#network-policy'), 'strict');
+    // The proxy was enabled above, so the warning about Strict without a proxy stays hidden.
+    assert.ok(await page.isHidden('#policy-warning'));
+    await page.uncheck('#proxy-enabled');
+    assert.ok(await page.isVisible('#policy-warning'));
+    await page.check('#proxy-enabled');
+    await page.selectOption('#egress-family', 'ipv4');
+    await page.fill('#limit-connections', '20');
+    await page.fill('#limit-quota', '50');
+    await page.fill('#limit-rate', '10');
+    await page.selectOption('#network-policy', 'managed');
+    await page.click('#proxy-form > button');
+    await waitFor(async () => (await server.status()).settings.networkPolicy === 'managed', { message: 'policy saved' });
+    const proxy = (await server.status()).settings.proxy;
+    assert.deepEqual([proxy.egressAddressFamily, proxy.maxConnectionsPerDevice, proxy.monthlyQuotaGb, proxy.rateLimitMbps], ['ipv4', 20, 50, 10]);
+    // Per-browser override from the browsers table.
+    await page.click('#devices tr:has-text("WB1") button.limits');
+    await page.fill('.limits-row input[name=maxConnections]', '3');
+    await page.fill('.limits-row input[name=rateLimitMbps]', '0');
+    await page.click('.limits-row button:has-text("Save limits")');
+    await waitFor(async () => (await server.status()).devices.find(item => item.name === 'WB1').limitOverrides.maxConnections === 3, { message: 'override saved' });
+    const overrides = (await server.status()).devices.find(item => item.name === 'WB1').limitOverrides;
+    assert.deepEqual(overrides, { maxConnections: 3, monthlyQuotaGb: null, rateLimitMbps: 0 });
+    assert.ok((await page.textContent('#devices').then(() => page.locator('table:has(#devices) thead').textContent())).includes('Proxy this month'));
+    assert.match(await page.textContent('#devices'), /↑ .* · ↓ /);
+  });
+
   test('lists backups and the audit log', async () => {
     await waitFor(async () => (await page.locator('#backups tr').count()) >= 1 && !(await page.textContent('#backups')).includes('No backups'), { message: 'backup rows' });
     const audit = await page.textContent('#audit');
