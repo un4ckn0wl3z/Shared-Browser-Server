@@ -445,6 +445,7 @@ public sealed class SharedStateStore
                 return 0;
             }
             var changed = 0;
+            var adopted = false;
             var seen = new HashSet<string>();
             foreach (var incoming in incomingCookies.Take(MaxCookiesPerRequest))
             {
@@ -453,13 +454,20 @@ public sealed class SharedStateStore
                 seen.Add(CookieKey(cookie));
                 if (cookie.ExpiresAt is { } expires && expires < DateTimeOffset.UtcNow.ToUnixTimeSeconds()) continue;
                 var index = profile.Cookies.FindIndex(item => CookieKey(item) == CookieKey(cookie));
-                if (index >= 0 && CookieEqual(profile.Cookies[index], cookie)) continue;
+                if (index >= 0 && CookieEqual(profile.Cookies[index], cookie))
+                {
+                    // The primary browser now holds the cookie an administrator typed in, so from here on it
+                    // follows that browser: a later sign-out removes it like any other session cookie.
+                    if (profile.Cookies[index].SourceDeviceId == AdminSource) { profile.Cookies[index].SourceDeviceId = deviceId; adopted = true; }
+                    continue;
+                }
                 if (index < 0) profile.Cookies.Add(cookie); else profile.Cookies[index] = cookie;
                 changed++;
             }
             // A complete list describes every cookie the primary browser holds for exactly this host, so
             // cookies it no longer has (sign-out, server-side deletion) are removed from the vault too.
-            // Cookies typed in by an administrator are only removed from the dashboard.
+            // Cookies typed in by an administrator are kept until the primary browser has confirmed it holds
+            // them, so a publish that races ahead of installing a new cookie cannot delete it.
             if (request.Complete)
             {
                 changed += profile.Cookies.RemoveAll(item => item.Domain == host && item.SourceDeviceId != AdminSource && !seen.Contains(CookieKey(item)));
@@ -469,6 +477,7 @@ public sealed class SharedStateStore
                 BumpRevision();
                 await SaveLockedAsync();
             }
+            else if (adopted) await SaveLockedAsync();
             return changed;
         }
         finally { _gate.Release(); }
@@ -667,7 +676,7 @@ public sealed record EnrollRequest(string DeviceId, string DeviceName);
 public sealed record EnrollResponse(string DeviceId, string DeviceToken, long Revision);
 /// <summary>
 /// Complete=true means Cookies is every cookie the primary browser holds whose domain is exactly the
-/// page host, so stored cookies missing from it were deleted. Older clients omit it (partial update).
+/// page host, so stored cookies missing from it were deleted. Without it the list is a partial update.
 /// </summary>
 public sealed record SyncRequest(long KnownRevision, string PageUrl, List<SharedCookie>? Cookies, bool Complete = false);
 public sealed record SyncResponse(long Revision, int ChangedCookies, SharedSnapshot Snapshot);

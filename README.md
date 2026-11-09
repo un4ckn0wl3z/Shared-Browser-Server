@@ -59,7 +59,6 @@ The primary-writer model prevents a logged-out secondary browser from replacing 
 ## Included
 
 - `server/` — ASP.NET Core management server and web dashboard
-- `client/` — native Windows Shared Browser using WebView2
 - `electron-client/` — cross-platform Shared Browser for Windows, macOS, and Linux
 - Encrypted server-side cookie/session vault
 - Unique device identities and revocable device tokens
@@ -103,9 +102,9 @@ Revoke a device from the dashboard. A revoked device can no longer download or p
 | Regular cookies | Yes | Restricted to authorized domain profiles |
 | Secure and HttpOnly cookies | Yes | Values are encrypted in the server vault |
 | Cookie-based login sessions | Yes | Works when the website's login state is cookie-based |
-| Cookie expiration dates | Yes (Electron) | Expired cookies are dropped from the vault; the .NET client installs browser-session cookies |
-| Sign-outs and deleted cookies | Yes (Electron primary) | Cookies the primary browser no longer holds are removed from the vault and from the other browsers |
-| Shared bookmarks | Yes | Managed in the dashboard and shown in the Electron ★ menu |
+| Cookie expiration dates | Yes | Expired cookies are dropped from the vault |
+| Sign-outs and deleted cookies | Yes | Cookies the primary browser no longer holds are removed from the vault and from the other browsers |
+| Shared bookmarks | Yes | Managed in the dashboard and shown in the client's ★ menu |
 | `localStorage` | No | Some sites may still require a new login |
 | `sessionStorage` | No | Intentionally tab-scoped and temporary |
 | IndexedDB and service-worker caches | No | Remain local to each browser profile |
@@ -204,56 +203,34 @@ For browsers on other computers, bind the server to an appropriate private netwo
 
 `SHARED_BROWSER_PROXY_BIND` controls the interface used by the built-in forward proxy. Keep `127.0.0.1` for a local-only installation. For clients on a private network, set it to the server's private interface (or `0.0.0.0`) and protect the port with a firewall. The proxy always requires an active enrolled-device ID and device token; it is not an open unauthenticated proxy.
 
-## Windows .NET client
+## Shared Browser client (Electron)
 
-```powershell
-dotnet build client\SharedBrowser.csproj -c Release
-```
-
-Run each browser with a distinct local profile name:
-
-```powershell
-SharedBrowser.exe --profile=WB1
-SharedBrowser.exe --profile=WB2
-SharedBrowser.exe --profile=WB3
-```
-
-Each name creates an isolated WebView2 profile, device identity, encrypted token, and offline cache. All profiles connect to the same management server and shared vault.
-
-On first launch:
-
-1. Open **Server settings**.
-2. Enter the management-server URL.
-3. Enter a descriptive device name such as `WB1`.
-4. Enter the server administrator token once as the enrollment token.
-5. Save, close, and reopen Shared Browser.
-
-The server issues a random per-device token. The administrator token is discarded from the browser after enrollment. The device token and offline cookie cache are protected with Windows DPAPI.
-
-Repeat enrollment for WB2 and WB3. In the dashboard, choose the signed-in browser (normally WB1) as **Primary session browser**. Its stored cookies are scanned on startup, and every domain it visits is added to the shared vault automatically. WB2 and WB3 pull those changes approximately every 2.5 seconds.
-
-## Cross-platform Electron client
-
-The Electron client runs on Windows, macOS, and Linux while the original .NET/WebView2 client remains available. Both clients use the same server API and can share the same cookie/session vault.
+The client runs on Windows, macOS, and Linux.
 
 Ready-to-use Windows and macOS installers are published on the [GitHub Releases page](https://github.com/un4ckn0wl3z/Shared-Browser-Server/releases). Release tags build a Windows x64 NSIS installer and a universal macOS DMG on native GitHub runners. These community builds are currently unsigned, so Windows SmartScreen or macOS Gatekeeper may display a warning; review the repository source before allowing an unsigned build.
 
-Install and start it with Node.js 20 or newer:
+Install and start it with Node.js 20 or newer and pnpm (`corepack enable` provides it):
 
 ```bash
 cd electron-client
-npm install
-npm start -- --profile=WB1
+pnpm install
+pnpm start --profile=WB1
 ```
 
 Use a different profile name for every browser instance:
 
 ```bash
-npm start -- --profile=WB2
-npm start -- --profile=WB3
+pnpm start --profile=WB2
+pnpm start --profile=WB3
 ```
 
-On first launch, the settings dialog opens automatically. Enter the management-server URL, a device name, the administrator token as the one-time enrollment token, and choose Direct or Managed proxy mode. Saving restarts and enrolls the client.
+On Windows, `Open-WB1.cmd`, `Open-WB2.cmd`, and `Open-WB3.cmd` in the repository root start the WB1, WB2, and WB3 profiles after the dependencies are installed.
+
+Each profile name gets its own browser storage, device identity, encrypted device token, and offline cache. All profiles connect to the same management server and shared vault.
+
+On first launch, the settings dialog opens automatically. Enter the management-server URL, a device name such as `WB1`, the administrator token as the one-time enrollment token, and choose Direct or Managed proxy mode. Saving restarts and enrolls the client. The server issues a random per-device token and the administrator token is discarded from the browser after enrollment.
+
+Repeat enrollment for WB2 and WB3. In the dashboard, choose the signed-in browser (normally WB1) as **Primary session browser**. Its stored cookies are published on startup, and every domain whose cookies it holds is added to the shared vault automatically. WB2 and WB3 pull those changes approximately every 2.5 seconds.
 
 The installed client checks GitHub Releases at startup and every four hours. Its version is shown in the window title, the toolbar status text, and the settings dialog, which also has **Check for updates**. Windows and Linux AppImage builds download a new release in the background and show **Restart to update** in the toolbar; the update otherwise installs when the browser is closed. The macOS DMG is unsigned, so macOS cannot install updates in place: the toolbar shows **Update to vX** and opens the release page. Update checks follow the browser's connection mode, so in Managed or Strict privacy mode they go through the management proxy.
 
@@ -266,9 +243,9 @@ Electron stores each named profile in the operating system's application-data di
 Create platform installers from the matching operating system:
 
 ```bash
-npm run dist:win
-npm run dist:mac
-npm run dist:linux
+pnpm run dist:win
+pnpm run dist:mac
+pnpm run dist:linux
 ```
 
 macOS installers normally must be built and code-signed on macOS. Windows installers should be signed before public distribution.
@@ -283,11 +260,11 @@ Each browser independently chooses its route in **Server settings**:
 - **Managed proxy — use server IP**: HTTP and HTTPS traffic goes through the authenticated management-server proxy, so websites see the management server's outbound IP.
 - **Strict privacy**: requires Managed proxy mode, removes Chromium's implicit direct bypass routes, blocks browsing if the proxy configuration is unavailable, restricts WebRTC from using non-proxied UDP, and denies website permission prompts such as location, camera, microphone, and notifications.
 
-Restart a browser after changing its connection mode. When an administrator changes the proxy endpoint in the dashboard, Electron browsers in Managed mode switch to it on their next sync without a restart; the .NET/WebView2 client still needs a restart. HTTPS uses standard `CONNECT` tunneling and remains end-to-end encrypted between the browser and destination; the management proxy does not install a certificate authority or decrypt page contents.
+Restart a browser after changing its connection mode. When an administrator changes the proxy endpoint in the dashboard, browsers in Managed mode switch to it on their next sync without a restart. HTTPS uses standard `CONNECT` tunneling and remains end-to-end encrypted between the browser and destination; the management proxy does not install a certificate authority or decrypt page contents.
 
 Strict privacy is leak reduction, not anonymity. Signed-in accounts, shared cookies, browser fingerprints, and account activity can still identify a user. Because WebRTC cannot use direct UDP in this mode, browser-based voice or video calls may fall back to TCP or fail.
 
-The Electron settings dialog includes **Run privacy check**, which verifies that Chromium resolves both public and loopback destinations through the configured proxy and confirms that the non-proxied WebRTC policy was applied. Run it after saving and restarting the browser.
+The settings dialog includes **Run privacy check**, which verifies that Chromium resolves both public and loopback destinations through the configured proxy and confirms that the non-proxied WebRTC policy was applied. Run it after saving and restarting the browser.
 
 The default destination-port allowlist is `80,443`. Private, loopback, link-local, and multicast destinations are blocked to reduce server-side request-forgery risk.
 
@@ -295,7 +272,7 @@ The default destination-port allowlist is `80,443`. Private, loopback, link-loca
 
 - Automatic sharing is enabled by default. The primary browser creates a profile for every domain whose cookies it publishes.
 - Only the primary browser can publish cookie/session changes. This prevents a logged-out secondary browser from overwriting a logged-in session.
-- The Electron primary publishes a complete cookie list per domain, and only for domains whose cookies changed. Cookies it no longer has (for example after signing out) are removed from the vault; cookies typed into the dashboard are only removed from the dashboard. Secondary browsers delete a removed cookie only while it still holds the value they received.
+- The primary browser publishes a complete cookie list per domain, and only for domains whose cookies changed. Cookies it no longer has (for example after signing out) are removed from the vault. A cookie typed into the dashboard is protected until the primary browser has received it; after that it is removed on sign-out like any other cookie. Secondary browsers delete a removed cookie only while it still holds the value they received.
 - A disabled profile stops sharing for its domain; the primary browser does not recreate an automatic profile for it.
 - Profile edits in the dashboard keep stored cookie values when the value field is left empty, so one cookie can be changed without re-entering the others.
 - Clients poll with the revision they already have and the server answers `204 No Content` when nothing changed. After errors, polling backs off up to one minute.

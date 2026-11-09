@@ -7,7 +7,6 @@
 **/dist
 **/browser-data
 **/server-data
-**/webview-profile
 *.log
 *.tmp
 .vs
