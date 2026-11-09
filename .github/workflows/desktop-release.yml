@@ -63,12 +63,6 @@ jobs:
           cache: pnpm
           cache-dependency-path: electron-client/pnpm-lock.yaml
 
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Check JavaScript
-        run: pnpm run check
-
       # electron-builder downloads Electron and its packaging tools (NSIS, 7-Zip, AppImage) from GitHub
       # releases. Caching them avoids most downloads, and retries ride out the occasional 502/504.
       - name: Cache Electron downloads
@@ -83,6 +77,23 @@ jobs:
             ~/AppData/Local/electron-builder/Cache
           key: electron-downloads-${{ runner.os }}-${{ hashFiles('electron-client/pnpm-lock.yaml') }}
           restore-keys: electron-downloads-${{ runner.os }}-
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          # Electron's postinstall downloads its binary from GitHub releases as well.
+          for attempt in 1 2 3 4; do
+            if pnpm install --frozen-lockfile; then exit 0; fi
+            if [ "$attempt" -lt 4 ]; then
+              echo "::warning::Install attempt $attempt failed; retrying in $((attempt * 30)) seconds"
+              sleep $((attempt * 30))
+            fi
+          done
+          echo "::error::Installing dependencies failed after 4 attempts"
+          exit 1
+
+      - name: Check JavaScript
+        run: pnpm run check
 
       - name: Package application
         shell: bash
