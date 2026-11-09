@@ -35,6 +35,14 @@ jobs:
             command: dist:mac
             artifact: shared-browser-macos-universal
             files: electron-client/dist/*.dmg
+          - name: Linux x64
+            os: ubuntu-latest
+            command: dist:linux
+            artifact: shared-browser-linux-x64
+            # latest-linux.yml lets the AppImage update itself.
+            files: |
+              electron-client/dist/*.AppImage
+              electron-client/dist/latest-linux.yml
     runs-on: ${{ matrix.os }}
     defaults:
       run:

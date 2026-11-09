@@ -1,4 +1,5 @@
 using System.Net;
+using System.Net.Security;
 using System.Net.Sockets;
 using System.Text;
 
@@ -12,7 +13,9 @@ public sealed class ForwardProxyService : BackgroundService
     private static readonly TimeSpan IdleTimeout = TimeSpan.FromMinutes(10);
     private static readonly TimeSpan RevocationCheckInterval = TimeSpan.FromSeconds(5);
     private readonly SharedStateStore _store;
+    private readonly ProxyCertificate _certificate;
     private readonly ILogger<ForwardProxyService> _logger;
+    private DateTimeOffset _lastFingerprintCheck;
     private long _totalConnections;
     private long _activeConnections;
     private long _bytesFromClients;
@@ -21,9 +24,10 @@ public sealed class ForwardProxyService : BackgroundService
     private volatile int _listeningPort;
     private string _lastError = "";
 
-    public ForwardProxyService(SharedStateStore store, ILogger<ForwardProxyService> logger)
+    public ForwardProxyService(SharedStateStore store, ProxyCertificate certificate, ILogger<ForwardProxyService> logger)
     {
         _store = store;
+        _certificate = certificate;
         _logger = logger;
     }
 
@@ -32,6 +36,9 @@ public sealed class ForwardProxyService : BackgroundService
         listening = _listening,
         bindAddress = Environment.GetEnvironmentVariable("SHARED_BROWSER_PROXY_BIND") ?? "127.0.0.1",
         port = _listeningPort,
+        tls = _store.Settings.Proxy.Tls,
+        certificateSha256 = _store.Settings.Proxy.CertificateSha256,
+        certificateSource = _certificate.OperatorSupplied ? "operator" : "generated",
         activeConnections = Interlocked.Read(ref _activeConnections),
         totalConnections = Interlocked.Read(ref _totalConnections),
         bytesFromClients = Interlocked.Read(ref _bytesFromClients),
@@ -66,6 +73,7 @@ public sealed class ForwardProxyService : BackgroundService
 
                 while (!stoppingToken.IsCancellationRequested)
                 {
+                    await RefreshFingerprintAsync();
                     var current = _store.Settings.Proxy;
                     if (!current.Enabled || current.Port != proxy.Port) break;
                     using var acceptCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
@@ -114,7 +122,15 @@ public sealed class ForwardProxyService : BackgroundService
                 client.NoDelay = true;
                 using var timeout = CancellationTokenSource.CreateLinkedTokenSource(serverToken);
                 timeout.CancelAfter(HeaderTimeout);
-                var clientStream = client.GetStream();
+                Stream clientStream = client.GetStream();
+                if (_store.Settings.Proxy.Tls)
+                {
+                    // The browser sends its device credentials to the proxy, so they travel inside TLS.
+                    var tls = new SslStream(clientStream, leaveInnerStreamOpen: false);
+                    await tls.AuthenticateAsServerAsync(new SslServerAuthenticationOptions { ServerCertificate = _certificate.Current, ClientCertificateRequired = false }, timeout.Token);
+                    clientStream = tls;
+                }
+                await using var clientStreamScope = clientStream;
                 var request = await ReadRequestAsync(clientStream, timeout.Token);
                 if (request is null) return;
                 Interlocked.Add(ref _bytesFromClients, request.Header.Length + request.Remainder.Length);
@@ -167,7 +183,9 @@ public sealed class ForwardProxyService : BackgroundService
                 }
 
                 var upload = PumpAsync(clientStream, remoteStream, true, timeout);
-                var download = PumpAsync(remoteStream, clientStream, false, timeout);
+                var download = request.Method.Equals("CONNECT", StringComparison.OrdinalIgnoreCase)
+                    ? PumpAsync(remoteStream, clientStream, false, timeout)
+                    : ForwardResponseAsync(remoteStream, clientStream, timeout);
                 var revocation = WatchRevocationAsync(deviceId, timeout.Token);
                 await Task.WhenAny(upload, download, revocation);
                 timeout.Cancel();
@@ -200,7 +218,80 @@ public sealed class ForwardProxyService : BackgroundService
             await Task.Delay(RevocationCheckInterval, cancellationToken);
     }
 
-    private static async Task<ProxyRequest?> ReadRequestAsync(NetworkStream stream, CancellationToken cancellationToken)
+    private async Task RefreshFingerprintAsync()
+    {
+        if (DateTimeOffset.UtcNow - _lastFingerprintCheck < TimeSpan.FromSeconds(30)) return;
+        _lastFingerprintCheck = DateTimeOffset.UtcNow;
+        try { await _store.RefreshProxyFingerprintAsync(); }
+        catch (Exception error) { _logger.LogWarning(error, "Could not refresh the proxy certificate fingerprint"); }
+    }
+
+    /// <summary>
+    /// Forwards a plain-HTTP origin response with "Connection: close" added. Without it the browser would
+    /// reuse this connection, and its next request (carrying Proxy-Authorization, possibly for another
+    /// site) would be pumped unparsed to the first origin. Interim 1xx responses pass through unchanged.
+    /// </summary>
+    private async Task ForwardResponseAsync(Stream remote, Stream client, CancellationTokenSource idle)
+    {
+        var pending = Array.Empty<byte>();
+        while (true)
+        {
+            var block = await ReadHeaderBlockAsync(remote, pending, idle.Token);
+            if (block is null)
+            {
+                if (pending.Length > 0) await client.WriteAsync(pending, idle.Token);
+                return;
+            }
+            var (header, rest) = block.Value;
+            var text = Encoding.ASCII.GetString(header);
+            var statusLine = text[..text.IndexOf("\r\n", StringComparison.Ordinal)];
+            var parts = statusLine.Split(' ', 3);
+            var interim = parts.Length > 1 && parts[1].Length == 3 && parts[1][0] == '1' && parts[1] != "101";
+            if (interim)
+            {
+                await client.WriteAsync(header, idle.Token);
+                Interlocked.Add(ref _bytesToClients, header.Length);
+                pending = rest;
+                continue;
+            }
+            var builder = new StringBuilder(statusLine).Append("\r\n");
+            foreach (var line in text.Split("\r\n").Skip(1))
+            {
+                if (line.Length == 0) continue;
+                var name = line.Split(':', 2)[0].Trim();
+                if (name.Equals("Connection", StringComparison.OrdinalIgnoreCase) || name.Equals("Keep-Alive", StringComparison.OrdinalIgnoreCase) || name.Equals("Proxy-Connection", StringComparison.OrdinalIgnoreCase)) continue;
+                builder.Append(line).Append("\r\n");
+            }
+            builder.Append("Connection: close\r\nProxy-Connection: close\r\n\r\n");
+            var rewritten = Encoding.ASCII.GetBytes(builder.ToString());
+            await client.WriteAsync(rewritten, idle.Token);
+            if (rest.Length > 0) await client.WriteAsync(rest, idle.Token);
+            Interlocked.Add(ref _bytesToClients, rewritten.Length + rest.Length);
+            await PumpAsync(remote, client, false, idle);
+            return;
+        }
+    }
+
+    /// <summary>Reads one header block (through the blank line), starting with bytes already received.</summary>
+    private static async Task<(byte[] Header, byte[] Remainder)?> ReadHeaderBlockAsync(Stream stream, byte[] initial, CancellationToken cancellationToken)
+    {
+        using var buffer = new MemoryStream();
+        buffer.Write(initial);
+        var chunk = new byte[8192];
+        var end = FindHeaderEnd(buffer.GetBuffer(), (int)buffer.Length);
+        while (end < 0)
+        {
+            if (buffer.Length >= MaxHeaderBytes) throw new InvalidOperationException("Origin response headers are too large");
+            var read = await stream.ReadAsync(chunk, cancellationToken);
+            if (read == 0) return null;
+            buffer.Write(chunk, 0, read);
+            end = FindHeaderEnd(buffer.GetBuffer(), (int)buffer.Length);
+        }
+        var bytes = buffer.ToArray();
+        return (bytes[..end], bytes[end..]);
+    }
+
+    private static async Task<ProxyRequest?> ReadRequestAsync(Stream stream, CancellationToken cancellationToken)
     {
         using var buffer = new MemoryStream();
         var chunk = new byte[4096];

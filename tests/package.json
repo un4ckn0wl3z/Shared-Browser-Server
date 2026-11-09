@@ -1,0 +1,15 @@
+{
+  "name": "shared-browser-tests",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.19.0",
+  "scripts": {
+    "test": "node --test --test-concurrency=1 --test-timeout=240000 server.test.mjs dashboard.test.mjs electron.test.mjs",
+    "test:server": "node --test --test-timeout=120000 server.test.mjs",
+    "test:dashboard": "node --test --test-timeout=120000 dashboard.test.mjs",
+    "test:electron": "node --test --test-timeout=240000 electron.test.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.64.1"
+  }
+}

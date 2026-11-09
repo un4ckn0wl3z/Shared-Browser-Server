@@ -2,7 +2,7 @@
 :root { color-scheme: light; font-family: Inter, "Segoe UI", system-ui, sans-serif; }
 * { box-sizing: border-box; }
 body { margin: 0; overflow: hidden; background: #f5f7fb; color: #152033; }
-header { height: 112px; padding: 7px 8px 8px; border-bottom: 1px solid #ccd3df; background: #edf1f7; }
+header { min-height: 112px; padding: 7px 8px 8px; border-bottom: 1px solid #ccd3df; background: #edf1f7; }
 button, input, select { font: inherit; }
 button { border: 1px solid #c4cbd7; border-radius: 7px; background: #fff; color: #263246; padding: 7px 11px; cursor: pointer; }
 button:hover:not(:disabled) { background: #f7f9fc; border-color: #9ba8ba; }
@@ -49,3 +49,14 @@ label small { color: #667085; font-weight: normal; }
 .version-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: #475467; font-size: 13px; }
 .primary { background: #2868c7; border-color: #2868c7; color: white; }
 .primary:hover { background: #1e57ac !important; }
+.announcements { display: grid; gap: 6px; max-height: 196px; overflow-y: auto; }
+.announcements:not(:empty) { margin-top: 8px; }
+.announcement { display: flex; align-items: flex-start; gap: 10px; padding: 8px 10px 8px 12px; border: 1px solid #b9d3f5; border-left: 4px solid #2868c7; border-radius: 8px; background: #eaf2fd; color: #17375f; font-size: 13px; }
+.announcement.warning { border-color: #f1d79a; border-left-color: #d99a12; background: #fff6df; color: #5c3d00; }
+.announcement.critical { border-color: #f1b6b1; border-left-color: #c62828; background: #fdecea; color: #6d1410; }
+.announcement-body { flex: 1; min-width: 0; }
+.announcement-body strong { display: block; margin-bottom: 2px; }
+.announcement-body p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.announcement-body small { display: block; margin-top: 3px; opacity: .75; }
+.announcement button { height: 28px; padding: 3px 10px; background: #ffffffb3; }
+.announcement .dismiss { width: 28px; padding: 0; font-size: 16px; }

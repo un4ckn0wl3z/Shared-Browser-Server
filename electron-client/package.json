@@ -1,6 +1,6 @@
 {
   "name": "shared-browser-electron",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Cross-platform Shared Browser client",
   "main": "main.cjs",
   "author": "Shared Browser Server contributors",
@@ -13,7 +13,7 @@
     "dist": "electron-builder --publish never",
     "dist:win": "electron-builder --win nsis --x64 --publish never",
     "dist:mac": "electron-builder --mac dmg --universal --publish never",
-    "dist:linux": "electron-builder --linux --publish never"
+    "dist:linux": "electron-builder --linux --x64 --publish never"
   },
   "devDependencies": {
     "electron": "^38.0.0",
@@ -51,8 +51,7 @@
     },
     "linux": {
       "target": [
-        "AppImage",
-        "deb"
+        "AppImage"
       ],
       "category": "Network"
     }
@@ -62,5 +61,6 @@
   },
   "dependencies": {
     "electron-updater": "^6.8.11"
-  }
+  },
+  "homepage": "https://github.com/un4ckn0wl3z/Shared-Browser-Server"
 }

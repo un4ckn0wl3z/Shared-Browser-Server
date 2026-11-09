@@ -54,14 +54,14 @@ sequenceDiagram
     Secondary->>Site: Browse using synchronized cookies
 ```
 
-The primary-writer model prevents a logged-out secondary browser from replacing a valid shared session. Secondary clients consume updates approximately every 2.5 seconds.
+The primary-writer model prevents a logged-out secondary browser from replacing a valid shared session. The server pushes each new revision to connected browsers over Server-Sent Events, so secondary browsers pick up a change within about a second; polling remains as a fallback.
 
 ## Included
 
 - `server/` — ASP.NET Core management server and web dashboard
 - `electron-client/` — cross-platform Shared Browser for Windows, macOS, and Linux
 - Encrypted server-side cookie/session vault
-- Unique device identities and revocable device tokens
+- Unique device identities and revocable device tokens, enrolled with one-time codes
 - Automatic per-domain cookie/session profiles
 - A primary browser that publishes session changes while other browsers consume them
 - Controlled cookie synchronization with one primary writer
@@ -70,6 +70,11 @@ The primary-writer model prevents a logged-out secondary browser from replacing 
 - Browser/device status in the management dashboard
 - Authenticated forward proxy built into the management server
 - Per-browser choice between direct client-IP traffic and management-server-IP traffic
+- TLS between browsers and the proxy, with the certificate pinned by the browsers
+- Per-profile access: share a domain with all browsers or only selected ones
+- Live updates over Server-Sent Events
+- Audit log, automatic vault backups, and vault export/import
+- Announcements from the administrator to all or selected browsers
 
 Session values are sensitive credentials. Use this only for domains and accounts you own or are explicitly authorized to administer.
 
@@ -115,7 +120,7 @@ Revoke a device from the dashboard. A revoked device can no longer download or p
 1. Deploy the management server and securely save its administrator token and data key.
 2. Enable the forward proxy only if browsers need the server's outbound IP.
 3. Install Shared Browser on each computer and give every instance a unique profile name.
-4. Enroll each browser once with the administrator token; the server replaces it with a revocable device token.
+4. Create a one-time enrollment code in the dashboard for each browser and enter it in the browser's Settings; the server issues a revocable device token in exchange.
 5. Select WB1 as the primary session browser in the dashboard.
 6. Sign in to an authorized website on WB1.
 7. Open the same website on WB2 or WB3 after synchronization completes.
@@ -176,9 +181,9 @@ To allow remote browsers to use Managed proxy mode, set `SHARED_BROWSER_PROXY_PU
 docker compose up -d
 ```
 
-Keep port `8899` behind a private network, firewall allowlist, WireGuard, or Tailscale. Do not publish it openly to the internet: the destination HTTPS connection is tunneled, but the browser-to-proxy authentication exchange is not protected by TLS. If the dashboard proxy port is changed from `8899`, update the Compose port mapping at the same time.
+Turn on **Encrypt the browser-to-proxy connection with TLS** in the dashboard so the device credentials browsers send to the proxy are never readable on the network (see [Proxy TLS](#proxy-tls)). Even with TLS, prefer keeping port `8899` behind a private network, firewall allowlist, WireGuard, or Tailscale. If the dashboard proxy port is changed from `8899`, update the Compose port mapping at the same time.
 
-Back up the `shared-browser-data` volume and securely retain the matching data key. Upgrade with:
+The server keeps hourly backups of the vault in the `backups` folder of the data volume (see [Backups, export and import](#backups-export-and-import)). Still back up the `shared-browser-data` volume and securely retain the matching data key. Upgrade with:
 
 ```bash
 git pull
@@ -201,13 +206,26 @@ Open `http://127.0.0.1:8787` and enter the administrator token.
 
 For browsers on other computers, bind the server to an appropriate private network interface and put HTTPS in front of it. Do not transmit device tokens or session cookies over untrusted plain HTTP.
 
+### Server configuration
+
+| Variable | Purpose |
+| --- | --- |
+| `SHARED_BROWSER_ADMIN_TOKEN` | Required. Dashboard administrator token (and, unless disabled, an enrollment credential). |
+| `SHARED_BROWSER_DATA_KEY` | Required. Encrypts cookie values in the vault, backups and exports. Never change it once data exists. |
+| `SHARED_BROWSER_DATA` | Data directory (`state.json`, `audit.jsonl`, `backups/`, `proxy-tls.pfx`). |
+| `SHARED_BROWSER_PROXY_BIND` | Interface the forward proxy listens on (default `127.0.0.1`). |
+| `SHARED_BROWSER_PROXY_TLS_CERT` / `SHARED_BROWSER_PROXY_TLS_KEY` | Optional PEM certificate and key for proxy TLS. Without them the server generates a self-signed certificate. |
+| `SHARED_BROWSER_BACKUP_INTERVAL_MINUTES` | Minimum time between automatic backups (default `60`). |
+| `SHARED_BROWSER_BACKUP_KEEP` | Number of backups to keep (default `48`). |
+| `SHARED_BROWSER_TRUST_FORWARDED_HEADERS` | `true` to take client addresses in the audit log from `X-Forwarded-For`. Enable only when the server is reachable solely through a reverse proxy such as the bundled Caddy profile. |
+
 `SHARED_BROWSER_PROXY_BIND` controls the interface used by the built-in forward proxy. Keep `127.0.0.1` for a local-only installation. For clients on a private network, set it to the server's private interface (or `0.0.0.0`) and protect the port with a firewall. The proxy always requires an active enrolled-device ID and device token; it is not an open unauthenticated proxy.
 
 ## Shared Browser client (Electron)
 
 The client runs on Windows, macOS, and Linux.
 
-Ready-to-use Windows and macOS installers are published on the [GitHub Releases page](https://github.com/un4ckn0wl3z/Shared-Browser-Server/releases). Release tags build a Windows x64 NSIS installer and a universal macOS DMG on native GitHub runners. These community builds are currently unsigned, so Windows SmartScreen or macOS Gatekeeper may display a warning; review the repository source before allowing an unsigned build.
+Ready-to-use installers are published on the [GitHub Releases page](https://github.com/un4ckn0wl3z/Shared-Browser-Server/releases): a Windows x64 NSIS installer, a universal macOS DMG, and a Linux x64 AppImage, each built on a native GitHub runner. These community builds are currently unsigned, so Windows SmartScreen or macOS Gatekeeper may display a warning; review the repository source before allowing an unsigned build.
 
 Install and start it with Node.js 20 or newer and pnpm (`corepack enable` provides it):
 
@@ -228,7 +246,9 @@ On Windows, `Open-WB1.cmd`, `Open-WB2.cmd`, and `Open-WB3.cmd` in the repository
 
 Each profile name gets its own browser storage, device identity, encrypted device token, and offline cache. All profiles connect to the same management server and shared vault.
 
-On first launch, the settings dialog opens automatically. Enter the management-server URL, a device name such as `WB1`, the administrator token as the one-time enrollment token, and choose Direct or Managed proxy mode. Saving restarts and enrolls the client. The server issues a random per-device token and the administrator token is discarded from the browser after enrollment.
+On first launch, the settings dialog opens automatically. In the dashboard, use **Connect a browser** to create a one-time enrollment code (it expires after 10 minutes by default and works once). In the browser, enter the management-server URL, a device name such as `WB1`, and the enrollment code, then choose Direct or Managed proxy mode. Saving restarts and enrolls the client, and the server issues a random per-device token.
+
+The administrator token also works as an enrollment credential for compatibility. Turn off **Allow browsers to enroll with the administrator token** in the dashboard once every browser uses codes, so the administrator token never has to be typed on a browser computer.
 
 Repeat enrollment for WB2 and WB3. In the dashboard, choose the signed-in browser (normally WB1) as **Primary session browser**. Its stored cookies are published on startup, and every domain whose cookies it holds is added to the shared vault automatically. WB2 and WB3 pull those changes approximately every 2.5 seconds.
 
@@ -237,6 +257,8 @@ The installed client checks GitHub Releases at startup and every four hours. Its
 The address bar accepts full URLs, bare host names (`github.com`, or `localhost:3000` which opens over HTTP), and search terms, which use the search URL configured in the dashboard (DuckDuckGo by default; leave it empty to disable searching). The ★ button lists the shared bookmarks; hold Ctrl (⌘) or Shift to open one in a new tab. Middle-click a tab to close it, and double-click the empty tab strip to open a new one. Download progress is shown in the status text.
 
 Keyboard shortcuts (⌘ instead of Ctrl on macOS): Ctrl+T new tab, Ctrl+Shift+T reopen the last closed tab, Ctrl+W close tab, Ctrl+Tab / Ctrl+Shift+Tab switch tabs, Ctrl+L focus the address bar, Ctrl+F or F3 find in page (Enter / Shift+Enter for next and previous, Esc to close), Ctrl+R or F5 reload, Ctrl+Shift+R hard reload, Alt+← / Alt+→ back and forward, Ctrl+= / Ctrl+- / Ctrl+0 zoom, and F12 developer tools. Right-click a page for copy/paste, link, and Inspect actions. Links that open a new tab load as tabs; `window.open` popups open as real windows so sign-in and approval flows that report back to their opener keep working.
+
+Open tabs and the window size and position are restored the next time a profile starts. Tab addresses are stored encrypted along with the device credentials.
 
 Electron stores each named profile in the operating system's application-data directory. Device credentials and the offline shared snapshot use Electron `safeStorage`; Chromium protects its persistent cookie store using the facilities available on the operating system. On Linux, install and unlock a supported secret store such as KWallet, GNOME Keyring, or Secret Service. The client warns when Electron falls back to unencrypted `basic_text` storage.
 
@@ -266,6 +288,16 @@ Strict privacy is leak reduction, not anonymity. Signed-in accounts, shared cook
 
 The settings dialog includes **Run privacy check**, which verifies that Chromium resolves both public and loopback destinations through the configured proxy and confirms that the non-proxied WebRTC policy was applied. Run it after saving and restarting the browser.
 
+### Proxy TLS
+
+Browsers authenticate to the proxy with their device ID and token. With **Encrypt the browser-to-proxy connection with TLS** enabled in the dashboard, the proxy accepts only TLS connections and browsers in Managed mode switch to an `https://` proxy automatically, so those credentials and the requested destinations are never sent in plain text.
+
+The server generates a self-signed certificate on first use and keeps it in the data directory, or uses `SHARED_BROWSER_PROXY_TLS_CERT` and `SHARED_BROWSER_PROXY_TLS_KEY` when set (a renewed certificate on disk is picked up within a minute). Browsers do not rely on a public certificate authority: the management server publishes the certificate's SHA-256 fingerprint over its authenticated API, the dashboard shows it, and each browser accepts the proxy certificate only when it matches.
+
+Proxy TLS requires Shared Browser 1.2 or newer on every browser that uses Managed mode. Update the browsers before turning it on; older browsers cannot connect to a TLS proxy.
+
+Plain-HTTP requests through the proxy are answered with `Connection: close`, so a browser never reuses the connection for a second request that the proxy would pass to the first origin unparsed.
+
 The default destination-port allowlist is `80,443`. Private, loopback, link-local, and multicast destinations are blocked to reduce server-side request-forgery risk.
 
 ## Synchronization rules
@@ -277,6 +309,7 @@ The default destination-port allowlist is `80,443`. Private, loopback, link-loca
 - Profile edits in the dashboard keep stored cookie values when the value field is left empty, so one cookie can be changed without re-entering the others.
 - Clients poll with the revision they already have and the server answers `204 No Content` when nothing changed. After errors, polling backs off up to one minute.
 - Profiles can still be disabled or removed from the dashboard when a domain should not be shared.
+- A profile can be shared with all browsers or only selected ones. A browser that loses access removes the cookies it received from that profile, and deleting the last selected browser never widens a profile to everyone.
 - Server revisions provide a consistent order across browsers.
 - Cookie conflicts use server-arrival last-write-wins behavior.
 - Identical updates are deduplicated and do not create new revisions.
@@ -284,3 +317,35 @@ The default destination-port allowlist is `80,443`. Private, loopback, link-loca
 - In Direct mode, browser web traffic does not pass through the management server. In Managed mode, it passes through the authenticated forward proxy.
 
 The first version deliberately uses the central server as the authority. Direct P2P transport can be added later without changing the browser data model.
+
+## Administration
+
+### Announcements
+
+The dashboard's **Send an announcement** section sends a message to every browser or to selected ones. An announcement has a title and/or message, a level (info, warning, or critical), an optional link, and an optional expiry (1 hour to 30 days, or never). Connected browsers show it within a second or two as a banner below the toolbar, and the page moves down so nothing is covered. Warning and critical announcements also raise a desktop notification.
+
+The banner is plain text: nothing in an announcement is interpreted as HTML. **Open link** opens the link in a new tab, and **×** dismisses the banner on that browser. The dismissal is remembered across restarts and reported to the server, so the dashboard lists which browsers have dismissed each announcement. Deleting an announcement removes its banner everywhere; expired announcements disappear from browsers and stay listed in the dashboard for a week.
+
+### Audit log
+
+The dashboard's **Activity** section lists enrollments, enrollment codes, settings and proxy changes, announcements, profile, bookmark and device changes, vault exports, imports and restores, and failed administrator sign-ins or enrollments (at most one entry per address every five minutes). Entries are also written to `audit.jsonl` in the data directory and to the server log. Set `SHARED_BROWSER_TRUST_FORWARDED_HEADERS=true` behind a reverse proxy so the recorded address is the client's rather than the proxy's.
+
+### Backups, export and import
+
+The server copies `state.json` into `backups/` at most once an hour (`SHARED_BROWSER_BACKUP_INTERVAL_MINUTES`) and keeps the newest 48 (`SHARED_BROWSER_BACKUP_KEEP`). The dashboard's **Vault backups** section lists them and restores any of them, and can export the current vault or import an exported one. Every import or restore first saves the current vault as another backup.
+
+Backups and exports keep cookie values encrypted with `SHARED_BROWSER_DATA_KEY`, so they can only be restored on a server with the same data key; a vault written with another key is refused. They do contain device token hashes and enrollment state, so store them as carefully as the data volume.
+
+## Development and tests
+
+Integration tests start the real server and real Electron browsers:
+
+```bash
+dotnet build server/SharedBrowser.Server.csproj -c Release
+cd electron-client && pnpm install && cd ..
+cd tests && pnpm install
+pnpm exec playwright install chromium
+xvfb-run -a pnpm test
+```
+
+On a desktop, run `pnpm test` without `xvfb-run`. The proxy tunnel tests need an origin on an address the proxy treats as public; they are skipped unless `TEST_PUBLIC_IP` (default `8.8.4.4`) is bound locally, for example with `sudo ip addr add 8.8.4.4/32 dev lo` on Linux. The CI workflow runs the whole suite on every pull request.

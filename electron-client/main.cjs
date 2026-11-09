@@ -1,4 +1,4 @@
-const { app, BrowserWindow, WebContentsView, Menu, clipboard, ipcMain, net, session, safeStorage, shell } = require('electron');
+const { app, BrowserWindow, WebContentsView, Menu, Notification, clipboard, ipcMain, net, screen, session, safeStorage, shell } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const crypto = require('node:crypto');
@@ -11,6 +11,10 @@ const MAX_CLOSED_TABS = 25;
 // The server ignores expiry shifts smaller than a day, so the client does not re-push them either.
 const EXPIRY_BUCKET_SECONDS = 24 * 60 * 60;
 const DEFAULT_SEARCH_URL = 'https://duckduckgo.com/?q=%s';
+// While the server can push changes over Server-Sent Events, polling is only a slow safety net.
+const EVENTS_POLL_INTERVAL_MS = 30 * 1000;
+const EVENTS_IDLE_TIMEOUT_MS = 70 * 1000;
+const MAX_RESTORED_TABS = 30;
 const UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000;
 const RELEASE_REPOSITORY = 'un4ckn0wl3z/Shared-Browser-Server';
 // electron-updater downloads through this partition (its NET_SESSION_NAME); it gets the same proxy as
@@ -37,6 +41,12 @@ let appliedCookies = new Map();
 let pushedDomains = new Map();
 let wasPrimary = false;
 let watchingCookies = false;
+let eventsConnected = false;
+let eventsController;
+let sessionSaveTimer;
+let quitting = false;
+let chromeHeight = TOOLBAR_HEIGHT;
+let announcementTimer;
 const closedTabs = [];
 let autoUpdater;
 let updateTimer;
@@ -78,7 +88,8 @@ function defaultSnapshot() {
       proxy: { enabled: false, host: '127.0.0.1', port: 8899, allowedPorts: '80,443', bypassList: 'localhost;127.0.0.1' }
     },
     profiles: [],
-    bookmarks: []
+    bookmarks: [],
+    announcements: []
   };
 }
 
@@ -89,7 +100,9 @@ function defaultConfig() {
     deviceName: profileName,
     networkMode: 'direct',
     strictPrivacy: false,
-    secrets: { deviceToken: '', enrollmentToken: '', cache: defaultSnapshot() }
+    window: undefined,
+    announcements: { dismissed: [], notified: [], pendingAcks: [] },
+    secrets: { deviceToken: '', enrollmentToken: '', cache: defaultSnapshot(), session: { tabs: [], active: 0 } }
   };
 }
 
@@ -127,10 +140,20 @@ function loadConfig() {
       deviceName: String(disk.deviceName || profileName).slice(0, 80),
       networkMode: disk.networkMode === 'managed' ? 'managed' : 'direct',
       strictPrivacy: disk.strictPrivacy === true,
+      window: normalizeWindowState(disk.window),
+      announcements: {
+        dismissed: stringList(disk.announcements?.dismissed),
+        notified: stringList(disk.announcements?.notified),
+        pendingAcks: stringList(disk.announcements?.pendingAcks)
+      },
       secrets: {
         deviceToken: String(secrets?.deviceToken || ''),
         enrollmentToken: String(secrets?.enrollmentToken || ''),
-        cache: normalizeSnapshot(secrets?.cache)
+        cache: normalizeSnapshot(secrets?.cache),
+        session: {
+          tabs: Array.isArray(secrets?.session?.tabs) ? secrets.session.tabs.filter(url => /^https?:\/\//i.test(String(url))).slice(0, MAX_RESTORED_TABS) : [],
+          active: Number(secrets?.session?.active) || 0
+        }
       }
     };
   } catch {
@@ -146,6 +169,9 @@ function saveConfig() {
     deviceName: config.deviceName,
     networkMode: config.networkMode,
     strictPrivacy: config.strictPrivacy,
+    window: config.window,
+    announcements: config.announcements,
+    // Open tab addresses can contain tokens, so they are encrypted along with the device credentials.
     protected: encrypt(config.secrets)
   };
   const target = configPath();
@@ -164,8 +190,133 @@ function normalizeSnapshot(input) {
   input.settings.proxy ||= fallback.settings.proxy;
   input.profiles = Array.isArray(input.profiles) ? input.profiles : [];
   input.bookmarks = Array.isArray(input.bookmarks) ? input.bookmarks.filter(item => item && /^https?:\/\//i.test(item.url || '')) : [];
+  input.announcements = Array.isArray(input.announcements)
+    ? input.announcements.filter(item => item && typeof item.id === 'string' && ['info', 'warning', 'critical'].includes(item.level))
+      .map(item => ({ ...item, title: String(item.title || ''), message: String(item.message || ''), url: /^https?:\/\//i.test(item.url || '') ? item.url : '' }))
+    : [];
   input.revision = Number(input.revision) || 0;
   return input;
+}
+
+function stringList(value) {
+  return Array.isArray(value) ? value.filter(item => typeof item === 'string').slice(-500) : [];
+}
+
+// ---- Announcements ------------------------------------------------------------------------------
+
+function visibleAnnouncements() {
+  const dismissed = new Set(config.announcements.dismissed);
+  const now = Date.now();
+  return config.secrets.cache.announcements.filter(item => !dismissed.has(item.id) && !(item.expiresAt && Date.parse(item.expiresAt) <= now));
+}
+
+// Sends the banners to the toolbar, raises a desktop notification for new warning and critical
+// announcements, and schedules a refresh for the next one that expires.
+function publishAnnouncements() {
+  const visible = visibleAnnouncements();
+  send('browser:announcements', visible);
+  const known = new Set(config.secrets.cache.announcements.map(item => item.id));
+  const notified = new Set(config.announcements.notified);
+  let changed = false;
+  for (const item of visible) {
+    if (notified.has(item.id)) continue;
+    notified.add(item.id);
+    changed = true;
+    if (item.level !== 'info' && Notification.isSupported()) {
+      const notification = new Notification({ title: item.title || 'Announcement', body: item.message || item.title, urgency: item.level === 'critical' ? 'critical' : 'normal' });
+      notification.on('click', () => { if (mainWindow) { if (mainWindow.isMinimized()) mainWindow.restore(); mainWindow.focus(); } });
+      notification.show();
+    }
+  }
+  // Forget ids the server no longer sends so the lists cannot grow without bound.
+  const prune = list => list.filter(id => known.has(id));
+  const before = JSON.stringify(config.announcements);
+  config.announcements = { dismissed: prune(config.announcements.dismissed), notified: prune([...notified]), pendingAcks: config.announcements.pendingAcks };
+  if (changed || before !== JSON.stringify(config.announcements)) saveConfig();
+  clearTimeout(announcementTimer);
+  const next = Math.min(...visible.filter(item => item.expiresAt).map(item => Date.parse(item.expiresAt) - Date.now()));
+  if (Number.isFinite(next)) announcementTimer = setTimeout(publishAnnouncements, Math.max(1000, Math.min(next + 500, 2 ** 31 - 1)));
+}
+
+async function dismissAnnouncement(id) {
+  const value = String(id);
+  if (!config.announcements.dismissed.includes(value)) config.announcements.dismissed.push(value);
+  if (!config.announcements.pendingAcks.includes(value)) config.announcements.pendingAcks.push(value);
+  saveConfig();
+  publishAnnouncements();
+  await sendAnnouncementAcks();
+}
+
+// Tells the server which announcements were dismissed; anything that fails is retried after the next sync.
+async function sendAnnouncementAcks() {
+  if (!config.secrets.deviceToken || !config.announcements.pendingAcks.length) return;
+  const remaining = [];
+  for (const id of config.announcements.pendingAcks) {
+    try { await api(`/api/client/announcements/${encodeURIComponent(id)}/ack`, { method: 'POST' }); }
+    catch (error) { if (!/not found/i.test(error.message)) remaining.push(id); }
+  }
+  config.announcements.pendingAcks = remaining;
+  saveConfig();
+}
+
+function normalizeWindowState(value) {
+  if (!value || typeof value !== 'object') return undefined;
+  const bounds = ['x', 'y', 'width', 'height'].map(key => Number(value[key]));
+  if (bounds.some(number => !Number.isFinite(number))) return undefined;
+  const [x, y, width, height] = bounds;
+  return { x, y, width: Math.max(850, width), height: Math.max(560, height), maximized: value.maximized === true };
+}
+
+// Saved bounds are only reused while they still overlap a connected display.
+function savedBounds() {
+  const saved = config.window;
+  if (!saved) return {};
+  const visible = screen.getAllDisplays().some(({ workArea: area }) =>
+    saved.x < area.x + area.width - 80 && saved.x + saved.width > area.x + 80 && saved.y < area.y + area.height - 40 && saved.y + saved.height > area.y);
+  return visible ? { x: saved.x, y: saved.y, width: saved.width, height: saved.height } : { width: saved.width, height: saved.height };
+}
+
+function captureSessionState() {
+  if (!config) return;
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    config.window = { ...mainWindow.getNormalBounds(), maximized: mainWindow.isMaximized() };
+  }
+  const ordered = [...tabs.values()];
+  const urls = [];
+  let active = 0;
+  for (const tab of ordered) {
+    const url = tab.view.webContents.isDestroyed() ? '' : tab.view.webContents.getURL();
+    if (!/^https?:\/\//i.test(url)) continue;
+    if (tab.id === activeTabId) active = urls.length;
+    urls.push(url);
+  }
+  config.secrets.session = { tabs: urls.slice(0, MAX_RESTORED_TABS), active };
+}
+
+function saveSessionState() {
+  clearTimeout(sessionSaveTimer);
+  try {
+    captureSessionState();
+    saveConfig();
+  } catch (error) { logFatal(error); }
+}
+
+function scheduleSessionSave() {
+  clearTimeout(sessionSaveTimer);
+  sessionSaveTimer = setTimeout(saveSessionState, 5000);
+}
+
+// Reopens the tabs from the last session, or the shared home page when there were none.
+async function openInitialTabs() {
+  if (tabs.size > 0) return;
+  const { tabs: urls, active } = config.secrets.session;
+  if (!urls.length) {
+    await addTab(config.secrets.cache.settings.homePage);
+    return;
+  }
+  const ids = [];
+  for (const url of urls) ids.push(await addTab(url));
+  await selectTab(ids[Math.min(Math.max(active, 0), ids.length - 1)]);
 }
 
 function validServerUrl(value) {
@@ -188,6 +339,7 @@ function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1280,
     height: 820,
+    ...savedBounds(),
     minWidth: 850,
     minHeight: 560,
     title: `Shared Browser ${app.getVersion()} — ${profileName}`,
@@ -205,8 +357,13 @@ function createWindow() {
     if (handleShortcut(input, mainWindow.webContents)) event.preventDefault();
   });
   mainWindow.loadFile(path.join(__dirname, 'index.html'));
-  mainWindow.on('resize', layoutActiveView);
+  if (config.window?.maximized) mainWindow.maximize();
+  mainWindow.on('resize', () => { layoutActiveView(); scheduleSessionSave(); });
+  mainWindow.on('move', scheduleSessionSave);
+  mainWindow.on('close', () => { quitting = true; saveSessionState(); });
   mainWindow.on('closed', () => {
+    eventsController?.abort();
+    clearTimeout(sessionSaveTimer);
     clearTimeout(syncTimer);
     clearInterval(updateTimer);
     clearTimeout(cookiePushTimer);
@@ -227,7 +384,7 @@ function layoutActiveView() {
   const tab = tabs.get(activeTabId);
   if (!tab || !mainWindow || mainWindow.isDestroyed()) return;
   const [width, height] = mainWindow.getContentSize();
-  tab.view.setBounds({ x: 0, y: TOOLBAR_HEIGHT, width, height: Math.max(0, height - TOOLBAR_HEIGHT) });
+  tab.view.setBounds({ x: 0, y: chromeHeight, width, height: Math.max(0, height - chromeHeight) });
 }
 
 function publishAll() {
@@ -304,6 +461,7 @@ async function addTab(url, details) {
     view.webContents.on(eventName, () => {
       if (activeTabId === id) publishNavigationState();
       if (eventName === 'did-start-loading' || eventName === 'did-stop-loading') publishTabs();
+      if (eventName === 'did-navigate' || eventName === 'did-navigate-in-page') scheduleSessionSave();
     });
   }
   view.webContents.on('did-finish-load', () => {
@@ -461,9 +619,10 @@ async function closeTab(id) {
   }
   if (!tab.view.webContents.isDestroyed()) tab.view.webContents.close();
   if (activeTabId === numericId) activeTabId = undefined;
-  if (tabs.size === 0) await addTab(config.secrets.cache.settings.homePage);
-  else if (!activeTabId) await selectTab(ids[index - 1] || ids[index + 1] || [...tabs.keys()][0]);
+  if (tabs.size === 0 && !quitting) await addTab(config.secrets.cache.settings.homePage);
+  else if (!activeTabId && tabs.size) await selectTab(ids[index - 1] || ids[index + 1] || [...tabs.keys()][0]);
   publishTabs();
+  scheduleSessionSave();
 }
 
 async function reopenClosedTab() {
@@ -492,7 +651,12 @@ async function api(pathname, options = {}, useDevice = true) {
   try {
     const response = await fetch(apiUrl(pathname), { ...options, headers, signal: controller.signal });
     const text = await response.text();
-    if (!response.ok) throw new Error(response.status === 401 ? 'This browser is unauthorized or revoked.' : `Server returned ${response.status}${text ? `: ${text}` : ''}`);
+    if (!response.ok) {
+      let message = '';
+      try { message = JSON.parse(text).error || ''; } catch { }
+      if (response.status === 401) throw new Error(useDevice ? 'This browser is unauthorized or revoked.' : message || 'The enrollment code or token was not accepted.');
+      throw new Error(message || `Server returned ${response.status}${text ? `: ${text.slice(0, 200)}` : ''}`);
+    }
     return text ? JSON.parse(text) : undefined;
   } finally {
     clearTimeout(timeout);
@@ -501,7 +665,7 @@ async function api(pathname, options = {}, useDevice = true) {
 
 async function ensureEnrolled() {
   if (config.secrets.deviceToken) return;
-  if (!config.secrets.enrollmentToken) throw new Error('Open Settings and enter the management server administrator token.');
+  if (!config.secrets.enrollmentToken) throw new Error('Open Settings and enter an enrollment code from the management dashboard.');
   const result = await api('/api/client/enroll', {
     method: 'POST',
     headers: { authorization: `Bearer ${config.secrets.enrollmentToken}` },
@@ -511,6 +675,55 @@ async function ensureEnrolled() {
   config.secrets.deviceToken = result.deviceToken;
   config.secrets.enrollmentToken = '';
   saveConfig();
+}
+
+// Listens for "revision" events from the server and pulls right away, so a change made on the primary
+// browser reaches the others within a moment instead of at the next poll.
+async function listenForEvents() {
+  let failures = 0;
+  while (mainWindow && config.secrets.deviceToken) {
+    const controller = new AbortController();
+    eventsController = controller;
+    let idle;
+    const resetIdle = () => { clearTimeout(idle); idle = setTimeout(() => controller.abort(), EVENTS_IDLE_TIMEOUT_MS); };
+    try {
+      resetIdle();
+      const response = await fetch(apiUrl('/api/client/events'), {
+        headers: { accept: 'text/event-stream', authorization: `Bearer ${config.secrets.deviceToken}`, 'x-device-id': config.deviceId },
+        signal: controller.signal
+      });
+      if (!response.ok || !response.body) throw Object.assign(new Error(`events ${response.status}`), { status: response.status });
+      eventsConnected = true;
+      failures = 0;
+      scheduleSync();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      for await (const chunk of response.body) {
+        resetIdle();
+        buffer += decoder.decode(chunk, { stream: true });
+        let end;
+        while ((end = buffer.indexOf('\n\n')) >= 0) {
+          const block = buffer.slice(0, end);
+          buffer = buffer.slice(end + 2);
+          const type = /^event: *(.*)$/m.exec(block)?.[1];
+          const data = /^data: *(.*)$/m.exec(block)?.[1];
+          if (type === 'revision' && Number(data) !== config.secrets.cache.revision) pullSnapshot(false);
+        }
+      }
+    } catch (error) {
+      failures++;
+      // A revoked or unknown device is reported by the regular sync; just retry slowly.
+      if (error.status === 401) failures = Math.max(failures, 5);
+    } finally {
+      clearTimeout(idle);
+      if (eventsConnected) {
+        eventsConnected = false;
+        scheduleSync();
+      }
+    }
+    if (!mainWindow) return;
+    await new Promise(resolve => setTimeout(resolve, Math.min(2000 * 2 ** Math.min(failures, 5), 60000)));
+  }
 }
 
 // All server traffic runs one request at a time so a slow snapshot pull can never land after a
@@ -568,6 +781,8 @@ async function installSnapshot(snapshot, previous) {
     }
   }
   if (JSON.stringify(previous.bookmarks) !== JSON.stringify(snapshot.bookmarks)) send('browser:bookmarks', snapshot.bookmarks);
+  if (JSON.stringify(previous.announcements) !== JSON.stringify(snapshot.announcements)) publishAnnouncements();
+  sendAnnouncementAcks().catch(() => { });
   const primary = isPrimary();
   // A browser that has just been made primary publishes everything it holds right away.
   if (primary && !wasPrimary) {
@@ -581,7 +796,8 @@ async function installSnapshot(snapshot, previous) {
 
 function scheduleSync() {
   clearTimeout(syncTimer);
-  const delay = syncFailures ? Math.min(SYNC_INTERVAL_MS * 2 ** Math.min(syncFailures, 6), MAX_SYNC_BACKOFF_MS) : SYNC_INTERVAL_MS;
+  const delay = syncFailures ? Math.min(SYNC_INTERVAL_MS * 2 ** Math.min(syncFailures, 6), MAX_SYNC_BACKOFF_MS)
+    : eventsConnected ? EVENTS_POLL_INTERVAL_MS : SYNC_INTERVAL_MS;
   syncTimer = setTimeout(async () => {
     try { await pullSnapshot(false); } finally { if (mainWindow) scheduleSync(); }
   }, delay);
@@ -806,6 +1022,7 @@ async function pushCookies(pageUrl, cookies, complete) {
       }
     }
     if (JSON.stringify(previous.bookmarks) !== JSON.stringify(config.secrets.cache.bookmarks)) send('browser:bookmarks', config.secrets.cache.bookmarks);
+    if (JSON.stringify(previous.announcements) !== JSON.stringify(config.secrets.cache.announcements)) publishAnnouncements();
   }
 }
 
@@ -834,7 +1051,7 @@ async function configureProxy() {
   const host = String(proxy.host).includes(':') && !String(proxy.host).startsWith('[') ? `[${proxy.host}]` : proxy.host;
   await setProxy({
     mode: 'fixed_servers',
-    proxyRules: `http://${host}:${proxy.port}`,
+    proxyRules: `${proxy.tls ? 'https' : 'http'}://${host}:${proxy.port}`,
     proxyBypassRules: config.strictPrivacy ? '<-loopback>' : String(proxy.bypassList || '').split(';').filter(Boolean).join(',')
   });
   if (config.strictPrivacy) {
@@ -844,6 +1061,25 @@ async function configureProxy() {
       throw new Error('Strict privacy blocked browsing because Chromium resolved a direct route.');
     }
   }
+}
+
+function certificateSha256(certificate) {
+  try { return new crypto.X509Certificate(certificate.data).fingerprint256.replaceAll(':', '').toLowerCase(); } catch { return ''; }
+}
+
+// The management server advertises the SHA-256 of its proxy certificate over the authenticated API, so
+// a self-signed proxy certificate is trusted exactly when it matches. Anything else, including a site
+// that happens to share the proxy's host name, gets Chromium's normal verification.
+function verifyCertificate(request, callback) {
+  const proxy = config?.secrets.cache.settings.proxy;
+  const pinned = String(proxy?.certificateSha256 || '').toLowerCase();
+  const host = String(proxy?.host || '').replace(/^\[|\]$/g, '').toLowerCase();
+  if (config?.networkMode === 'managed' && proxy?.tls && pinned && request.hostname.replace(/^\[|\]$/g, '').toLowerCase() === host
+    && certificateSha256(request.certificate) === pinned) {
+    callback(0);
+    return;
+  }
+  callback(-3);
 }
 
 async function setProxy(proxyConfig) {
@@ -896,20 +1132,25 @@ async function startClient() {
     await configureProxy();
     await applyAllCookies();
     watchCookies();
-    if (tabs.size === 0) await addTab(config.secrets.cache.settings.homePage);
+    await openInitialTabs();
+    publishAnnouncements();
+    sendAnnouncementAcks().catch(() => { });
     wasPrimary = isPrimary();
     await pushAllStoredCookies();
     scheduleSync();
+    listenForEvents();
   } catch (error) {
     status(error.message, true);
     try { await applyAllCookies(); } catch { }
-    if (tabs.size === 0) await addTab(config.secrets.cache.settings.homePage);
+    await openInitialTabs();
+    publishAnnouncements();
     send('browser:show-settings');
     // Keep retrying in the background (for example when the server was briefly unreachable at startup).
     if (config.secrets.deviceToken) {
       watchCookies();
       syncFailures = Math.max(syncFailures, 1);
       scheduleSync();
+      listenForEvents();
     }
   }
 }
@@ -939,7 +1180,7 @@ function showBookmarksMenu(position) {
   Menu.buildFromTemplate(template).popup({
     window: mainWindow,
     x: Math.round(Number(position?.x) || 0),
-    y: Math.round(Number(position?.y) || TOOLBAR_HEIGHT)
+    y: Math.round(Number(position?.y) || chromeHeight)
   });
 }
 
@@ -1080,7 +1321,18 @@ function publicConfig() {
 function registerIpc() {
   ipcMain.handle('browser:check-updates', checkForUpdates);
   ipcMain.handle('browser:install-update', installUpdate);
-  ipcMain.handle('browser:bootstrap', () => ({ config: publicConfig(), update: updateState, tabs: tabSummaries(), bookmarks: config.secrets.cache.bookmarks }));
+  ipcMain.handle('browser:bootstrap', () => ({ config: publicConfig(), update: updateState, tabs: tabSummaries(), bookmarks: config.secrets.cache.bookmarks, announcements: visibleAnnouncements() }));
+  ipcMain.handle('browser:dismiss-announcement', (_, id) => dismissAnnouncement(id));
+  ipcMain.handle('browser:open-announcement-link', (_, id) => {
+    const item = config.secrets.cache.announcements.find(entry => entry.id === String(id));
+    if (item?.url) return addTab(item.url);
+  });
+  ipcMain.handle('browser:chrome-height', (_, height) => {
+    const value = Math.round(Number(height));
+    if (!Number.isFinite(value)) return;
+    chromeHeight = Math.min(Math.max(value, TOOLBAR_HEIGHT), 420);
+    layoutActiveView();
+  });
   ipcMain.handle('browser:show-bookmarks', (_, position) => showBookmarksMenu(position));
   ipcMain.handle('browser:reopen-tab', reopenClosedTab);
   ipcMain.handle('browser:find', (_, text, options) => {
@@ -1149,8 +1401,9 @@ function registerIpc() {
     config.networkMode = networkMode;
     config.strictPrivacy = strictPrivacy;
     if (String(input.enrollmentToken || '').trim()) config.secrets.enrollmentToken = String(input.enrollmentToken).trim();
-    if (!config.secrets.deviceToken && !config.secrets.enrollmentToken) throw new Error('An enrollment token is required for a new browser or server.');
+    if (!config.secrets.deviceToken && !config.secrets.enrollmentToken) throw new Error('An enrollment code is required for a new browser or server.');
     saveConfig();
+    saveSessionState();
     app.relaunch({ args: process.argv.slice(1) });
     app.exit(0);
     return true;
@@ -1183,6 +1436,7 @@ app.whenReady().then(async () => {
   Menu.setApplicationMenu(applicationMenu());
   browserSession = session.fromPartition('persist:shared-browser');
   browserSession.setUserAgent(app.userAgentFallback);
+  for (const item of [browserSession, session.fromPartition(UPDATER_PARTITION, { cache: false })]) item.setCertificateVerifyProc(verifyCertificate);
   configurePrivacyPermissions();
   configureDownloads();
   registerIpc();
