@@ -63,14 +63,51 @@ jobs:
           cache: pnpm
           cache-dependency-path: electron-client/pnpm-lock.yaml
 
+      # electron-builder downloads Electron and its packaging tools (NSIS, 7-Zip, AppImage) from GitHub
+      # releases. Caching them avoids most downloads, and retries ride out the occasional 502/504.
+      - name: Cache Electron downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/electron
+            ~/.cache/electron-builder
+            ~/Library/Caches/electron
+            ~/Library/Caches/electron-builder
+            ~/AppData/Local/electron/Cache
+            ~/AppData/Local/electron-builder/Cache
+          key: electron-downloads-${{ runner.os }}-${{ hashFiles('electron-client/pnpm-lock.yaml') }}
+          restore-keys: electron-downloads-${{ runner.os }}-
+
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        shell: bash
+        run: |
+          # Electron's postinstall downloads its binary from GitHub releases as well.
+          for attempt in 1 2 3 4; do
+            if pnpm install --frozen-lockfile; then exit 0; fi
+            if [ "$attempt" -lt 4 ]; then
+              echo "::warning::Install attempt $attempt failed; retrying in $((attempt * 30)) seconds"
+              sleep $((attempt * 30))
+            fi
+          done
+          echo "::error::Installing dependencies failed after 4 attempts"
+          exit 1
 
       - name: Check JavaScript
         run: pnpm run check
 
       - name: Package application
-        run: pnpm run ${{ matrix.command }}
+        shell: bash
+        run: |
+          for attempt in 1 2 3 4; do
+            rm -rf dist
+            if pnpm run ${{ matrix.command }}; then exit 0; fi
+            if [ "$attempt" -lt 4 ]; then
+              echo "::warning::Packaging attempt $attempt failed; retrying in $((attempt * 30)) seconds"
+              sleep $((attempt * 30))
+            fi
+          done
+          echo "::error::Packaging failed after 4 attempts"
+          exit 1
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
 
