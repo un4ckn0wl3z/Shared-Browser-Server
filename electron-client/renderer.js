@@ -142,6 +142,18 @@ function updateStatus(value) {
   target.className = value.error ? 'status-error' : 'status-ok';
 }
 
+// The administrator can require Managed proxy mode, or Managed proxy with Strict privacy.
+function applyPolicyLock() {
+  const policy = currentConfig?.networkPolicy || 'choice';
+  const note = element('policy-note');
+  element('network-mode').disabled = policy !== 'choice';
+  element('strict-privacy').disabled = policy === 'strict';
+  note.hidden = policy === 'choice';
+  note.textContent = policy === 'strict'
+    ? 'Your administrator requires the managed proxy with Strict privacy.'
+    : policy === 'managed' ? 'Your administrator requires the managed proxy.' : '';
+}
+
 async function openSettings() {
   await api.setSettingsOpen(true);
   const state = await api.bootstrap();
@@ -155,6 +167,9 @@ async function openSettings() {
   element('network-mode').value = currentConfig.networkMode;
   element('strict-privacy').checked = currentConfig.strictPrivacy === true;
   element('privacy-warning').hidden = !currentConfig.strictPrivacy;
+  applyPolicyLock();
+  element('ip-check').hidden = !currentConfig.ipCheck;
+  element('privacy-result').hidden = true;
   element('proxy-info').textContent = currentConfig.proxy?.enabled
     ? `Managed proxy available at ${currentConfig.proxy.host}:${currentConfig.proxy.port}.`
     : 'Managed proxy is disabled on the server.';
@@ -207,6 +222,21 @@ element('strict-privacy').addEventListener('change', event => {
   if (event.target.checked) element('network-mode').value = 'managed';
   element('privacy-warning').hidden = !event.target.checked;
 });
+element('ip-check').addEventListener('click', async () => {
+  const output = element('privacy-result');
+  output.hidden = false;
+  output.className = 'info';
+  output.textContent = 'Checking which IP websites see…';
+  try {
+    const result = await api.checkIp();
+    const route = { direct: 'directly from this computer', managed: 'through the management proxy', strict: 'through the management proxy (Strict privacy)' }[result.mode];
+    output.textContent = `Websites see ${result.ip}. This browser connects ${route}.`;
+  } catch (error) {
+    output.className = 'warning';
+    output.textContent = error.message;
+  }
+});
+
 element('privacy-check').addEventListener('click', async () => {
   const output = element('privacy-result');
   output.hidden = false;
@@ -250,6 +280,15 @@ api.onShowFind(showFind);
 api.onFindResult(updateFindResult);
 api.onBookmarks(bookmarks => { element('bookmarks').title = `Shared bookmarks (${bookmarks.length})`; });
 api.onAnnouncements(renderAnnouncements);
+api.onConfig(value => {
+  currentConfig = value;
+  if (dialog.open) {
+    element('network-mode').value = value.networkMode;
+    element('strict-privacy').checked = value.strictPrivacy === true;
+    element('privacy-warning').hidden = !value.strictPrivacy;
+    applyPolicyLock();
+  }
+});
 // The page view sits below the toolbar, so the main process needs to know when banners change its height.
 new ResizeObserver(() => api.setChromeHeight(Math.ceil(document.querySelector('header').getBoundingClientRect().height))).observe(document.querySelector('header'));
 

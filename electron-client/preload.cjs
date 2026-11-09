@@ -12,6 +12,7 @@ contextBridge.exposeInMainWorld('sharedBrowser', {
   closeTab: (id) => ipcRenderer.invoke('browser:close-tab', id),
   syncNow: () => ipcRenderer.invoke('browser:sync-now'),
   privacyCheck: () => ipcRenderer.invoke('browser:privacy-check'),
+  checkIp: () => ipcRenderer.invoke('browser:check-ip'),
   setSettingsOpen: (open) => ipcRenderer.invoke('browser:settings-open', Boolean(open)),
   saveSettings: (settings) => ipcRenderer.invoke('browser:save-settings', settings),
   checkForUpdates: () => ipcRenderer.invoke('browser:check-updates'),
@@ -31,6 +32,7 @@ contextBridge.exposeInMainWorld('sharedBrowser', {
   onUpdate: (callback) => ipcRenderer.on('browser:update', (_, value) => callback(value)),
   onBookmarks: (callback) => ipcRenderer.on('browser:bookmarks', (_, value) => callback(value)),
   onAnnouncements: (callback) => ipcRenderer.on('browser:announcements', (_, value) => callback(value)),
+  onConfig: (callback) => ipcRenderer.on('browser:config', (_, value) => callback(value)),
   onShowFind: (callback) => ipcRenderer.on('browser:show-find', (_, value) => callback(value)),
   onFindResult: (callback) => ipcRenderer.on('browser:find-result', (_, value) => callback(value))
 });

@@ -1,4 +1,4 @@
-const { app, BrowserWindow, WebContentsView, Menu, Notification, clipboard, ipcMain, net, screen, session, safeStorage, shell } = require('electron');
+const { app, BrowserWindow, WebContentsView, Menu, Notification, clipboard, ipcMain, net, screen, session, safeStorage, shell, webContents } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const crypto = require('node:crypto');
@@ -98,8 +98,9 @@ function defaultConfig() {
     serverUrl: 'http://127.0.0.1:8787',
     deviceId: crypto.randomUUID().replaceAll('-', ''),
     deviceName: profileName,
-    networkMode: 'direct',
-    strictPrivacy: false,
+    // New browsers send everything through the management proxy with Strict privacy until told otherwise.
+    networkMode: 'managed',
+    strictPrivacy: true,
     window: undefined,
     announcements: { dismissed: [], notified: [], pendingAcks: [] },
     secrets: { deviceToken: '', enrollmentToken: '', cache: defaultSnapshot(), session: { tabs: [], active: 0 } }
@@ -110,8 +111,10 @@ function configPath() {
   return path.join(app.getPath('userData'), 'client-config.json');
 }
 
+// Read before the app is ready, because the WebRTC policy switch must be set at startup. A browser
+// without a saved configuration starts in Strict privacy, which is the default.
 function readStrictPrivacySetting() {
-  try { return JSON.parse(fs.readFileSync(configPath(), 'utf8')).strictPrivacy === true; } catch { return false; }
+  try { return JSON.parse(fs.readFileSync(configPath(), 'utf8')).strictPrivacy === true; } catch { return true; }
 }
 
 function encrypt(value) {
@@ -138,8 +141,8 @@ function loadConfig() {
       serverUrl: validServerUrl(disk.serverUrl) ? disk.serverUrl.replace(/\/$/, '') : fresh.serverUrl,
       deviceId: /^[a-f0-9]{32}$/i.test(disk.deviceId || '') ? disk.deviceId.toLowerCase() : fresh.deviceId,
       deviceName: String(disk.deviceName || profileName).slice(0, 80),
-      networkMode: disk.networkMode === 'managed' ? 'managed' : 'direct',
-      strictPrivacy: disk.strictPrivacy === true,
+      networkMode: disk.networkMode === 'managed' || disk.networkMode === 'direct' ? disk.networkMode : fresh.networkMode,
+      strictPrivacy: typeof disk.strictPrivacy === 'boolean' ? disk.strictPrivacy : fresh.strictPrivacy,
       window: normalizeWindowState(disk.window),
       announcements: {
         dismissed: stringList(disk.announcements?.dismissed),
@@ -492,6 +495,7 @@ function loadOptions(details) {
 
 // Shared by tabs and popup windows so every page gets the same popup, menu, and shortcut handling.
 function configurePageContents(webContents) {
+  applyWebRtcPolicy(webContents);
   webContents.setWindowOpenHandler(details => {
     // Real popups (window.open with features) must stay attached to their opener for
     // sign-in, OAuth, and approval flows that report back through window.opener.
@@ -688,7 +692,7 @@ async function listenForEvents() {
     const resetIdle = () => { clearTimeout(idle); idle = setTimeout(() => controller.abort(), EVENTS_IDLE_TIMEOUT_MS); };
     try {
       resetIdle();
-      const response = await fetch(apiUrl('/api/client/events'), {
+      const response = await fetch(apiUrl(`/api/client/events?${clientReport()}`), {
         headers: { accept: 'text/event-stream', authorization: `Bearer ${config.secrets.deviceToken}`, 'x-device-id': config.deviceId },
         signal: controller.signal
       });
@@ -744,7 +748,7 @@ async function pullSnapshot(notify = false) {
     try {
       const previous = config.secrets.cache;
       const since = previous.revision > 0 && !notify ? `&since=${previous.revision}` : '';
-      const response = await api(`/api/client/snapshot?deviceName=${encodeURIComponent(config.deviceName)}${since}`);
+      const response = await api(`/api/client/snapshot?deviceName=${encodeURIComponent(config.deviceName)}&${clientReport()}${since}`);
       if (response) {
         const snapshot = normalizeSnapshot(response);
         if (snapshot.revision !== previous.revision || notify) await installSnapshot(snapshot, previous);
@@ -766,13 +770,24 @@ async function pullSnapshot(notify = false) {
   });
 }
 
+// Lets the dashboard show each browser's version and whether it follows the required connection mode.
+function clientReport() {
+  return `version=${encodeURIComponent(app.getVersion())}&mode=${effectiveMode()}`;
+}
+
 async function installSnapshot(snapshot, previous) {
   config.secrets.cache = snapshot;
+  const modeChanged = enforceNetworkPolicy();
   saveConfig();
+  if (modeChanged) {
+    await applyNetworkMode();
+    // Report the new mode right away instead of at the next poll.
+    setTimeout(() => pullSnapshot(false), 0);
+  }
   // Cookies are installed in place. Reloading the page here would wipe whatever the user is in
   // the middle of (an open dialog, a half-filled form, a deployment approval).
   await applyAllCookies();
-  if (JSON.stringify(previous.settings.proxy) !== JSON.stringify(snapshot.settings.proxy) && config.networkMode === 'managed') {
+  if (!modeChanged && JSON.stringify(previous.settings.proxy) !== JSON.stringify(snapshot.settings.proxy) && config.networkMode === 'managed') {
     try {
       await configureProxy();
       await browserSession.closeAllConnections();
@@ -1095,11 +1110,79 @@ async function blockBrowserTraffic() {
 }
 
 function configurePrivacyPermissions() {
-  if (!config.strictPrivacy) return;
+  if (!config.strictPrivacy) {
+    browserSession.setPermissionCheckHandler(null);
+    browserSession.setPermissionRequestHandler(null);
+    return;
+  }
   // Copy buttons and fullscreen video do not expose anything about the network or device.
   const harmless = new Set(['clipboard-sanitized-write', 'fullscreen']);
   browserSession.setPermissionCheckHandler((_webContents, permission) => harmless.has(permission));
   browserSession.setPermissionRequestHandler((_webContents, permission, callback) => callback(harmless.has(permission)));
+}
+
+const STRICT_WEBRTC_POLICY = 'disable_non_proxied_udp';
+
+// Also set per page, so Strict privacy can take effect without the restart the command-line switch needs.
+function applyWebRtcPolicy(webContents) {
+  if (!webContents || webContents.isDestroyed() || webContents === mainWindow?.webContents) return;
+  webContents.setWebRTCIPHandlingPolicy(config.strictPrivacy ? STRICT_WEBRTC_POLICY : 'default');
+}
+
+function networkPolicy() {
+  const value = config.secrets.cache.settings.networkPolicy;
+  return value === 'managed' || value === 'strict' ? value : 'choice';
+}
+
+function effectiveMode() {
+  return config.networkMode !== 'managed' ? 'direct' : config.strictPrivacy ? 'strict' : 'managed';
+}
+
+// Applies the connection mode the administrator requires. Returns true when this browser's mode changed.
+function enforceNetworkPolicy() {
+  const policy = networkPolicy();
+  const before = effectiveMode();
+  if (policy === 'managed' || policy === 'strict') config.networkMode = 'managed';
+  if (policy === 'strict') config.strictPrivacy = true;
+  return effectiveMode() !== before;
+}
+
+// Switches routing, permissions and WebRTC to the current mode while the browser keeps running.
+async function applyNetworkMode() {
+  configurePrivacyPermissions();
+  for (const contents of webContents.getAllWebContents()) applyWebRtcPolicy(contents);
+  try {
+    await configureProxy();
+    await browserSession.closeAllConnections();
+  } catch (error) {
+    status(error.message, true);
+  }
+  send('browser:config', publicConfig());
+}
+
+// Asks the administrator's IP echo service which address websites see, over this browser's own route.
+function checkPublicIp() {
+  const url = config.secrets.cache.settings.ipCheckUrl;
+  if (!url) return Promise.reject(new Error('The administrator has not set an IP check service.'));
+  return new Promise((resolve, reject) => {
+    const request = net.request({ url, session: browserSession, useSessionCookies: false });
+    const timeout = setTimeout(() => { request.abort(); reject(new Error('The IP check timed out.')); }, 20000);
+    const finish = (error, value) => { clearTimeout(timeout); if (error) reject(error); else resolve(value); };
+    request.on('login', proxyLogin);
+    request.on('response', response => {
+      const chunks = [];
+      response.on('data', chunk => chunks.push(chunk));
+      response.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8').trim();
+        let ip = text;
+        try { ip = JSON.parse(text).ip || ''; } catch { }
+        if (response.statusCode !== 200 || !/^[0-9a-f:.]+$/i.test(ip)) finish(new Error(`The IP check service answered ${response.statusCode}.`));
+        else finish(undefined, { ip, mode: effectiveMode() });
+      });
+    });
+    request.on('error', error => finish(new Error(`IP check failed: ${error.message}`)));
+    request.end();
+  });
 }
 
 function routeIsDirect(value) {
@@ -1109,11 +1192,12 @@ function routeIsDirect(value) {
 async function privacyCheck() {
   const externalRoute = await browserSession.resolveProxy('https://example.com/');
   const loopbackRoute = await browserSession.resolveProxy('http://127.0.0.1/');
-  const webRtcPolicy = app.commandLine.getSwitchValue('force-webrtc-ip-handling-policy');
+  const page = tabs.get(activeTabId)?.view.webContents;
+  const webRtcPolicy = page && !page.isDestroyed() ? page.getWebRTCIPHandlingPolicy() : app.commandLine.getSwitchValue('force-webrtc-ip-handling-policy');
   const ok = config.strictPrivacy
     && !routeIsDirect(externalRoute)
     && !routeIsDirect(loopbackRoute)
-    && webRtcPolicy === 'disable_non_proxied_udp';
+    && webRtcPolicy === STRICT_WEBRTC_POLICY;
   return {
     ok,
     strictPrivacy: config.strictPrivacy,
@@ -1126,6 +1210,8 @@ async function privacyCheck() {
 async function startClient() {
   try {
     seedSyncState();
+    if (enforceNetworkPolicy()) saveConfig();
+    configurePrivacyPermissions();
     if (config.strictPrivacy) await blockBrowserTraffic();
     await ensureEnrolled();
     await pullSnapshot(false);
@@ -1312,6 +1398,8 @@ function publicConfig() {
     enrolled: Boolean(config.secrets.deviceToken),
     networkMode: config.networkMode,
     strictPrivacy: config.strictPrivacy,
+    networkPolicy: networkPolicy(),
+    ipCheck: Boolean(config.secrets.cache.settings.ipCheckUrl),
     revision: config.secrets.cache.revision,
     proxy: config.secrets.cache.settings.proxy,
     secureStorage: safeStorage.isEncryptionAvailable() && backend !== 'basic_text'
@@ -1373,6 +1461,7 @@ function registerIpc() {
     await pullSnapshot(true);
   });
   ipcMain.handle('browser:privacy-check', privacyCheck);
+  ipcMain.handle('browser:check-ip', checkPublicIp);
   ipcMain.handle('browser:settings-open', (_, open) => {
     settingsOpen = Boolean(open);
     const tab = tabs.get(activeTabId);
@@ -1388,10 +1477,13 @@ function registerIpc() {
     const deviceName = String(input.deviceName || '').trim();
     if (!deviceName || deviceName.length > 80) throw new Error('Device name must be between 1 and 80 characters.');
     const serverUrl = String(input.serverUrl).trim().replace(/\/$/, '');
-    const networkMode = input.networkMode === 'managed' ? 'managed' : 'direct';
-    const strictPrivacy = input.strictPrivacy === true;
+    // A mode the administrator requires cannot be changed here.
+    const policy = networkPolicy();
+    const networkMode = policy === 'choice' ? (input.networkMode === 'managed' ? 'managed' : 'direct') : 'managed';
+    const strictPrivacy = policy === 'strict' || input.strictPrivacy === true;
     if (strictPrivacy && networkMode !== 'managed') throw new Error('Strict privacy requires Managed proxy mode.');
-    if (strictPrivacy && !config.secrets.cache.settings.proxy?.enabled) throw new Error('Enable the managed proxy in the server dashboard before turning on Strict privacy.');
+    // Before the first sync the proxy settings are not known yet, so the check waits until they are.
+    if (policy === 'choice' && strictPrivacy && config.secrets.cache.revision > 0 && !config.secrets.cache.settings.proxy?.enabled) throw new Error('Enable the managed proxy in the server dashboard before turning on Strict privacy.');
     if (serverUrl !== config.serverUrl) {
       config.secrets.deviceToken = '';
       config.secrets.cache = defaultSnapshot();

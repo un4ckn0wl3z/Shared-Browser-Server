@@ -60,3 +60,5 @@ label small { color: #667085; font-weight: normal; }
 .announcement-body small { display: block; margin-top: 3px; opacity: .75; }
 .announcement button { height: 28px; padding: 3px 10px; background: #ffffffb3; }
 .announcement .dismiss { width: 28px; padding: 0; font-size: 16px; }
+.button-row { display: flex; gap: 8px; flex-wrap: wrap; }
+select:disabled, input:disabled { opacity: .6; }
