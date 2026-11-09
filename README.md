@@ -324,7 +324,7 @@ A tunnel stays open as long as data flows and closes after 10 minutes without tr
 - A disabled profile stops sharing for its domain; the primary browser does not recreate an automatic profile for it.
 - Profile edits in the dashboard keep stored cookie values when the value field is left empty, so one cookie can be changed without re-entering the others.
 - The server announces every new revision over Server-Sent Events, and browsers pull the snapshot immediately. Polling remains as a safety net (every 30 seconds while the event stream is connected, every 2.5 seconds otherwise): browsers send the revision they already have and the server answers `204 No Content` when nothing changed. After errors, polling backs off up to one minute.
-- Profiles can still be disabled or removed from the dashboard when a domain should not be shared.
+- Profiles can still be disabled or removed from the dashboard when a domain should not be shared. Tick several profiles and use **Delete selected**, or **Purge all** (confirmed by typing `PURGE`) to empty the vault; both save a backup first, so either can be undone under **Vault backups**. Other browsers remove the deleted cookies, while the primary browser keeps its own and, with automatic sharing on, shares a domain again the next time its cookies there change.
 - A profile can be shared with all browsers or only selected ones. A browser that loses access removes the cookies it received from that profile, and deleting the last selected browser never widens a profile to everyone.
 - Server revisions provide a consistent order across browsers.
 - Cookie conflicts use server-arrival last-write-wins behavior.
@@ -348,7 +348,7 @@ The banner is plain text: nothing in an announcement is interpreted as HTML. **O
 
 ### Audit log
 
-The dashboard's **Activity** section lists enrollments, enrollment codes, settings and proxy changes, announcements, profile, bookmark and device changes, vault exports, imports and restores, and failed administrator sign-ins or enrollments (at most one entry per address every five minutes). Entries are also written to `audit.jsonl` in the data directory and to the server log. Set `SHARED_BROWSER_TRUST_FORWARDED_HEADERS=true` behind a reverse proxy so the recorded address is the client's rather than the proxy's.
+The dashboard's **Activity** section lists enrollments, enrollment codes, settings and proxy changes, announcements, profile changes and bulk deletions, bookmark and device changes, vault exports, imports and restores, and failed administrator sign-ins or enrollments (at most one entry per address every five minutes). Entries are also written to `audit.jsonl` in the data directory and to the server log. Set `SHARED_BROWSER_TRUST_FORWARDED_HEADERS=true` behind a reverse proxy so the recorded address is the client's rather than the proxy's.
 
 ### Backups, export and import
 

@@ -75,10 +75,40 @@ describe('dashboard', () => {
     assert.equal((await server.status()).announcements[0].level, 'critical');
   });
 
+  test('deletes selected profiles and purges the rest', async () => {
+    for (const domain of ['bulk-a.example', 'bulk-b.example', 'bulk-c.example']) {
+      await server.admin('/profiles', 'POST', { name: domain, domain, enabled: true, cookies: [{ name: 'c', value: '1', domain, path: '/', secure: true, httpOnly: true, sameSite: 'Lax' }] });
+    }
+    await page.click('#refresh');
+    await waitFor(async () => (await page.locator('.profile').count()) >= 4, { message: 'profiles listed' });
+    assert.ok(await page.isDisabled('#delete-selected'));
+    await page.check('.profile:has-text("bulk-a.example") input[type=checkbox]');
+    await page.check('.profile:has-text("bulk-b.example") input[type=checkbox]');
+    assert.equal(await page.textContent('#delete-selected'), 'Delete selected (2)');
+    assert.equal(await page.evaluate(() => document.getElementById('select-all-profiles').indeterminate), true);
+    page.once('dialog', dialog => dialog.accept());
+    await page.click('#delete-selected');
+    await waitFor(async () => {
+      const domains = (await server.status()).profiles.map(item => item.domain);
+      return !domains.includes('bulk-a.example') && !domains.includes('bulk-b.example') && domains.includes('bulk-c.example');
+    }, { message: 'selected profiles deleted' });
+    await waitFor(async () => !(await page.textContent('#profiles')).includes('bulk-a.example'), { message: 'list refreshed' });
+    // A purge needs PURGE typed; anything else leaves the vault alone.
+    page.once('dialog', dialog => dialog.accept('purge please'));
+    await page.click('#purge-profiles');
+    await waitFor(async () => /type PURGE/.test(await page.textContent('#toast')), { message: 'purge refused' });
+    assert.ok((await server.status()).profiles.length > 0);
+    page.once('dialog', dialog => dialog.accept('PURGE'));
+    await page.click('#purge-profiles');
+    await waitFor(async () => (await server.status()).profiles.length === 0, { message: 'vault purged' });
+    await waitFor(async () => (await page.textContent('#profiles')).includes('No shared profiles yet'), { message: 'empty list' });
+    assert.ok(await page.isDisabled('#purge-profiles'));
+  });
+
   test('lists backups and the audit log', async () => {
     await waitFor(async () => (await page.locator('#backups tr').count()) >= 1 && !(await page.textContent('#backups')).includes('No backups'), { message: 'backup rows' });
     const audit = await page.textContent('#audit');
-    for (const action of ['enrollment_code.created', 'device.enrolled', 'profile.updated', 'settings.updated', 'announcement.sent']) assert.ok(audit.includes(action), action);
+    for (const action of ['enrollment_code.created', 'device.enrolled', 'profile.updated', 'settings.updated', 'announcement.sent', 'profiles.deleted', 'profiles.purged']) assert.ok(audit.includes(action), action);
   });
 
   test('has no script errors', () => {

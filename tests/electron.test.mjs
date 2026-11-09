@@ -189,6 +189,13 @@ describe('Electron browsers sharing a session', () => {
     assert.equal(await wb2.window.locator('.announcement').count(), 0);
   });
 
+  test('purging the vault removes shared cookies from the other browser but not from the primary', async () => {
+    await waitFor(async () => (await wb2.cookies(site.origin)).includes('pref=dark'), { message: 'WB2 has the shared cookie' });
+    await server.admin('/profiles/purge', 'POST', { confirm: true });
+    await waitFor(async () => !(await wb2.cookies(site.origin)).includes('pref='), { message: 'WB2 removed the purged cookie' });
+    assert.ok((await wb1.cookies(site.origin)).includes('pref=dark'));
+  });
+
   test('a revoked browser asks for settings once and keeps what the user types', async () => {
     await server.admin(`/devices/${deviceId('WB2')}/revoke`, 'POST', {});
     await waitFor(async () => /unauthorized/i.test(await wb2.status()), { message: 'unauthorized status', timeout: 40000 });
