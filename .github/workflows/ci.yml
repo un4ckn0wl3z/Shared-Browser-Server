@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # The forward proxy only connects to public addresses, so the tunnel tests run their origin
+      # servers on this address after adding it to the loopback interface.
+      TEST_PUBLIC_IP: 8.8.4.4
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.19.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: |
+            electron-client/pnpm-lock.yaml
+            tests/pnpm-lock.yaml
+
+      - name: Build server
+        run: dotnet build server/SharedBrowser.Server.csproj --configuration Release
+
+      - name: Install client dependencies
+        working-directory: electron-client
+        run: pnpm install --frozen-lockfile
+
+      - name: Check JavaScript
+        run: |
+          (cd electron-client && pnpm run check)
+          node --check server/wwwroot/app.js
+
+      - name: Install test dependencies
+        working-directory: tests
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm exec playwright install --with-deps chromium
+
+      - name: Prepare test environment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb libgbm1 libnss3 libasound2t64 libgtk-3-0t64 libxss1
+          sudo ip addr add "$TEST_PUBLIC_IP/32" dev lo
+
+      - name: Run tests
+        working-directory: tests
+        run: xvfb-run -a pnpm test
