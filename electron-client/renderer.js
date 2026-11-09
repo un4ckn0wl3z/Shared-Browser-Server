@@ -6,11 +6,14 @@ const dialog = element('settings-dialog');
 let currentConfig;
 let loading = false;
 
+const findBar = element('find-bar');
+const findText = element('find-text');
+
 function renderTabs(tabs) {
   tabsElement.replaceChildren(...tabs.map(tab => {
     const button = document.createElement('button');
-    button.className = `tab${tab.active ? ' active' : ''}`;
-    button.title = tab.title;
+    button.className = `tab${tab.active ? ' active' : ''}${tab.loading ? ' loading' : ''}`;
+    button.title = tab.url ? `${tab.title}\n${tab.url}` : tab.title;
     const title = document.createElement('span');
     title.textContent = tab.title;
     const close = document.createElement('span');
@@ -20,11 +23,46 @@ function renderTabs(tabs) {
     close.addEventListener('click', event => { event.stopPropagation(); api.closeTab(tab.id); });
     button.append(title, close);
     button.addEventListener('click', () => api.selectTab(tab.id));
+    // Middle-click closes a tab, as in other browsers.
+    button.addEventListener('auxclick', event => { if (event.button === 1) { event.preventDefault(); api.closeTab(tab.id); } });
+    button.addEventListener('mousedown', event => { if (event.button === 1) event.preventDefault(); });
     return button;
   }));
 }
 
+function showFind(options = {}) {
+  const wasOpen = !findBar.hidden;
+  findBar.hidden = false;
+  findText.focus();
+  findText.select();
+  if (wasOpen && options.next && findText.value) runFind(!options.backward, true);
+  else if (!wasOpen && findText.value) runFind(true, false);
+}
+
+function closeFind() {
+  if (findBar.hidden) return;
+  findBar.hidden = true;
+  element('find-count').textContent = '';
+  findBar.classList.remove('no-match');
+  api.stopFind();
+}
+
+function runFind(forward = true, next = false) {
+  api.find(findText.value, { forward, next });
+}
+
+function updateFindResult(result) {
+  if (result.reset) {
+    if (!findBar.hidden && findText.value) runFind(true, false);
+    return;
+  }
+  const count = element('find-count');
+  count.textContent = findText.value ? `${result.matches ? result.active : 0}/${result.matches}` : '';
+  findBar.classList.toggle('no-match', Boolean(findText.value) && result.matches === 0);
+}
+
 function updateState(state) {
+  address.dataset.url = state.url || '';
   if (document.activeElement !== address) address.value = state.url || '';
   element('back').disabled = !state.canGoBack;
   element('forward').disabled = !state.canGoForward;
@@ -104,11 +142,27 @@ element('sync').addEventListener('click', api.syncNow);
 element('update').addEventListener('click', api.installUpdate);
 element('check-updates').addEventListener('click', api.checkForUpdates);
 element('new-tab').addEventListener('click', () => api.newTab());
+tabsElement.addEventListener('dblclick', event => { if (event.target === tabsElement) api.newTab(); });
+element('bookmarks').addEventListener('click', event => {
+  const rect = event.currentTarget.getBoundingClientRect();
+  api.showBookmarks({ x: rect.left, y: rect.bottom + 2 });
+});
+findText.addEventListener('input', () => runFind(true, false));
+findText.addEventListener('keydown', event => {
+  if (event.key === 'Enter') { event.preventDefault(); runFind(!event.shiftKey, true); }
+  if (event.key === 'Escape') { event.preventDefault(); closeFind(); }
+});
+element('find-next').addEventListener('click', () => runFind(true, true));
+element('find-previous').addEventListener('click', () => runFind(false, true));
+element('find-close').addEventListener('click', closeFind);
 element('settings').addEventListener('click', openSettings);
 element('settings-close').addEventListener('click', closeSettings);
 element('cancel').addEventListener('click', closeSettings);
 dialog.addEventListener('cancel', event => { event.preventDefault(); closeSettings(); });
-address.addEventListener('keydown', event => { if (event.key === 'Enter') navigate(); });
+address.addEventListener('keydown', event => {
+  if (event.key === 'Enter') navigate();
+  if (event.key === 'Escape') { address.value = address.dataset.url || ''; address.blur(); }
+});
 element('strict-privacy').addEventListener('change', event => {
   if (event.target.checked) element('network-mode').value = 'managed';
   element('privacy-warning').hidden = !event.target.checked;
@@ -152,10 +206,15 @@ api.onStatus(updateStatus);
 api.onShowSettings(openSettings);
 api.onUpdate(updateUpdate);
 api.onFocusAddress(() => { address.focus(); address.select(); });
+api.onShowFind(showFind);
+api.onFindResult(updateFindResult);
+api.onBookmarks(bookmarks => { element('bookmarks').title = `Shared bookmarks (${bookmarks.length})`; });
 
 api.bootstrap().then(state => {
   currentConfig = state.config;
   renderTabs(state.tabs);
   updateUpdate(state.update);
-  if (!currentConfig.enrolled) openSettings();
+  element('bookmarks').title = `Shared bookmarks (${state.bookmarks?.length || 0})`;
+  // The main process opens Settings when it is actually needed (no credentials, or enrollment failed).
+  // Opening it here as well would cover the browser while a saved enrollment token is still being used.
 });

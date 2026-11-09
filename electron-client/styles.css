@@ -1,3 +1,4 @@
+[hidden] { display: none !important; }
 :root { color-scheme: light; font-family: Inter, "Segoe UI", system-ui, sans-serif; }
 * { box-sizing: border-box; }
 body { margin: 0; overflow: hidden; background: #f5f7fb; color: #152033; }
@@ -10,6 +11,13 @@ button:disabled { opacity: .4; cursor: default; }
 .tab { display: inline-flex; align-items: center; justify-content: space-between; width: 190px; min-width: 120px; height: 34px; padding: 6px 7px 6px 11px; border-radius: 9px 9px 4px 4px; background: #dfe5ee; border-color: transparent; }
 .tab.active { background: #fff; border-color: #c8d0dc; }
 .tab span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tab.loading span:first-child::before { content: ''; display: inline-block; width: 8px; height: 8px; margin-right: 6px; border: 2px solid #6596e8; border-right-color: transparent; border-radius: 50%; animation: spin .8s linear infinite; vertical-align: -1px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.find-bar { display: flex; align-items: center; gap: 4px; padding: 0 4px; border: 1px solid #bcc5d3; border-radius: 8px; background: #fff; height: 34px; }
+.find-bar input { width: 170px; border: 0; outline: none; padding: 4px 6px; background: transparent; }
+.find-bar #find-count { min-width: 44px; color: #667085; font-size: 12px; text-align: right; }
+.find-bar.no-match input { color: #b3261e; }
+.compact-small { width: 26px; height: 26px !important; padding: 0; border-color: transparent; }
 .tab-close { margin-left: 8px; border-radius: 4px; padding: 0 4px; font-size: 18px; line-height: 20px; }
 .tab-close:hover { background: #d8deea; }
 .compact { width: 34px; height: 34px; padding: 2px; font-size: 20px; }

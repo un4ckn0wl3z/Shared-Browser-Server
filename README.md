@@ -66,7 +66,7 @@ The primary-writer model prevents a logged-out secondary browser from replacing 
 - Automatic per-domain cookie/session profiles
 - A primary browser that publishes session changes while other browsers consume them
 - Controlled cookie synchronization with one primary writer
-- Shared home-page configuration
+- Shared home-page, address-bar search, and bookmark configuration
 - Offline encrypted browser cache
 - Browser/device status in the management dashboard
 - Authenticated forward proxy built into the management server
@@ -94,7 +94,7 @@ Strict Privacy mode requires the managed proxy, blocks direct fallback, restrict
 
 ### Centrally revoke a lost or retired browser
 
-Revoke a device from the dashboard. A revoked device can no longer download or publish shared session data, and its proxy credentials stop authorizing new connections.
+Revoke a device from the dashboard. A revoked device can no longer download or publish shared session data, its proxy credentials stop authorizing new connections, and proxy tunnels it already has open are closed within a few seconds. Retired browsers can also be deleted from the device list.
 
 ## What is synchronized?
 
@@ -103,7 +103,9 @@ Revoke a device from the dashboard. A revoked device can no longer download or p
 | Regular cookies | Yes | Restricted to authorized domain profiles |
 | Secure and HttpOnly cookies | Yes | Values are encrypted in the server vault |
 | Cookie-based login sessions | Yes | Works when the website's login state is cookie-based |
-| Cookie expiration dates | No | Synchronized values are installed as browser-session cookies |
+| Cookie expiration dates | Yes (Electron) | Expired cookies are dropped from the vault; the .NET client installs browser-session cookies |
+| Sign-outs and deleted cookies | Yes (Electron primary) | Cookies the primary browser no longer holds are removed from the vault and from the other browsers |
+| Shared bookmarks | Yes | Managed in the dashboard and shown in the Electron ★ menu |
 | `localStorage` | No | Some sites may still require a new login |
 | `sessionStorage` | No | Intentionally tab-scoped and temporary |
 | IndexedDB and service-worker caches | No | Remain local to each browser profile |
@@ -255,7 +257,9 @@ On first launch, the settings dialog opens automatically. Enter the management-s
 
 The installed client checks GitHub Releases at startup and every four hours. Its version is shown in the window title, the toolbar status text, and the settings dialog, which also has **Check for updates**. Windows and Linux AppImage builds download a new release in the background and show **Restart to update** in the toolbar; the update otherwise installs when the browser is closed. The macOS DMG is unsigned, so macOS cannot install updates in place: the toolbar shows **Update to vX** and opens the release page. Update checks follow the browser's connection mode, so in Managed or Strict privacy mode they go through the management proxy.
 
-Keyboard shortcuts (⌘ instead of Ctrl on macOS): Ctrl+T new tab, Ctrl+W close tab, Ctrl+Tab / Ctrl+Shift+Tab switch tabs, Ctrl+L focus the address bar, Ctrl+R or F5 reload, Ctrl+Shift+R hard reload, Alt+← / Alt+→ back and forward, Ctrl+= / Ctrl+- / Ctrl+0 zoom, and F12 developer tools. Right-click a page for copy/paste, link, and Inspect actions. Links that open a new tab load as tabs; `window.open` popups open as real windows so sign-in and approval flows that report back to their opener keep working.
+The address bar accepts full URLs, bare host names (`github.com`, or `localhost:3000` which opens over HTTP), and search terms, which use the search URL configured in the dashboard (DuckDuckGo by default; leave it empty to disable searching). The ★ button lists the shared bookmarks; hold Ctrl (⌘) or Shift to open one in a new tab. Middle-click a tab to close it, and double-click the empty tab strip to open a new one. Download progress is shown in the status text.
+
+Keyboard shortcuts (⌘ instead of Ctrl on macOS): Ctrl+T new tab, Ctrl+Shift+T reopen the last closed tab, Ctrl+W close tab, Ctrl+Tab / Ctrl+Shift+Tab switch tabs, Ctrl+L focus the address bar, Ctrl+F or F3 find in page (Enter / Shift+Enter for next and previous, Esc to close), Ctrl+R or F5 reload, Ctrl+Shift+R hard reload, Alt+← / Alt+→ back and forward, Ctrl+= / Ctrl+- / Ctrl+0 zoom, and F12 developer tools. Right-click a page for copy/paste, link, and Inspect actions. Links that open a new tab load as tabs; `window.open` popups open as real windows so sign-in and approval flows that report back to their opener keep working.
 
 Electron stores each named profile in the operating system's application-data directory. Device credentials and the offline shared snapshot use Electron `safeStorage`; Chromium protects its persistent cookie store using the facilities available on the operating system. On Linux, install and unlock a supported secret store such as KWallet, GNOME Keyring, or Secret Service. The client warns when Electron falls back to unencrypted `basic_text` storage.
 
@@ -279,7 +283,7 @@ Each browser independently chooses its route in **Server settings**:
 - **Managed proxy — use server IP**: HTTP and HTTPS traffic goes through the authenticated management-server proxy, so websites see the management server's outbound IP.
 - **Strict privacy**: requires Managed proxy mode, removes Chromium's implicit direct bypass routes, blocks browsing if the proxy configuration is unavailable, restricts WebRTC from using non-proxied UDP, and denies website permission prompts such as location, camera, microphone, and notifications.
 
-Restart a browser after changing its connection mode or after changing the proxy endpoint. Both WebView2 and Electron establish proxy routing at startup. HTTPS uses standard `CONNECT` tunneling and remains end-to-end encrypted between the browser and destination; the management proxy does not install a certificate authority or decrypt page contents.
+Restart a browser after changing its connection mode. When an administrator changes the proxy endpoint in the dashboard, Electron browsers in Managed mode switch to it on their next sync without a restart; the .NET/WebView2 client still needs a restart. HTTPS uses standard `CONNECT` tunneling and remains end-to-end encrypted between the browser and destination; the management proxy does not install a certificate authority or decrypt page contents.
 
 Strict privacy is leak reduction, not anonymity. Signed-in accounts, shared cookies, browser fingerprints, and account activity can still identify a user. Because WebRTC cannot use direct UDP in this mode, browser-based voice or video calls may fall back to TCP or fail.
 
@@ -291,6 +295,10 @@ The default destination-port allowlist is `80,443`. Private, loopback, link-loca
 
 - Automatic sharing is enabled by default. The primary browser creates a profile for every domain whose cookies it publishes.
 - Only the primary browser can publish cookie/session changes. This prevents a logged-out secondary browser from overwriting a logged-in session.
+- The Electron primary publishes a complete cookie list per domain, and only for domains whose cookies changed. Cookies it no longer has (for example after signing out) are removed from the vault; cookies typed into the dashboard are only removed from the dashboard. Secondary browsers delete a removed cookie only while it still holds the value they received.
+- A disabled profile stops sharing for its domain; the primary browser does not recreate an automatic profile for it.
+- Profile edits in the dashboard keep stored cookie values when the value field is left empty, so one cookie can be changed without re-entering the others.
+- Clients poll with the revision they already have and the server answers `204 No Content` when nothing changed. After errors, polling backs off up to one minute.
 - Profiles can still be disabled or removed from the dashboard when a domain should not be shared.
 - Server revisions provide a consistent order across browsers.
 - Cookie conflicts use server-arrival last-write-wins behavior.
