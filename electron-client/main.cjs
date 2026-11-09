@@ -15,8 +15,6 @@ const DEFAULT_SEARCH_URL = 'https://duckduckgo.com/?q=%s';
 const EVENTS_POLL_INTERVAL_MS = 30 * 1000;
 const EVENTS_IDLE_TIMEOUT_MS = 70 * 1000;
 const MAX_RESTORED_TABS = 30;
-// Set by the release workflow when the build is code-signed; macOS can only self-update signed apps.
-const SIGNED_BUILD = Boolean(require('./package.json').signedBuild);
 const UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000;
 const RELEASE_REPOSITORY = 'un4ckn0wl3z/Shared-Browser-Server';
 // electron-updater downloads through this partition (its NET_SESSION_NAME); it gets the same proxy as
@@ -1132,12 +1130,10 @@ function proxyLogin(authInfo, callback) {
   else callback();
 }
 
-// Windows (NSIS), Linux AppImage and code-signed macOS builds download and install updates themselves.
-// Other builds, including the unsigned macOS DMG that Squirrel.Mac refuses to update, link to the release page.
+// Windows (NSIS) and Linux AppImage builds download and install updates themselves. Other builds,
+// including the unsigned macOS DMG that Squirrel.Mac refuses to update, link to the release page.
 function installsUpdates() {
-  return app.isPackaged && (process.platform === 'win32'
-    || (process.platform === 'linux' && Boolean(process.env.APPIMAGE))
-    || (process.platform === 'darwin' && SIGNED_BUILD));
+  return app.isPackaged && (process.platform === 'win32' || (process.platform === 'linux' && Boolean(process.env.APPIMAGE)));
 }
 
 function publishUpdate(patch) {

@@ -34,12 +34,7 @@ jobs:
             os: macos-15
             command: dist:mac
             artifact: shared-browser-macos-universal
-            # The zip and latest-mac.yml let code-signed macOS builds update themselves.
-            files: |
-              electron-client/dist/*.dmg
-              electron-client/dist/*.zip
-              electron-client/dist/*.blockmap
-              electron-client/dist/latest-mac.yml
+            files: electron-client/dist/*.dmg
           - name: Linux x64
             os: ubuntu-latest
             command: dist:linux
@@ -74,26 +69,10 @@ jobs:
       - name: Check JavaScript
         run: pnpm run check
 
-      # Builds are signed only when the matching repository secrets exist; otherwise they stay unsigned.
-      #   Windows: WIN_CSC_LINK (base64 .pfx or URL) and WIN_CSC_KEY_PASSWORD
-      #   macOS:   MAC_CSC_LINK (base64 Developer ID .p12) and MAC_CSC_KEY_PASSWORD, plus APPLE_ID,
-      #            APPLE_APP_SPECIFIC_PASSWORD and APPLE_TEAM_ID for notarization
       - name: Package application
-        shell: bash
-        run: |
-          extra=()
-          # Only a signed macOS app can update itself, so the client is told at build time.
-          if [ "$RUNNER_OS" = "macOS" ] && [ -n "$CSC_LINK" ]; then extra+=("-c.extraMetadata.signedBuild=true"); fi
-          pnpm run ${{ matrix.command }} "${extra[@]}"
+        run: pnpm run ${{ matrix.command }}
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
-          CSC_LINK: ${{ runner.os == 'macOS' && secrets.MAC_CSC_LINK || '' }}
-          CSC_KEY_PASSWORD: ${{ runner.os == 'macOS' && secrets.MAC_CSC_KEY_PASSWORD || '' }}
-          WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
-          WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
-          APPLE_ID: ${{ runner.os == 'macOS' && secrets.APPLE_ID || '' }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ runner.os == 'macOS' && secrets.APPLE_APP_SPECIFIC_PASSWORD || '' }}
-          APPLE_TEAM_ID: ${{ runner.os == 'macOS' && secrets.APPLE_TEAM_ID || '' }}
 
       - name: Upload installer
         uses: actions/upload-artifact@v4

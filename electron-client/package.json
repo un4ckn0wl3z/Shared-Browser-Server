@@ -12,7 +12,7 @@
     "check": "node --check main.cjs && node --check preload.cjs && node --check renderer.js",
     "dist": "electron-builder --publish never",
     "dist:win": "electron-builder --win nsis --x64 --publish never",
-    "dist:mac": "electron-builder --mac --universal --publish never",
+    "dist:mac": "electron-builder --mac dmg --universal --publish never",
     "dist:linux": "electron-builder --linux --x64 --publish never"
   },
   "devDependencies": {
@@ -46,10 +46,7 @@
       "target": "nsis"
     },
     "mac": {
-      "target": [
-        "dmg",
-        "zip"
-      ],
+      "target": "dmg",
       "category": "public.app-category.productivity"
     },
     "linux": {

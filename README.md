@@ -224,7 +224,7 @@ For browsers on other computers, bind the server to an appropriate private netwo
 
 The client runs on Windows, macOS, and Linux.
 
-Ready-to-use installers are published on the [GitHub Releases page](https://github.com/un4ckn0wl3z/Shared-Browser-Server/releases): a Windows x64 NSIS installer, a universal macOS DMG, and a Linux x64 AppImage, each built on a native GitHub runner. Unless the repository has signing secrets configured (see [Code signing](#code-signing)), these builds are unsigned, so Windows SmartScreen or macOS Gatekeeper may display a warning; review the repository source before allowing an unsigned build.
+Ready-to-use installers are published on the [GitHub Releases page](https://github.com/un4ckn0wl3z/Shared-Browser-Server/releases): a Windows x64 NSIS installer, a universal macOS DMG, and a Linux x64 AppImage, each built on a native GitHub runner. These community builds are currently unsigned, so Windows SmartScreen or macOS Gatekeeper may display a warning; review the repository source before allowing an unsigned build.
 
 Install and start it with Node.js 20 or newer and pnpm (`corepack enable` provides it):
 
@@ -251,7 +251,7 @@ The administrator token also works as an enrollment credential for compatibility
 
 Repeat enrollment for WB2 and WB3. In the dashboard, choose the signed-in browser (normally WB1) as **Primary session browser**. Its stored cookies are published on startup, and every domain whose cookies it holds is added to the shared vault automatically. WB2 and WB3 pull those changes approximately every 2.5 seconds.
 
-The installed client checks GitHub Releases at startup and every four hours. Its version is shown in the window title, the toolbar status text, and the settings dialog, which also has **Check for updates**. Windows, Linux AppImage, and code-signed macOS builds download a new release in the background and show **Restart to update** in the toolbar; the update otherwise installs when the browser is closed. An unsigned macOS build cannot install updates in place, so the toolbar shows **Update to vX** and opens the release page. Update checks follow the browser's connection mode, so in Managed or Strict privacy mode they go through the management proxy.
+The installed client checks GitHub Releases at startup and every four hours. Its version is shown in the window title, the toolbar status text, and the settings dialog, which also has **Check for updates**. Windows and Linux AppImage builds download a new release in the background and show **Restart to update** in the toolbar; the update otherwise installs when the browser is closed. The macOS DMG is unsigned, so macOS cannot install updates in place: the toolbar shows **Update to vX** and opens the release page. Update checks follow the browser's connection mode, so in Managed or Strict privacy mode they go through the management proxy.
 
 The address bar accepts full URLs, bare host names (`github.com`, or `localhost:3000` which opens over HTTP), and search terms, which use the search URL configured in the dashboard (DuckDuckGo by default; leave it empty to disable searching). The ★ button lists the shared bookmarks; hold Ctrl (⌘) or Shift to open one in a new tab. Middle-click a tab to close it, and double-click the empty tab strip to open a new one. Download progress is shown in the status text.
 
@@ -270,18 +270,6 @@ pnpm run dist:linux
 ```
 
 macOS installers normally must be built and code-signed on macOS. Windows installers should be signed before public distribution.
-
-### Code signing
-
-The release workflow signs installers when these repository secrets exist, and builds unsigned installers otherwise:
-
-| Platform | Secrets |
-| --- | --- |
-| Windows | `WIN_CSC_LINK` (base64-encoded `.pfx` or an HTTPS URL to it), `WIN_CSC_KEY_PASSWORD` |
-| macOS signing | `MAC_CSC_LINK` (base64-encoded Developer ID Application `.p12`), `MAC_CSC_KEY_PASSWORD` |
-| macOS notarization | `APPLE_ID`, `APPLE_APP_SPECIFIC_PASSWORD`, `APPLE_TEAM_ID` |
-
-A signed macOS build is marked at build time so it installs updates itself, using the `.zip` and `latest-mac.yml` the release also publishes.
 
 ## Direct IP or management-server IP
 
