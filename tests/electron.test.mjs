@@ -19,7 +19,8 @@ describe('Electron browsers sharing a session', () => {
     site = await startSite();
     home = tempDir('home');
     // Browsers enroll with one-time codes, and administrator-token enrollment is switched off.
-    await server.settings({ allowAdminTokenEnrollment: false });
+    // These browsers run in Direct mode against a site on localhost, so they need the choice policy.
+    await server.settings({ allowAdminTokenEnrollment: false, networkPolicy: 'choice' });
     for (const name of ['WB1', 'WB2']) {
       writeClientProfile(home, name, { serverUrl: server.url, deviceId: deviceId(name), credential: await server.code(name) });
     }
@@ -238,10 +239,101 @@ describe('Electron browser in Managed proxy mode', () => {
     assert.ok(origin.requests.length > 0 && origin.requests.every(item => !item.proxyAuthorization));
   });
 
+  test('the default policy puts the browser in Strict privacy and locks the setting', async () => {
+    const status = await server.status();
+    assert.equal(status.settings.networkPolicy, 'strict');
+    await waitFor(async () => (await server.status()).devices.find(item => item.name === 'WB3')?.networkMode === 'strict', { message: 'WB3 reports strict' });
+    const device = (await server.status()).devices.find(item => item.name === 'WB3');
+    assert.equal(device.clientVersion, '1.3.0');
+    // Loopback goes through the proxy too, and pages refuse non-proxied WebRTC.
+    assert.notEqual(await browser.route('http://127.0.0.1/'), 'DIRECT');
+    const policies = await browser.app.evaluate(({ webContents }) => webContents.getAllWebContents().filter(item => /^https?:|about:blank/.test(item.getURL())).map(item => item.getWebRTCIPHandlingPolicy()));
+    assert.ok(policies.length && policies.every(policy => policy === 'disable_non_proxied_udp'), JSON.stringify(policies));
+    await browser.window.click('#settings');
+    await waitFor(() => browser.window.evaluate(() => document.getElementById('settings-dialog').open), { message: 'settings open' });
+    assert.ok(await browser.window.isDisabled('#network-mode'));
+    assert.ok(await browser.window.isDisabled('#strict-privacy'));
+    assert.match(await browser.window.textContent('#policy-note'), /Strict privacy/);
+  });
+
+  test('"What IP do websites see?" answers through the proxy', async t => {
+    if (!haveOrigin) return t.skip(`${PUBLIC_IP} is not bound locally`);
+    await server.settings({ ipCheckUrl: `http://${PUBLIC_IP}:${origin.port}/ip` });
+    const dialogOpen = () => browser.window.evaluate(() => document.getElementById('settings-dialog').open);
+    // The dialog reads the configuration when it opens, so reopen it until the new setting has synced.
+    await waitFor(async () => {
+      if (await dialogOpen()) await browser.window.click('#settings-close');
+      await browser.window.click('#settings');
+      await waitFor(dialogOpen, { message: 'settings open' });
+      return !(await browser.window.isHidden('#ip-check'));
+    }, { message: 'IP check button shown', interval: 500 });
+    const before = origin.requests.length;
+    await browser.window.click('#ip-check');
+    await waitFor(async () => /Websites see/.test(await browser.window.textContent('#privacy-result')), { message: 'IP result' });
+    const seen = origin.requests.slice(before).find(item => item.path === '/ip');
+    assert.ok(seen && !seen.proxyAuthorization);
+    assert.match(await browser.window.textContent('#privacy-result'), new RegExp(`Websites see ${seen.remote.replaceAll('.', '\\.')}\\. .*Strict privacy`));
+    await browser.window.click('#settings-close');
+  });
+
   test('switches to a changed proxy endpoint without a restart', async () => {
     await server.settings({}, { tls: false });
     await waitFor(async () => (await browser.route('https://example.com/')) === `PROXY 127.0.0.1:${server.proxyPort}`, { message: 'plain proxy route' });
     await server.settings({}, { tls: true });
     await waitFor(async () => (await browser.route('https://example.com/')) === `HTTPS 127.0.0.1:${server.proxyPort}`, { message: 'TLS route again' });
+  });
+});
+
+describe('Electron browser switched by the connection policy', () => {
+  let server;
+  let home;
+  let browser;
+
+  before(async () => {
+    server = await startServer();
+    home = tempDir('home');
+    await server.settings({ networkPolicy: 'choice' }, { enabled: true, port: server.proxyPort, tls: true });
+    await waitFor(async () => (await server.status()).proxy.listening, { message: 'proxy listening' });
+    writeClientProfile(home, 'WB4', { serverUrl: server.url, deviceId: randomDeviceId(), credential: await server.code('WB4'), networkMode: 'direct' });
+    browser = await launchBrowser(home, 'WB4');
+    await waitFor(async () => (await server.status()).devices.find(item => item.name === 'WB4')?.networkMode === 'direct', { message: 'WB4 reports direct' });
+  });
+  after(async () => {
+    await browser?.close().catch(() => { });
+    await server?.stop();
+  });
+
+  test('a running Direct-mode browser moves to the proxy with Strict privacy when the policy changes', async () => {
+    assert.equal(await browser.route('https://example.com/'), 'DIRECT');
+    await server.settings({ networkPolicy: 'strict' });
+    await waitFor(async () => (await browser.route('https://example.com/')) === `HTTPS 127.0.0.1:${server.proxyPort}`, { message: 'proxy route', timeout: 10000 });
+    await waitFor(async () => (await server.status()).devices.find(item => item.name === 'WB4')?.networkMode === 'strict', { message: 'WB4 reports strict' });
+    const policies = await browser.app.evaluate(({ webContents }) => webContents.getAllWebContents().filter(item => /^https?:|about:blank/.test(item.getURL())).map(item => item.getWebRTCIPHandlingPolicy()));
+    assert.ok(policies.every(policy => policy === 'disable_non_proxied_udp'), JSON.stringify(policies));
+  });
+
+  test('the managed policy still lets the user turn Strict privacy off', async () => {
+    await server.settings({ networkPolicy: 'managed' });
+    await browser.window.click('#settings');
+    await waitFor(() => browser.window.evaluate(() => document.getElementById('settings-dialog').open), { message: 'settings open' });
+    await waitFor(async () => /requires the managed proxy\./.test(await browser.window.textContent('#policy-note')), { message: 'managed note' });
+    assert.ok(await browser.window.isDisabled('#network-mode'));
+    assert.ok(!(await browser.window.isDisabled('#strict-privacy')));
+    await browser.window.click('#settings-close');
+  });
+});
+
+describe('A newly installed browser', () => {
+  let browser;
+  after(async () => { await browser?.close().catch(() => { }); });
+
+  test('starts in Managed proxy mode with Strict privacy', async () => {
+    browser = await launchBrowser(tempDir('home'), 'Fresh');
+    const dialogOpen = () => browser.window.evaluate(() => document.getElementById('settings-dialog').open);
+    await waitFor(dialogOpen, { message: 'first-run settings dialog' });
+    assert.equal(await browser.window.inputValue('#network-mode'), 'managed');
+    assert.ok(await browser.window.isChecked('#strict-privacy'));
+    // Until it is enrolled and configured, nothing leaves the computer directly.
+    assert.notEqual(await browser.route('https://example.com/'), 'DIRECT');
   });
 });

@@ -17,6 +17,8 @@ export const DATA_KEY = 'test-data-key-0123456789abcdef0123456789abcdef01';
 // The proxy refuses private and loopback destinations, so tunnel tests need an origin on an address it
 // treats as public. CI adds this address to the loopback interface; locally the tests skip without it.
 export const PUBLIC_IP = process.env.TEST_PUBLIC_IP || '8.8.4.4';
+// A second local "public" address the proxy can be told to send from (egress source address tests).
+export const SOURCE_IP = process.env.TEST_SOURCE_IP || '1.1.1.2';
 export const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 export function tempDir(name) {
@@ -149,10 +151,10 @@ export async function startSite() {
   return { port, origin: `http://localhost:${port}`, close: () => new Promise(resolve => server.close(resolve)) };
 }
 
-/** Returns true when PUBLIC_IP is bound locally, so origins can listen on it. */
-export async function publicAddressAvailable() {
+/** Returns true when the address (PUBLIC_IP by default) is bound locally, so servers can listen on it. */
+export async function publicAddressAvailable(address = PUBLIC_IP) {
   return new Promise(resolve => {
-    const probe = net.createServer().once('error', () => resolve(false)).listen(0, PUBLIC_IP, () => probe.close(() => resolve(true)));
+    const probe = net.createServer().once('error', () => resolve(false)).listen(0, address, () => probe.close(() => resolve(true)));
   });
 }
 
@@ -160,8 +162,10 @@ export async function publicAddressAvailable() {
 export async function startOrigin() {
   const requests = [];
   const server = http.createServer((request, response) => {
-    requests.push({ path: request.url, proxyAuthorization: 'proxy-authorization' in request.headers });
-    const body = `hello ${request.url}`;
+    const remote = String(request.socket.remoteAddress).replace(/^::ffff:/, '');
+    requests.push({ path: request.url, proxyAuthorization: 'proxy-authorization' in request.headers, remote });
+    // /ip answers like an IP echo service with the address the request came from.
+    const body = request.url.startsWith('/ip') ? JSON.stringify({ ip: remote }) : `hello ${request.url}`;
     response.writeHead(200, { 'content-type': 'text/html', 'content-length': Buffer.byteLength(body), connection: 'keep-alive' });
     response.end(body);
   });

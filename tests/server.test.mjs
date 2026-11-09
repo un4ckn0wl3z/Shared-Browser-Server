@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { after, before, describe, test } from 'node:test';
 import {
-  ADMIN_TOKEN, PUBLIC_IP, basic, connectProxy, publicAddressAvailable, randomDeviceId, readHead, sleep,
+  ADMIN_TOKEN, PUBLIC_IP, SOURCE_IP, basic, connectProxy, publicAddressAvailable, randomDeviceId, readHead, sleep,
   startEcho, startOrigin, startServer, waitFor
 } from './lib/harness.mjs';
 
@@ -336,5 +336,171 @@ describe('forward proxy', () => {
     await server.admin(`/devices/${victim.id}/revoke`, 'POST', {});
     await Promise.race([closed, sleep(12000).then(() => { throw new Error('tunnel stayed open'); })]);
     assert.ok(Date.now() - started < 12000);
+  });
+});
+
+describe('connection policy, egress and per-browser proxy limits', () => {
+  let server;
+  let echo;
+  let origin;
+  let havePublic;
+  let haveSource;
+
+  // Opens a CONNECT tunnel to the echo server; resolves with the socket once the proxy answers 200.
+  const tunnel = async device => {
+    const { socket } = await connectProxy(server.proxyPort, false);
+    socket.write(`CONNECT ${PUBLIC_IP}:${echo.port} HTTP/1.1\r\nHost: ${PUBLIC_IP}:${echo.port}\r\nProxy-Authorization: ${basic(device)}\r\n\r\n`);
+    const response = await readHead(socket);
+    return { socket, status: response.status, head: response.head };
+  };
+  // Sends bytes through a tunnel and waits until the echo has returned all of them.
+  const roundTrip = (socket, size) => new Promise((resolve, reject) => {
+    let received = 0;
+    const onData = chunk => { received += chunk.length; if (received >= size) { socket.off('data', onData); resolve(); } };
+    socket.on('data', onData).once('error', reject);
+    socket.write(Buffer.alloc(size, 7));
+  });
+  const usageOf = async device => (await server.status()).devices.find(item => item.id === device.id).usage;
+
+  before(async () => {
+    server = await startServer();
+    havePublic = await publicAddressAvailable();
+    haveSource = havePublic && await publicAddressAvailable(SOURCE_IP);
+    if (havePublic) {
+      echo = await startEcho();
+      origin = await startOrigin();
+    }
+    const ports = ['80', '443', echo?.port, origin?.port].filter(Boolean).join(',');
+    await server.settings({}, { enabled: true, port: server.proxyPort, allowedPorts: ports, tls: false });
+    await waitFor(async () => (await server.status()).proxy.listening, { message: 'proxy listening' });
+  });
+  after(async () => {
+    await echo?.close();
+    await origin?.close();
+    await server?.stop();
+  });
+
+  test('strict is the default connection policy and browsers report their version and mode', async () => {
+    const status = await server.status();
+    assert.equal(status.settings.networkPolicy, 'strict');
+    assert.equal(status.settings.ipCheckUrl, 'https://api64.ipify.org?format=json');
+    await assert.rejects(server.settings({ networkPolicy: 'sometimes' }), /choice, managed or strict/);
+    const device = await server.enroll(randomDeviceId(), 'reporter');
+    assert.equal((await server.device(device, '/snapshot?version=1.3.0&mode=strict')).status, 200);
+    const listed = (await server.status()).devices.find(item => item.id === device.id);
+    assert.equal(listed.clientVersion, '1.3.0');
+    assert.equal(listed.networkMode, 'strict');
+    // Browsers receive the policy with their snapshot.
+    assert.equal((await (await server.device(device, '/snapshot')).json()).settings.networkPolicy, 'strict');
+  });
+
+  test('limit validation', async () => {
+    await assert.rejects(server.settings({}, { monthlyQuotaGb: -1 }), /between 0/);
+    await assert.rejects(server.settings({}, { egressAddressFamily: 'ipx' }), /any, ipv4 or ipv6/);
+    await assert.rejects(server.settings({}, { egressSourceAddress: 'not-an-ip' }), /IP address/);
+    await assert.rejects(server.settings({}, { egressAddressFamily: 'ipv6', egressSourceAddress: '127.0.0.1' }), /does not match/);
+    const device = await server.enroll(randomDeviceId(), 'limited');
+    await assert.rejects(server.admin(`/devices/${device.id}/limits`, 'PUT', { maxConnections: -3 }), /between 0/);
+    await server.admin(`/devices/${device.id}/limits`, 'PUT', { maxConnections: 2, monthlyQuotaGb: null, rateLimitMbps: 0 });
+    const listed = (await server.status()).devices.find(item => item.id === device.id);
+    assert.deepEqual(listed.limitOverrides, { maxConnections: 2, monthlyQuotaGb: null, rateLimitMbps: 0 });
+    assert.ok((await server.status()).audit.some(entry => entry.action === 'device.limits_updated'));
+  });
+
+  test('usage is counted per browser with its top sites', async t => {
+    if (!havePublic) return t.skip(`${PUBLIC_IP} is not bound locally`);
+    const device = await server.enroll(randomDeviceId(), 'counter');
+    const { socket, status } = await tunnel(device);
+    assert.equal(status, 200);
+    await roundTrip(socket, 50_000);
+    socket.destroy();
+    await waitFor(async () => (await usageOf(device)).activeConnections === 0, { message: 'connection closed' });
+    const usage = await usageOf(device);
+    assert.ok(usage.bytesUp >= 50_000 && usage.bytesDown >= 50_000, JSON.stringify(usage));
+    assert.equal(usage.connections, 1);
+    assert.equal(usage.topHosts[0].host, PUBLIC_IP);
+    assert.match(usage.month, /^\d{4}-\d{2}$/);
+  });
+
+  test('a browser cannot open more connections than its limit', async t => {
+    if (!havePublic) return t.skip(`${PUBLIC_IP} is not bound locally`);
+    const device = await server.enroll(randomDeviceId(), 'one-at-a-time');
+    await server.admin(`/devices/${device.id}/limits`, 'PUT', { maxConnections: 1 });
+    const first = await tunnel(device);
+    assert.equal(first.status, 200);
+    const second = await tunnel(device);
+    assert.equal(second.status, 429);
+    second.socket.destroy();
+    first.socket.destroy();
+    await waitFor(async () => (await usageOf(device)).activeConnections === 0, { message: 'slot released' });
+    const third = await tunnel(device);
+    assert.equal(third.status, 200);
+    third.socket.destroy();
+  });
+
+  test('the monthly quota stops new and open connections', async t => {
+    if (!havePublic) return t.skip(`${PUBLIC_IP} is not bound locally`);
+    const device = await server.enroll(randomDeviceId(), 'quota');
+    await server.admin(`/devices/${device.id}/limits`, 'PUT', { monthlyQuotaGb: 0.00002 }); // 20 kB
+    const open = await tunnel(device);
+    assert.equal(open.status, 200);
+    const closed = new Promise(resolve => open.socket.once('close', resolve));
+    await roundTrip(open.socket, 30_000);
+    await Promise.race([closed, sleep(12000).then(() => { throw new Error('tunnel stayed open over quota'); })]);
+    const refused = await tunnel(device);
+    assert.equal(refused.status, 403);
+    assert.match(refused.head, /quota/i);
+    refused.socket.destroy();
+    assert.ok((await server.status()).audit.some(entry => entry.action === 'proxy.quota_reached'));
+  });
+
+  test('the rate limit slows a browser down, and lifting it restores full speed', async t => {
+    if (!havePublic) return t.skip(`${PUBLIC_IP} is not bound locally`);
+    const device = await server.enroll(randomDeviceId(), 'slow');
+    await server.admin(`/devices/${device.id}/limits`, 'PUT', { rateLimitMbps: 2 }); // 250 kB/s for both directions together
+    const slow = await tunnel(device);
+    let started = Date.now();
+    await roundTrip(slow.socket, 500_000);
+    const limited = Date.now() - started;
+    slow.socket.destroy();
+    assert.ok(limited >= 2000, `took only ${limited} ms`);
+    await server.admin(`/devices/${device.id}/limits`, 'PUT', { rateLimitMbps: null });
+    const fast = await tunnel(device);
+    started = Date.now();
+    await roundTrip(fast.socket, 500_000);
+    const unlimited = Date.now() - started;
+    fast.socket.destroy();
+    assert.ok(unlimited < limited / 2, `limited ${limited} ms, unlimited ${unlimited} ms`);
+  });
+
+  test('egress family and source address decide how the proxy reaches websites', async t => {
+    if (!havePublic) return t.skip(`${PUBLIC_IP} is not bound locally`);
+    const device = await server.enroll(randomDeviceId(), 'egress');
+    await server.settings({}, { egressAddressFamily: 'ipv6' });
+    const v6 = await tunnel(device);
+    assert.equal(v6.status, 502);
+    assert.match(v6.head, /IPv6/);
+    v6.socket.destroy();
+    await server.settings({}, { egressAddressFamily: 'ipv4' });
+    const v4 = await tunnel(device);
+    assert.equal(v4.status, 200);
+    v4.socket.destroy();
+    if (!haveSource) return t.skip(`${SOURCE_IP} is not bound locally`);
+    await server.settings({ ipCheckUrl: `http://${PUBLIC_IP}:${origin.port}/ip` }, { egressSourceAddress: SOURCE_IP });
+    const check = await server.admin('/egress-ip', 'POST', {});
+    assert.equal(check.ip, SOURCE_IP);
+    // Plain-HTTP requests through the proxy leave from the same source address.
+    const { socket } = await connectProxy(server.proxyPort, false);
+    socket.write(`GET http://${PUBLIC_IP}:${origin.port}/ip HTTP/1.1\r\nHost: ${PUBLIC_IP}:${origin.port}\r\nProxy-Authorization: ${basic(device)}\r\n\r\n`);
+    const response = await readHead(socket);
+    socket.destroy();
+    assert.equal(response.status, 200);
+    assert.equal(origin.requests.at(-1).remote, SOURCE_IP);
+    await server.settings({}, { egressAddressFamily: 'any', egressSourceAddress: '' });
+  });
+
+  test('the egress check reports a bad IP check URL clearly', async () => {
+    await server.settings({ ipCheckUrl: '' });
+    await assert.rejects(server.admin('/egress-ip', 'POST', {}), /IP check URL/);
   });
 });
