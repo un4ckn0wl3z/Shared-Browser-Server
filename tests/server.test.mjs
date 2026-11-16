@@ -325,6 +325,8 @@ describe('management API', () => {
     assert.equal(response.headers.get('x-frame-options'), 'DENY');
     assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
     assert.equal((await fetch(`${server.url}/api/admin/status`, { headers: { authorization: `Bearer ${ADMIN_TOKEN}` } })).headers.get('cache-control'), 'no-store');
+    // Dashboard files are revalidated on every load, so an upgrade never mixes an old script with a new page.
+    for (const file of ['/', '/app.js', '/app.css']) assert.equal((await fetch(`${server.url}${file}`)).headers.get('cache-control'), 'no-cache', file);
   });
 });
 

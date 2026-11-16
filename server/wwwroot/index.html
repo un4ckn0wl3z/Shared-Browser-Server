@@ -1,6 +1,6 @@
 <!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Shared Browser Server</title><link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23071019'/%3E%3Ccircle cx='16' cy='16' r='9' fill='none' stroke='%2348dfb0' stroke-width='3'/%3E%3Cpath d='M7 16h18M16 7c4 4 4 14 0 18M16 7c-4 4-4 14 0 18' fill='none' stroke='%2348dfb0' stroke-width='2'/%3E%3C/svg%3E"><link rel="stylesheet" href="/app.css"></head>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Shared Browser Server</title><link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23071019'/%3E%3Ccircle cx='16' cy='16' r='9' fill='none' stroke='%2348dfb0' stroke-width='3'/%3E%3Cpath d='M7 16h18M16 7c4 4 4 14 0 18M16 7c-4 4-4 14 0 18' fill='none' stroke='%2348dfb0' stroke-width='2'/%3E%3C/svg%3E"><link rel="stylesheet" href="/app.css?v=1.5.1"></head>
 <body>
   <header><div><span class="eyebrow">CONTROL PLANE</span><h1>Shared Browser Server</h1></div><span id="connection" class="badge off">Disconnected</span></header>
   <main>
@@ -26,6 +26,6 @@
   </main>
   <template id="cookie-template"><div class="cookie"><label>Name<input class="cookie-name" required></label><label>Value<input class="cookie-value" type="password" autocomplete="off"></label><label>Domain<input class="cookie-domain" placeholder="uses profile domain"></label><label>Path<input class="cookie-path" value="/" required></label><label class="check"><input class="cookie-secure" type="checkbox" checked>Secure</label><label class="check"><input class="cookie-http" type="checkbox" checked>HttpOnly</label><select class="cookie-same"><option>Lax</option><option>Strict</option><option>None</option></select><button type="button" class="remove danger">×</button><small class="cookie-meta"></small></div></template>
   <template id="bookmark-template"><div class="bookmark"><label>Title<input class="bookmark-title" maxlength="120"></label><label>URL<input class="bookmark-url" type="url" required placeholder="https://example.com/"></label><button type="button" class="move-up secondary" title="Move up">↑</button><button type="button" class="remove danger" title="Remove">×</button></div></template>
-  <div id="toast"></div><script src="/app.js"></script>
+  <div id="toast"></div><script src="/app.js?v=1.5.1"></script>
 </body>
 </html>

@@ -51,7 +51,13 @@ function logout() {
 async function load() {
   state = await api('/status');
   connected(true);
-  render();
+  // A display problem must not sign the administrator out; only a rejected token does (see api()).
+  try {
+    render();
+  } catch (error) {
+    console.warn(error);
+    toast(`Part of the dashboard could not be shown (${error.message}). Reload the page with Ctrl+Shift+R.`, true);
+  }
 }
 
 function relativeTime(value) {
@@ -781,4 +787,5 @@ setInterval(() => {
   load().catch(() => { });
 }, 15000);
 
-if (token) load().catch(() => logout());
+// api() already signs out when the token is rejected; other errors (server restarting, network) keep the session.
+if (token) load().catch(error => { if (token) toast(error.message, true); });
