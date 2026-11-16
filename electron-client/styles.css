@@ -71,3 +71,17 @@ select:disabled, input:disabled { opacity: .6; }
 .lock-card label { text-align: left; }
 .lock-card small { color: #667085; font-size: 12px; }
 .lock-icon { font-size: 34px; }
+.downloads-button { position: relative; }
+.downloads-button .badge { position: absolute; top: -5px; right: -5px; min-width: 16px; height: 16px; padding: 0 4px; border-radius: 8px; background: #2563eb; color: #fff; font-size: 10px; line-height: 16px; }
+.downloads-button .badge[hidden] { display: none; }
+.downloads-dialog { width: min(620px, calc(100vw - 40px)); }
+.dialog-body { display: grid; gap: 12px; padding: 20px 22px; }
+.downloads-list { display: grid; gap: 8px; max-height: 60vh; overflow: auto; }
+.downloads-list .empty { color: #667085; font-size: 13px; padding: 12px 0; }
+.download { display: grid; grid-template-columns: 1fr auto; gap: 4px 10px; align-items: center; padding: 10px 12px; border: 1px solid #e2e7ef; border-radius: 9px; }
+.download strong { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.download small { color: #667085; font-size: 12px; grid-column: 1; }
+.download .row-actions { grid-row: 1 / span 3; grid-column: 2; display: flex; gap: 6px; }
+.download .row-actions button { padding: 5px 9px; font-size: 12px; }
+.download progress { grid-column: 1; width: 100%; height: 6px; }
+.download.blocked small, .download.interrupted small { color: #b3261e; }

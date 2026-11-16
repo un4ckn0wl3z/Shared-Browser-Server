@@ -294,6 +294,103 @@ describe('Electron browsers sharing a session', () => {
     await waitFor(async () => (await attached()) === 1, { message: 'pages shown again' });
   });
 
+  test('administrator actions reach the browser once: open, close tabs, clear cookies, lock', async () => {
+    const urls = () => wb2.app.evaluate(({ webContents }) => webContents.getAllWebContents().map(item => item.getURL()).filter(url => /^https?:/.test(url)));
+    const send = (type, argument = '') => server.admin(`/devices/${deviceId('WB2')}/commands`, 'POST', { type, argument });
+    await send('open-url', `${site.origin}/opened-by-admin`);
+    await waitFor(async () => (await urls()).includes(`${site.origin}/opened-by-admin`), { message: 'URL opened' });
+    await waitFor(async () => (await server.status()).devices.find(item => item.name === 'WB2').pendingCommands.length === 0, { message: 'action acknowledged' });
+    await send('close-tabs');
+    await waitFor(async () => !(await urls()).includes(`${site.origin}/opened-by-admin`), { message: 'tabs closed' });
+    assert.equal(await wb2.window.locator('.tab').count(), 1);
+    // Clearing cookies for a site removes them from this browser only.
+    await waitFor(async () => (await wb2.cookies(site.origin)).includes('pref=dark'), { message: 'WB2 has the shared cookie' });
+    await send('clear-site', 'localhost');
+    await waitFor(async () => !(await wb2.cookies(site.origin)).includes('pref='), { message: 'cookies cleared' });
+    assert.ok((await wb1.cookies(site.origin)).includes('pref=dark'));
+    // Lock needs an unlock code; with one, the browser locks at once. Idle time and the computer's lock do the same.
+    await server.admin('/client-lock', 'PUT', { enabled: true, code: 'letmein', idleMinutes: 1, lockOnSystemLock: true });
+    await wb2.window.waitForSelector('#lock-screen:not([hidden])');
+    const unlock = async () => {
+      await wb2.window.fill('#lock-code', 'letmein');
+      await wb2.window.click('#lock-form button');
+      await wb2.window.waitForSelector('#lock-screen', { state: 'hidden' });
+    };
+    await unlock();
+    await send('lock');
+    await wb2.window.waitForSelector('#lock-screen:not([hidden])');
+    await unlock();
+    await wb2.app.evaluate(({ powerMonitor }) => powerMonitor.emit('lock-screen'));
+    await wb2.window.waitForSelector('#lock-screen:not([hidden])');
+    await unlock();
+    await wb2.app.evaluate(({ powerMonitor }) => { powerMonitor.getSystemIdleTime = () => 120; });
+    await wb2.window.waitForSelector('#lock-screen:not([hidden])', { timeout: 15000 });
+    await wb2.app.evaluate(({ powerMonitor }) => { powerMonitor.getSystemIdleTime = () => 0; });
+    await unlock();
+    await server.admin('/client-lock', 'PUT', { enabled: false });
+  });
+
+  test('site filter: blocked sites show a notice, allow lists keep everything else out', async () => {
+    const text = async () => (await wb2.pageText()).join('\n');
+    await server.settings({ siteFilter: { mode: 'block', domains: ['localhost'] } });
+    await sleep(1500);
+    await wb2.navigate(`${site.origin}/blocked-page`);
+    await waitFor(async () => /localhost is blocked/.test(await wb2.app.evaluate(async ({ webContents }) => (await Promise.all(webContents.getAllWebContents().filter(item => item.getURL().startsWith('data:')).map(item => item.executeJavaScript('document.body.innerText')))).join(' '))), { message: 'blocked notice' });
+    // A per-browser allow list replaces the shared filter for this browser only.
+    await server.admin(`/devices/${deviceId('WB2')}/settings`, 'PUT', { homePage: '', siteFilter: { mode: 'allow', domains: ['localhost'] }, scheduleExempt: false });
+    await sleep(1500);
+    await wb2.navigate(`${site.origin}/allowed-page`);
+    await waitFor(async () => /needle/.test(await text()), { message: 'allowed page loads' });
+    await server.admin(`/devices/${deviceId('WB2')}/settings`, 'PUT', { homePage: '', siteFilter: null, scheduleExempt: false });
+    await server.settings({ siteFilter: { mode: 'off', domains: [] } });
+  });
+
+  test('allowed hours hide the pages outside them; an exempt browser is not affected', async () => {
+    // Allowed only on a day that is not today in the chosen time zone.
+    const today = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Bangkok' })).getDay();
+    await server.settings({ schedule: { enabled: true, days: [(today + 3) % 7], start: '09:00', end: '18:00', timeZone: 'Asia/Bangkok' } });
+    await wb2.window.waitForSelector('#schedule-screen:not([hidden])');
+    assert.match(await wb2.window.textContent('#schedule-text'), /09:00–18:00 \(Asia\/Bangkok\)/);
+    assert.equal(await wb2.app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].contentView.children.length), 0);
+    await server.admin(`/devices/${deviceId('WB2')}/settings`, 'PUT', { homePage: '', siteFilter: null, scheduleExempt: true });
+    await wb2.window.waitForSelector('#schedule-screen', { state: 'hidden' });
+    await server.admin(`/devices/${deviceId('WB2')}/settings`, 'PUT', { homePage: '', siteFilter: null, scheduleExempt: false });
+    await server.settings({ schedule: { enabled: false, days: [1], start: '09:00', end: '18:00', timeZone: 'Asia/Bangkok' } });
+    await wb2.window.waitForSelector('#schedule-screen', { state: 'hidden' });
+  });
+
+  test('download manager, and data controls that block downloads, uploads and copying', async () => {
+    await wb2.navigate(`${site.origin}/file`);
+    await waitFor(async () => (await wb2.window.evaluate(() => window.sharedBrowser.downloads())).some(item => item.name === 'report.txt' && item.state === 'completed'), { message: 'download completed' });
+    const [done] = await wb2.window.evaluate(() => window.sharedBrowser.downloads());
+    assert.equal(fs.readFileSync(done.path, 'utf8'), 'quarterly numbers');
+    await wb2.window.click('#downloads-button');
+    await wb2.window.waitForSelector('#downloads-dialog[open]');
+    assert.match(await wb2.window.textContent('#downloads-list'), /report\.txt[\s\S]*Done/);
+    await wb2.window.click('#downloads-close');
+    await server.settings({ dataControls: { blockDownloads: true, blockUploads: true, blockCopy: true, domains: ['localhost'] } });
+    await sleep(1500);
+    await wb2.navigate(`${site.origin}/protected`);
+    await waitFor(async () => /needle/.test((await wb2.pageText()).join(' ')), { message: 'protected page' });
+    await wb2.navigate(`${site.origin}/file`);
+    await waitFor(async () => (await wb2.window.evaluate(() => window.sharedBrowser.downloads()))[0].state === 'blocked', { message: 'download blocked' });
+    const guarded = await wb2.app.evaluate(async ({ webContents }) => {
+      const page = webContents.getAllWebContents().find(item => item.getURL().endsWith('/protected'));
+      return page.executeJavaScript(`(() => {
+        const copy = new Event('copy', { cancelable: true, bubbles: true });
+        document.body.dispatchEvent(copy);
+        const input = document.createElement('input');
+        input.type = 'file';
+        document.body.append(input);
+        const click = new MouseEvent('click', { cancelable: true, bubbles: true });
+        input.dispatchEvent(click);
+        return [copy.defaultPrevented, click.defaultPrevented];
+      })()`);
+    });
+    assert.deepEqual(guarded, [true, true]);
+    await server.settings({ dataControls: { blockDownloads: false, blockUploads: false, blockCopy: false, domains: [] } });
+  });
+
   test('purging the vault removes shared cookies from the other browser but not from the primary', async () => {
     await waitFor(async () => (await wb2.cookies(site.origin)).includes('pref=dark'), { message: 'WB2 has the shared cookie' });
     await server.admin('/profiles/purge', 'POST', { confirm: true });

@@ -143,6 +143,12 @@ export async function startSite() {
       '/other-login': ['other=1; Path=/; Max-Age=3600']
     }[url.pathname];
     if (cookies) response.setHeader('Set-Cookie', cookies);
+    if (url.pathname === '/file') {
+      response.setHeader('content-type', 'text/plain');
+      response.setHeader('content-disposition', 'attachment; filename="report.txt"');
+      response.end('quarterly numbers');
+      return;
+    }
     response.setHeader('content-type', 'text/html; charset=utf-8');
     response.end(`<title>Test ${url.pathname}</title><p id="c">${request.headers.cookie || ''}</p><p>needle one needle two needle three</p>`);
   });

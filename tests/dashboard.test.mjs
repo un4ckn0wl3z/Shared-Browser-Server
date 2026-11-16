@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { after, before, describe, test } from 'node:test';
-import { ADMIN_TOKEN, randomDeviceId, startServer, waitFor } from './lib/harness.mjs';
+import { ADMIN_TOKEN, randomDeviceId, startCapture, startServer, waitFor } from './lib/harness.mjs';
 
 describe('dashboard', () => {
   let server;
@@ -62,6 +62,7 @@ describe('dashboard', () => {
     await page.fill('#proxy-port', String(server.proxyPort));
     await page.check('#proxy-tls');
     await page.click('#proxy-form > button');
+    await waitFor(async () => /Proxy settings saved/.test(await page.textContent('#toast')), { message: 'proxy saved' });
     await waitFor(async () => /Certificate SHA-256/.test(await page.textContent('#proxy-fingerprint')), { message: 'fingerprint shown' });
   });
 
@@ -169,6 +170,7 @@ describe('dashboard', () => {
     await page.fill('#limit-rate', '10');
     await page.selectOption('#network-policy', 'managed');
     await page.click('#proxy-form > button');
+    await waitFor(async () => /Proxy settings saved/.test(await page.textContent('#toast')), { message: 'proxy saved' });
     await waitFor(async () => (await server.status()).settings.networkPolicy === 'managed', { message: 'policy saved' });
     const proxy = (await server.status()).settings.proxy;
     assert.deepEqual([proxy.egressAddressFamily, proxy.maxConnectionsPerDevice, proxy.monthlyQuotaGb, proxy.rateLimitMbps], ['ipv4', 20, 50, 10]);
@@ -195,6 +197,67 @@ describe('dashboard', () => {
     await waitFor(async () => (await server.status()).settings.minimumClientVersion === '', { message: 'minimum cleared' });
   });
 
+  test('notifications: save a Discord webhook, keep it secret and send a test', async () => {
+    const capture = await startCapture();
+    try {
+      await page.fill('#notify-discord', `${capture.url}/api/webhooks/42/dashboard-secret`);
+      await page.uncheck('#notify-events input[value="device.offline"]');
+      await page.click('#notify-form button:not([type=button])');
+      await waitFor(async () => /Notifications saved/.test(await page.textContent('#toast')), { message: 'webhook saved' });
+      assert.ok(!(await server.status()).notifications.events.includes('device.offline'));
+      assert.equal(await page.inputValue('#notify-discord'), '••••••••');
+      await page.click('#notify-test');
+      await waitFor(async () => /Test sent to Discord/.test(await page.textContent('#toast')), { message: 'test sent' });
+      assert.match(JSON.parse(capture.requests[0].text).content, /Test notification/);
+    } finally {
+      await capture.close();
+    }
+  });
+
+  test('browsing controls and per-browser settings and actions', async () => {
+    await page.selectOption('#filter-mode', 'block');
+    await page.fill('#filter-domains', 'games.example');
+    await page.check('#schedule-enabled');
+    await page.fill('#schedule-start', '08:00');
+    await page.check('#block-copy');
+    await page.click('#controls-form > button');
+    await waitFor(async () => /Browsing controls saved/.test(await page.textContent('#toast')), { message: 'controls saved' });
+    const settings = (await server.status()).settings;
+    assert.deepEqual([settings.siteFilter.domains, settings.schedule.enabled, settings.schedule.start, settings.dataControls.blockCopy], [['games.example'], true, '08:00', true]);
+    await page.selectOption('#filter-mode', 'off');
+    await page.uncheck('#schedule-enabled');
+    await page.uncheck('#block-copy');
+    await page.click('#controls-form > button');
+    await waitFor(async () => !(await server.status()).settings.schedule.enabled, { message: 'controls cleared' });
+    await waitFor(async () => !(await page.isChecked('#schedule-enabled')) && (await page.textContent('#toast')) === 'Browsing controls saved', { message: 'controls form refreshed' });
+    // Per-browser panel: an action and settings.
+    await page.click('#devices tr:has-text("WB1") button.actions-button');
+    await page.fill('.device-row [name=openUrl]', 'https://intranet.example/');
+    await page.click('.device-row [data-command="open-url"]');
+    await waitFor(async () => (await server.status()).devices.find(item => item.name === 'WB1').pendingCommands.some(item => item.argument === 'https://intranet.example/'), { message: 'action sent' });
+    await waitFor(async () => /1 action\(s\) waiting/.test(await page.textContent('#devices')), { message: 'pending shown' });
+    await waitFor(async () => /Open a page sent to WB1/.test(await page.textContent('#toast')), { message: 'action toast' });
+    await page.click('#devices tr:has-text("WB1") button.actions-button');
+    await page.fill('.device-row [name=homePage]', 'https://desk.example/');
+    await page.selectOption('.device-row [name=filterMode]', 'allow');
+    await page.fill('.device-row [name=filterDomains]', 'desk.example, docs.example');
+    await page.click('.device-row form button:not([type=button])');
+    await waitFor(async () => /Settings saved for WB1/.test(await page.textContent('#toast')), { message: 'device settings saved' });
+    assert.deepEqual((await server.status()).devices.find(item => item.name === 'WB1').siteFilter, { mode: 'allow', domains: ['desk.example', 'docs.example'] });
+    await page.click('#devices tr:has-text("WB1") button.actions-button');
+    await page.click('.device-row [data-cancel]');
+    await waitFor(async () => (await server.status()).devices.find(item => item.name === 'WB1').pendingCommands.length === 0, { message: 'action cancelled' });
+  });
+
+  test('offsite backup settings are validated', async () => {
+    await page.check('#offsite-enabled');
+    await page.fill('#offsite-endpoint', 'https://sgp1.digitaloceanspaces.com');
+    await page.click('#offsite-form button:not([type=button])');
+    await waitFor(async () => /Enter the endpoint, bucket, access key and secret key/.test(await page.textContent('#toast')), { message: 'validation shown' });
+    assert.equal((await server.status()).offsiteBackup.enabled, false);
+    await page.uncheck('#offsite-enabled');
+  });
+
   test('lists backups and the audit log', async () => {
     await waitFor(async () => (await page.locator('#backups tr').count()) >= 1 && !(await page.textContent('#backups')).includes('No backups'), { message: 'backup rows' });
     assert.match(await page.textContent('#backup-policy'), /Keeps the newest \d+ backups/);
@@ -205,7 +268,7 @@ describe('dashboard', () => {
     await page.click('#refresh');
     await waitFor(async () => (await page.textContent('#audit')).includes('backup.deleted'), { message: 'deletion audited' });
     const audit = await page.textContent('#audit');
-    for (const action of ['client_lock.updated', 'enrollment_code.created', 'device.enrolled', 'profile.updated', 'settings.updated', 'announcement.sent', 'profiles.deleted', 'profiles.purged']) assert.ok(audit.includes(action), action);
+    for (const action of ['notifications.updated', 'device.command_sent', 'device.settings_updated', 'client_lock.updated', 'enrollment_code.created', 'device.enrolled', 'profile.updated', 'settings.updated', 'announcement.sent', 'profiles.deleted', 'profiles.purged']) assert.ok(audit.includes(action), action);
   });
 
   test('a display error does not sign out, and a reload keeps the session', async () => {

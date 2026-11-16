@@ -70,12 +70,30 @@ function relativeTime(value) {
   return date.toLocaleString();
 }
 
+// A form the administrator is editing is left alone when the dashboard refreshes; submitting it clears the mark.
+const untouched = selector => !$(selector).dataset.dirty;
+
 function render() {
-  for (const form of document.querySelectorAll('form[data-dirty]')) delete form.dataset.dirty;
   const settings = state.settings;
   $('#revision').textContent = state.revision;
   $('#device-count').textContent = state.devices.length;
   $('#profile-count').textContent = state.profiles.length;
+  if (untouched('#settings-form')) renderSettingsForm(settings);
+  renderSettingsHint(settings);
+  if (untouched('#proxy-form')) renderProxyForm(settings);
+  if (untouched('#lock-form')) {
+    const lock = settings.clientLock || {};
+    $('#lock-enabled').checked = lock.enabled === true;
+    $('#lock-idle').value = lock.idleMinutes || '';
+    $('#lock-system').checked = lock.lockOnSystemLock === true;
+  }
+  if (untouched('#notify-form')) renderNotifications();
+  if (untouched('#controls-form')) renderControls();
+  if (untouched('#offsite-form')) renderOffsite();
+  renderStatusOnly(settings);
+}
+
+function renderSettingsForm(settings) {
   $('#home-page').value = settings.homePage;
   $('#search-url').value = settings.searchUrl || '';
   $('#auto-share-mode').value = settings.autoShareCookies === false ? 'off' : settings.autoShareScope === 'listed' ? 'listed' : 'all';
@@ -83,13 +101,21 @@ function render() {
   updateShareSites();
   $('#allow-admin-enroll').checked = settings.allowAdminTokenEnrollment !== false;
   $('#min-version').value = settings.minimumClientVersion || '';
+  const primary = $('#primary-device');
+  primary.replaceChildren(new Option('Select automatically', ''));
+  for (const device of state.devices.filter(item => !item.revoked)) primary.append(new Option(`${device.name} (${device.id.slice(0, 8)})`, device.id));
+  primary.value = settings.primaryDeviceId || '';
+}
+
+function renderSettingsHint(settings) {
   const versions = state.devices.filter(device => !device.revoked && device.clientVersion).map(device => device.clientVersion);
   const newest = versions.reduce((best, version) => !best || versionAtLeast(version, best) ? version : best, '');
   const outdated = settings.minimumClientVersion ? state.devices.filter(device => !device.revoked && !(device.clientVersion && versionAtLeast(device.clientVersion, settings.minimumClientVersion))).length : 0;
   $('#min-version-hint').textContent = `Older browsers stop syncing and can only download the update through the proxy. Browsers 1.6 and newer install it and restart on their own.${newest ? ` Newest version in use: ${newest}.` : ''}${outdated ? ` ${outdated} browser(s) still need to update.` : ''}`;
+}
 
+function renderProxyForm(settings) {
   const proxy = settings.proxy || {};
-  const runtime = state.proxy || {};
   $('#proxy-enabled').checked = proxy.enabled === true;
   $('#proxy-host').value = proxy.host || '127.0.0.1';
   $('#proxy-port').value = proxy.port || 8899;
@@ -105,8 +131,12 @@ function render() {
   $('#limit-rate').value = proxy.rateLimitMbps || '';
   $('#record-destinations').checked = proxy.recordDestinations !== false;
   updatePolicyWarning();
+}
+
+function renderStatusOnly(settings) {
+  const proxy = settings.proxy || {};
+  const runtime = state.proxy || {};
   const lock = settings.clientLock || {};
-  $('#lock-enabled').checked = lock.enabled === true;
   $('#lock-state').textContent = lock.enabled ? 'On' : 'Off';
   $('#lock-state').className = lock.enabled ? 'badge' : 'badge off';
   $('#lock-code').placeholder = lock.hash ? 'Leave empty to keep the current code' : 'Choose an unlock code';
@@ -121,18 +151,13 @@ function render() {
     ? `${runtime.bindAddress}:${runtime.port} · ${runtime.activeConnections} active · ${runtime.totalConnections} total connection(s)`
     : runtime.lastError || 'Each enrolled browser authenticates with its own device token.';
 
-  const primary = $('#primary-device');
-  primary.replaceChildren(new Option('Select automatically', ''));
-  for (const device of state.devices.filter(item => !item.revoked)) primary.append(new Option(`${device.name} (${device.id.slice(0, 8)})`, device.id));
-  primary.value = settings.primaryDeviceId || '';
-
   renderDevices();
   // Forget selections for profiles that no longer exist (deleted elsewhere or by a restore).
   const existing = new Set(state.profiles.map(profile => profile.id));
   for (const id of [...selectedProfiles]) if (!existing.has(id)) selectedProfiles.delete(id);
   renderProfiles();
   updateBulkBar();
-  renderBookmarks();
+  if (untouched('#bookmarks-form')) renderBookmarks();
   renderCodes();
   renderAnnouncements();
   renderBackups();
@@ -191,7 +216,7 @@ function renderDevices() {
   const body = $('#devices');
   body.replaceChildren();
   if (!state.devices.length) {
-    body.innerHTML = '<tr><td colspan="8" class="empty">No browsers enrolled</td></tr>';
+    body.innerHTML = '<tr><td colspan="9" class="empty">No browsers enrolled</td></tr>';
     return;
   }
   const modes = { direct: 'Direct', managed: 'Managed', strict: 'Strict' };
@@ -204,6 +229,7 @@ function renderDevices() {
       + `<td>${device.revoked ? 'Revoked' : 'Active'}</td>`
       + `<td><button class="${device.revoked ? 'secondary' : 'danger'} toggle">${device.revoked ? 'Restore' : 'Revoke'}</button></td>`
       + '<td><button class="secondary limits" title="Proxy limits for this browser">Limits</button></td>'
+      + '<td><button class="secondary actions-button" title="Settings and actions for this browser">Manage</button></td>'
       + '<td><button class="ghost delete" title="Remove this browser from the list">Delete</button></td>';
     row.querySelector('.toggle').onclick = async () => {
       if (!device.revoked && !confirm(`Revoke ${device.name}? It can no longer sync or use the proxy, and its open proxy connections are closed.`)) return;
@@ -222,8 +248,81 @@ function renderDevices() {
       } catch (error) { toast(error.message, true); }
     };
     row.querySelector('.limits').onclick = () => toggleLimitsEditor(row, device);
+    row.querySelector('.actions-button').onclick = () => toggleDevicePanel(row, device);
+    if (device.pendingCommands?.length) row.children[4].insertAdjacentHTML('beforeend', `<br><span class="pending">${device.pendingCommands.length} action(s) waiting</span>`);
     body.append(row);
   }
+}
+
+const COMMAND_LABELS = { lock: 'Lock now', 'close-tabs': 'Close all tabs', 'clear-site': 'Clear cookies for a site', restart: 'Restart browser', 'open-url': 'Open a page' };
+
+function toggleDevicePanel(row, device) {
+  if (row.nextElementSibling?.classList.contains('device-row')) {
+    row.nextElementSibling.remove();
+    return;
+  }
+  const filter = device.siteFilter;
+  const panel = document.createElement('tr');
+  panel.className = 'limits-row device-row';
+  panel.innerHTML = `<td colspan="9"><div class="device-panel">
+    <strong>Actions for ${esc(device.name)}</strong>
+    <div class="buttons">
+      <button type="button" class="secondary" data-command="lock"${state.settings.clientLock?.enabled ? '' : ' disabled title="Turn on the unlock code first"'}>Lock now</button>
+      <button type="button" class="secondary" data-command="close-tabs">Close all tabs</button>
+      <button type="button" class="secondary" data-command="restart">Restart browser</button>
+      <label>Page to open<input name="openUrl" type="url" placeholder="https://example.com/"></label><button type="button" class="secondary" data-command="open-url">Open</button>
+      <label>Site<input name="clearSite" placeholder="github.com"></label><button type="button" class="danger" data-command="clear-site">Clear cookies</button>
+    </div>
+    <div class="pending">${(device.pendingCommands || []).map(command => `${esc(COMMAND_LABELS[command.type] || command.type)}${command.argument ? ` (${esc(command.argument)})` : ''} — waiting <button type="button" class="ghost" data-cancel="${esc(command.id)}">Cancel</button>`).join('<br>')}</div>
+    <form class="limits-form device-settings"><strong>Settings for this browser</strong>
+      <label>Home page<input name="homePage" type="url" placeholder="Shared home page"></label>
+      <label>Site filter<select name="filterMode"><option value="">Same as all browsers</option><option value="off">Any site</option><option value="allow">Only the sites listed</option><option value="block">Every site except those listed</option></select></label>
+      <label>Sites<input name="filterDomains" placeholder="github.com, gitlab.com"></label>
+      <label class="check"><input name="scheduleExempt" type="checkbox">Can be used outside the allowed hours</label>
+      <button>Save settings</button><button type="button" class="ghost cancel">Close</button>
+    </form>
+    <small class="hint">Actions run the next time the browser connects (within a second or two when it is online), once. Clearing cookies on the primary browser also removes that site's session from the vault.</small>
+  </div></td>`;
+  const form = panel.querySelector('form');
+  form.elements.homePage.value = device.homePage || '';
+  form.elements.filterMode.value = filter ? filter.mode : '';
+  form.elements.filterDomains.value = filter ? filter.domains.join(', ') : '';
+  form.elements.scheduleExempt.checked = device.scheduleExempt === true;
+  form.querySelector('.cancel').onclick = () => panel.remove();
+  form.onsubmit = async event => {
+    event.preventDefault();
+    const mode = form.elements.filterMode.value;
+    try {
+      await api(`/devices/${device.id}/settings`, {
+        method: 'PUT',
+        body: JSON.stringify({ homePage: form.elements.homePage.value, siteFilter: mode ? { mode, domains: lines(form.elements.filterDomains.value) } : null, scheduleExempt: form.elements.scheduleExempt.checked })
+      });
+      await load();
+      toast(`Settings saved for ${device.name}`);
+    } catch (error) { toast(error.message, true); }
+  };
+  for (const button of panel.querySelectorAll('[data-command]')) {
+    button.onclick = async () => {
+      const type = button.dataset.command;
+      const argument = type === 'open-url' ? panel.querySelector('[name=openUrl]').value : type === 'clear-site' ? panel.querySelector('[name=clearSite]').value : '';
+      if ((type === 'restart' || type === 'close-tabs' || type === 'clear-site') && !confirm(`${COMMAND_LABELS[type]} on ${device.name}?`)) return;
+      try {
+        await api(`/devices/${device.id}/commands`, { method: 'POST', body: JSON.stringify({ type, argument }) });
+        await load();
+        toast(`${COMMAND_LABELS[type]} sent to ${device.name}`);
+      } catch (error) { toast(error.message, true); }
+    };
+  }
+  for (const button of panel.querySelectorAll('[data-cancel]')) {
+    button.onclick = async () => {
+      try {
+        await api(`/devices/${device.id}/commands/${button.dataset.cancel}`, { method: 'DELETE' });
+        await load();
+        toast('Action cancelled');
+      } catch (error) { toast(error.message, true); }
+    };
+  }
+  row.after(panel);
 }
 
 function toggleLimitsEditor(row, device) {
@@ -236,7 +335,7 @@ function toggleLimitsEditor(row, device) {
   const fallback = value => value ? String(value) : 'unlimited';
   const editor = document.createElement('tr');
   editor.className = 'limits-row';
-  editor.innerHTML = `<td colspan="8"><form class="limits-form"><label>Open connections<input name="maxConnections" type="number" min="0" step="1" placeholder="default (${esc(fallback(proxy.maxConnectionsPerDevice))})"></label>`
+  editor.innerHTML = `<td colspan="9"><form class="limits-form"><label>Open connections<input name="maxConnections" type="number" min="0" step="1" placeholder="default (${esc(fallback(proxy.maxConnectionsPerDevice))})"></label>`
     + `<label>Data per month (GB)<input name="monthlyQuotaGb" type="number" min="0" step="0.1" placeholder="default (${esc(fallback(proxy.monthlyQuotaGb))})"></label>`
     + `<label>Speed (Mbps)<input name="rateLimitMbps" type="number" min="0" step="0.1" placeholder="default (${esc(fallback(proxy.rateLimitMbps))})"></label>`
     + '<button>Save limits</button><button type="button" class="ghost cancel">Close</button><small class="hint">Empty uses the default; 0 means unlimited for this browser.</small></form></td>';
@@ -255,6 +354,20 @@ function toggleLimitsEditor(row, device) {
   row.after(editor);
 }
 
+function healthBadge(profile) {
+  const health = profile.health || {};
+  if (!profile.enabled) return '';
+  const days = health.expiresAt ? (Date.parse(health.expiresAt) - Date.now()) / 86400000 : null;
+  const left = days === null ? '' : days >= 1 ? `${Math.floor(days)} d` : `${Math.max(0, Math.round(days * 24))} h`;
+  const text = {
+    ok: health.expiresAt ? `signed in · ${left} left` : 'signed in',
+    expiring: `expires in ${left}`,
+    'signed-out': 'signed out',
+    empty: 'no cookies'
+  }[health.state];
+  return text ? ` · <em class="health ${esc(health.state)}" title="${esc(health.expiresAt ? `Sign-in expires ${new Date(health.expiresAt).toLocaleString()}` : '')}">${esc(text)}</em>` : '';
+}
+
 function renderProfiles() {
   const container = $('#profiles');
   container.replaceChildren();
@@ -267,7 +380,7 @@ function renderProfiles() {
   for (const profile of [...state.profiles].sort((a, b) => a.domain.localeCompare(b.domain) || order.get(a.id) - order.get(b.id))) {
     const element = document.createElement('div');
     element.className = `profile${selectedProfiles.has(profile.id) ? ' selected' : ''}`;
-    element.innerHTML = `<label class="pick"><input type="checkbox" aria-label="Select ${esc(profile.domain)}"${selectedProfiles.has(profile.id) ? ' checked' : ''}><div><strong>${profile.enabled ? '●' : '○'} ${esc(profile.name)}</strong><span>${esc(profile.domain)} · ${profile.cookieCount} cookie(s)${profile.enabled ? '' : ' · disabled'}${profile.listed === false ? ' · <em class="unlisted" title="Not on the list of shared sites: the primary browser no longer updates it">not on the sharing list</em>' : ''}${profile.accounts > 1 ? ` · account of ${profile.accounts} · ${profile.usedBy?.length ? `used by ${esc(profile.usedBy.join(', '))}` : 'used by no browser'}` : ''}</span></div></label><button class="secondary">Edit</button>`;
+    element.innerHTML = `<label class="pick"><input type="checkbox" aria-label="Select ${esc(profile.domain)}"${selectedProfiles.has(profile.id) ? ' checked' : ''}><div><strong>${profile.enabled ? '●' : '○'} ${esc(profile.name)}</strong><span>${esc(profile.domain)} · ${profile.cookieCount} cookie(s)${profile.enabled ? '' : ' · disabled'}${profile.listed === false ? ' · <em class="unlisted" title="Not on the list of shared sites: the primary browser no longer updates it">not on the sharing list</em>' : ''}${healthBadge(profile)}${profile.accounts > 1 ? ` · account of ${profile.accounts} · ${profile.usedBy?.length ? `used by ${esc(profile.usedBy.join(', '))}` : 'used by no browser'}` : ''}</span></div></label><button class="secondary">Edit</button>`;
     element.querySelector('input').onchange = event => {
       if (event.target.checked) selectedProfiles.add(profile.id); else selectedProfiles.delete(profile.id);
       element.classList.toggle('selected', event.target.checked);
@@ -298,6 +411,89 @@ async function deleteProfiles(ids) {
   return result;
 }
 
+const EVENT_LABELS = {
+  'session.lost': 'A shared session is signed out',
+  'session.expiring': 'A shared session expires soon',
+  'device.offline': 'A browser goes offline',
+  'device.enrolled': 'A new browser enrolls',
+  'proxy.quota_reached': 'A browser reaches its proxy quota',
+  'browser.unlock_failed': 'A wrong unlock code is entered',
+  'backup.failed': 'A backup fails'
+};
+const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const lines = value => value.split(/[\s,]+/).filter(Boolean);
+
+function renderNotifications() {
+  const notify = state.notifications || {};
+  $('#notify-discord').value = notify.discordWebhookUrl || '';
+  $('#notify-telegram-token').value = notify.telegramBotToken || '';
+  $('#notify-telegram-chat').value = notify.telegramChatId || '';
+  $('#notify-line-token').value = notify.lineChannelToken || '';
+  $('#notify-line-to').value = notify.lineTo || '';
+  $('#notify-offline').value = notify.offlineMinutes || 30;
+  $('#notify-expiry').value = notify.expiryWarningDays || 3;
+  const enabled = new Set(notify.events || []);
+  $('#notify-events').replaceChildren(...(notify.allEvents || Object.keys(EVENT_LABELS)).map(event => {
+    const label = document.createElement('label');
+    label.className = 'check';
+    label.innerHTML = `<input type="checkbox" value="${esc(event)}"${enabled.has(event) ? ' checked' : ''}>${esc(EVENT_LABELS[event] || event)}`;
+    return label;
+  }));
+}
+
+function renderControls() {
+  const settings = state.settings;
+  const filter = settings.siteFilter || { mode: 'off', domains: [] };
+  $('#filter-mode').value = filter.mode;
+  $('#filter-domains').value = (filter.domains || []).join('\n');
+  const schedule = settings.schedule || {};
+  $('#schedule-enabled').checked = schedule.enabled === true;
+  $('#schedule-start').value = schedule.start || '09:00';
+  $('#schedule-end').value = schedule.end || '18:00';
+  $('#schedule-zone').value = schedule.timeZone || 'Asia/Bangkok';
+  const days = new Set(schedule.days || [1, 2, 3, 4, 5]);
+  $('#schedule-days').replaceChildren(...DAY_NAMES.map((name, index) => {
+    const label = document.createElement('label');
+    label.className = 'check';
+    label.innerHTML = `<input type="checkbox" value="${index}"${days.has(index) ? ' checked' : ''}>${name}`;
+    return label;
+  }));
+  const controls = settings.dataControls || {};
+  $('#block-downloads').checked = controls.blockDownloads === true;
+  $('#block-uploads').checked = controls.blockUploads === true;
+  $('#block-copy').checked = controls.blockCopy === true;
+  $('#block-domains').value = (controls.domains || []).join('\n');
+}
+
+function renderOffsite() {
+  const offsite = state.offsiteBackup || {};
+  $('#offsite-enabled').checked = offsite.enabled === true;
+  $('#offsite-endpoint').value = offsite.endpoint || '';
+  $('#offsite-region').value = offsite.region || '';
+  $('#offsite-bucket').value = offsite.bucket || '';
+  $('#offsite-prefix').value = offsite.prefix ?? 'shared-browser/';
+  $('#offsite-key').value = offsite.accessKeyId || '';
+  $('#offsite-secret').value = offsite.secretAccessKey || '';
+  $('#offsite-status').textContent = offsite.lastError
+    ? `Last upload failed: ${offsite.lastError}`
+    : offsite.lastUploadAt ? `Last uploaded ${offsite.lastUploadName} on ${new Date(offsite.lastUploadAt).toLocaleString()}.` : offsite.enabled ? 'Nothing uploaded yet.' : '';
+  $('#offsite-status').className = offsite.lastError ? 'warning-text' : 'hint';
+}
+
+function controlsPayload() {
+  return {
+    siteFilter: { mode: $('#filter-mode').value, domains: lines($('#filter-domains').value) },
+    schedule: {
+      enabled: $('#schedule-enabled').checked,
+      days: [...document.querySelectorAll('#schedule-days input:checked')].map(input => Number(input.value)),
+      start: $('#schedule-start').value,
+      end: $('#schedule-end').value,
+      timeZone: $('#schedule-zone').value.trim()
+    },
+    dataControls: { blockDownloads: $('#block-downloads').checked, blockUploads: $('#block-uploads').checked, blockCopy: $('#block-copy').checked, domains: lines($('#block-domains').value) }
+  };
+}
+
 function updateShareSites() {
   $('#auto-share-sites').hidden = $('#auto-share-mode').value !== 'listed';
 }
@@ -314,6 +510,7 @@ function settingsPayload(proxy) {
     minimumClientVersion: $('#min-version').value.trim(),
     networkPolicy: $('#network-policy').value,
     ipCheckUrl: $('#ip-check-url').value,
+    ...controlsPayload(),
     proxy: proxy || state.settings.proxy
   };
 }
@@ -352,6 +549,7 @@ function edit(profile = null) {
   $('#profile-id').value = profile?.id || '';
   $('#profile-name').value = profile?.name || '';
   $('#profile-domain').value = profile?.domain || '';
+  $('#profile-session-cookie').value = profile?.sessionCookie || '';
   $('#profile-enabled').checked = profile?.enabled !== false;
   $('#delete-profile').hidden = !profile;
   const shareAll = profile?.shareWithAllDevices !== false;
@@ -372,6 +570,7 @@ function edit(profile = null) {
 function bookmarkRow(bookmark = {}) {
   const row = $('#bookmark-template').content.firstElementChild.cloneNode(true);
   row.querySelector('.bookmark-title').value = bookmark.title || '';
+  row.querySelector('.bookmark-folder').value = bookmark.folder || '';
   row.querySelector('.bookmark-url').value = bookmark.url || '';
   row.querySelector('.remove').onclick = () => row.remove();
   row.querySelector('.move-up').onclick = () => { if (row.previousElementSibling) row.parentElement.insertBefore(row, row.previousElementSibling); };
@@ -548,11 +747,83 @@ $('#lock-form').onsubmit = async event => {
   if (code && code.length < 4) return toast('The unlock code must be at least 4 characters', true);
   if (enabled && !code && !state.settings.clientLock?.hash) return toast('Enter an unlock code', true);
   try {
-    await api('/client-lock', { method: 'PUT', body: JSON.stringify({ enabled, code }) });
+    await api('/client-lock', { method: 'PUT', body: JSON.stringify({ enabled, code, idleMinutes: Number($('#lock-idle').value) || 0, lockOnSystemLock: $('#lock-system').checked }) });
     $('#lock-code').value = '';
     await load();
     toast(enabled ? (code ? 'Unlock code saved. Browsers ask for it from now on' : 'Unlock code turned on') : 'Unlock code turned off');
   } catch (error) { toast(error.message, true); }
+};
+
+$('#notify-form').onsubmit = async event => {
+  event.preventDefault();
+  try {
+    await api('/notifications', {
+      method: 'PUT',
+      body: JSON.stringify({
+        discordWebhookUrl: $('#notify-discord').value,
+        telegramBotToken: $('#notify-telegram-token').value,
+        telegramChatId: $('#notify-telegram-chat').value,
+        lineChannelToken: $('#notify-line-token').value,
+        lineTo: $('#notify-line-to').value,
+        events: [...document.querySelectorAll('#notify-events input:checked')].map(input => input.value),
+        offlineMinutes: Number($('#notify-offline').value) || 30,
+        expiryWarningDays: Number($('#notify-expiry').value) || 3
+      })
+    });
+    await load();
+    toast('Notifications saved');
+  } catch (error) { toast(error.message, true); }
+};
+
+$('#notify-test').onclick = async () => {
+  try {
+    const result = await api('/notifications/test', { method: 'POST', body: '{}' });
+    const failed = result.results.filter(item => !item.ok);
+    toast(failed.length ? `Failed: ${failed.map(item => `${item.channel} (${item.error})`).join(', ')}` : `Test sent to ${result.results.map(item => item.channel).join(', ')}`, failed.length > 0);
+  } catch (error) { toast(error.message, true); }
+};
+
+$('#controls-form').onsubmit = async event => {
+  event.preventDefault();
+  try {
+    await api('/settings', { method: 'PUT', body: JSON.stringify(settingsPayload()) });
+    await load();
+    toast('Browsing controls saved');
+  } catch (error) { toast(error.message, true); }
+};
+
+$('#offsite-form').onsubmit = async event => {
+  event.preventDefault();
+  if ($('#offsite-enabled').checked && ['#offsite-endpoint', '#offsite-bucket', '#offsite-key', '#offsite-secret'].some(selector => !$(selector).value.trim())) {
+    return toast('Enter the endpoint, bucket, access key and secret key', true);
+  }
+  try {
+    await api('/offsite-backup', {
+      method: 'PUT',
+      body: JSON.stringify({
+        enabled: $('#offsite-enabled').checked,
+        endpoint: $('#offsite-endpoint').value,
+        region: $('#offsite-region').value,
+        bucket: $('#offsite-bucket').value,
+        prefix: $('#offsite-prefix').value,
+        accessKeyId: $('#offsite-key').value,
+        secretAccessKey: $('#offsite-secret').value
+      })
+    });
+    await load();
+    toast('Offsite backup saved');
+  } catch (error) { toast(error.message, true); }
+};
+
+$('#offsite-upload').onclick = async () => {
+  try {
+    const result = await api('/offsite-backup/upload', { method: 'POST', body: '{}' });
+    await load();
+    toast(`Uploaded ${result.name}`);
+  } catch (error) {
+    await load().catch(() => { });
+    toast(error.message, true);
+  }
 };
 
 $('#settings-form').onsubmit = async event => {
@@ -592,6 +863,7 @@ $('#bookmarks-form').onsubmit = async event => {
   event.preventDefault();
   const bookmarks = [...document.querySelectorAll('.bookmark')].map(row => ({
     title: row.querySelector('.bookmark-title').value,
+    folder: row.querySelector('.bookmark-folder').value,
     url: row.querySelector('.bookmark-url').value
   }));
   try {
@@ -770,6 +1042,7 @@ $('#profile-form').onsubmit = async event => {
       body: JSON.stringify({
         id,
         name: $('#profile-name').value,
+        sessionCookie: $('#profile-session-cookie').value.trim(),
         domain,
         enabled: $('#profile-enabled').checked,
         shareWithAllDevices: $('#share-all').checked,
@@ -794,6 +1067,7 @@ $('#delete-profile').onclick = async () => {
   } catch (error) { toast(error.message, true); }
 };
 
+document.addEventListener('submit', event => { delete event.target.dataset.dirty; }, true);
 document.addEventListener('input', event => {
   const form = event.target.closest?.('form');
   if (form && form.id !== 'login-form') form.dataset.dirty = 'true';
@@ -806,7 +1080,8 @@ document.addEventListener('click', event => {
 // the administrator is typing in a form.
 setInterval(() => {
   if (!state || document.hidden) return;
-  if (document.activeElement?.closest('form') || document.querySelector('form[data-dirty]') || document.querySelector('.limits-row') || !$('#editor').hidden) return;
+  // Forms being edited are kept as they are (see render), so only focus and open editors pause the refresh.
+  if (document.activeElement?.closest('form') || document.querySelector('.limits-row') || !$('#editor').hidden) return;
   load().catch(() => { });
 }, 15000);
 

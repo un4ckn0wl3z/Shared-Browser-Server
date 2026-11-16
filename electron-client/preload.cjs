@@ -3,6 +3,11 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('sharedBrowser', {
   bootstrap: () => ipcRenderer.invoke('browser:bootstrap'),
   unlock: (code) => ipcRenderer.invoke('browser:unlock', code),
+  downloads: () => ipcRenderer.invoke('browser:downloads'),
+  downloadAction: (id, action) => ipcRenderer.invoke('browser:download-action', id, action),
+  clearDownloads: () => ipcRenderer.invoke('browser:clear-downloads'),
+  onDownloads: (callback) => ipcRenderer.on('browser:downloads', (_, value) => callback(value)),
+  onDownloadStarted: (callback) => ipcRenderer.on('browser:download-started', (_, value) => callback(value)),
   onLock: (callback) => ipcRenderer.on('browser:lock', (_, value) => callback(value)),
   navigate: (url) => ipcRenderer.invoke('browser:navigate', url),
   back: () => ipcRenderer.invoke('browser:back'),

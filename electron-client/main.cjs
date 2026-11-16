@@ -1,4 +1,4 @@
-const { app, BrowserWindow, WebContentsView, Menu, Notification, clipboard, ipcMain: electronIpcMain, net, screen, session, safeStorage, shell, webContents } = require('electron');
+const { app, BrowserWindow, WebContentsView, Menu, Notification, clipboard, ipcMain: electronIpcMain, net, powerMonitor, screen, session, safeStorage, shell, webContents, webFrameMain } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const crypto = require('node:crypto');
@@ -64,6 +64,13 @@ let initialTabsRequested = false;
 // The minimum version the server requires while this browser is older; pages stay hidden until it updates.
 let updateRequired = '';
 let forcedInstallTimer;
+// Outside the allowed hours set by the administrator; pages stay hidden until they start again.
+let scheduleBlocked = false;
+// Addresses an administrator asked to open while pages were hidden.
+const pendingOpens = [];
+// Downloads of this session, newest first.
+const downloads = [];
+let nextDownloadId = 1;
 const tabs = new Map();
 
 function logFatal(error) {
@@ -115,7 +122,7 @@ function defaultConfig() {
     strictPrivacy: true,
     window: undefined,
     announcements: { dismissed: [], notified: [], pendingAcks: [] },
-    secrets: { deviceToken: '', enrollmentToken: '', unlockFailures: 0, cache: defaultSnapshot(), session: { tabs: [], active: 0 } }
+    secrets: { deviceToken: '', enrollmentToken: '', unlockFailures: 0, doneCommands: [], cache: defaultSnapshot(), session: { tabs: [], active: 0 } }
   };
 }
 
@@ -165,6 +172,7 @@ function loadConfig() {
         deviceToken: String(secrets?.deviceToken || ''),
         enrollmentToken: String(secrets?.enrollmentToken || ''),
         unlockFailures: Math.max(0, Math.floor(Number(secrets?.unlockFailures) || 0)),
+        doneCommands: stringList(secrets?.doneCommands).slice(-100),
         cache: normalizeSnapshot(secrets?.cache),
         session: {
           tabs: Array.isArray(secrets?.session?.tabs) ? secrets.session.tabs.filter(url => /^https?:\/\//i.test(String(url))).slice(0, MAX_RESTORED_TABS) : [],
@@ -205,6 +213,11 @@ function normalizeSnapshot(input) {
   if (typeof input.settings.searchUrl !== 'string') input.settings.searchUrl = fallback.settings.searchUrl;
   input.settings.proxy ||= fallback.settings.proxy;
   input.profiles = Array.isArray(input.profiles) ? input.profiles : [];
+  input.commands = Array.isArray(input.commands) ? input.commands.filter(item => item && typeof item.id === 'string' && typeof item.type === 'string') : [];
+  const settings = input.settings;
+  settings.siteFilter = settings.siteFilter && ['off', 'allow', 'block'].includes(settings.siteFilter.mode) ? { mode: settings.siteFilter.mode, domains: stringList(settings.siteFilter.domains).map(normalizedDomain) } : { mode: 'off', domains: [] };
+  settings.schedule = settings.schedule && typeof settings.schedule === 'object' ? settings.schedule : { enabled: false };
+  settings.dataControls = settings.dataControls && typeof settings.dataControls === 'object' ? { ...settings.dataControls, domains: stringList(settings.dataControls.domains).map(normalizedDomain) } : { domains: [] };
   // Servers before 1.4 do not send accounts; the account button then stays hidden.
   input.accounts = Array.isArray(input.accounts)
     ? input.accounts.filter(item => item && typeof item.id === 'string' && typeof item.domain === 'string')
@@ -337,7 +350,12 @@ async function openInitialTabs() {
     engageLock();
     return;
   }
-  if (updateRequired) return;
+  if (config.secrets.deviceToken && !scheduleBlocked && !scheduleOpen()) {
+    scheduleBlocked = true;
+    hidePages();
+    send('browser:lock', lockState());
+  }
+  if (updateRequired || scheduleBlocked) return;
   const { tabs: urls, active } = config.secrets.session;
   if (!urls.length) {
     await addTab(config.secrets.cache.settings.homePage);
@@ -524,6 +542,7 @@ function loadOptions(details) {
 // Shared by tabs and popup windows so every page gets the same popup, menu, and shortcut handling.
 function configurePageContents(webContents) {
   applyWebRtcPolicy(webContents);
+  protectPage(webContents);
   webContents.setWindowOpenHandler(details => {
     // Real popups (window.open with features) must stay attached to their opener for
     // sign-in, OAuth, and approval flows that report back through window.opener.
@@ -545,17 +564,18 @@ function configurePageContents(webContents) {
 
 function showContextMenu(webContents, params) {
   const template = [];
+  const rules = dataRules(params.pageURL || webContents.getURL());
   if (params.linkURL && /^https?:/i.test(params.linkURL)) {
     template.push(
       { label: 'Open link in new tab', click: () => addTab(params.linkURL, { referrer: { url: params.pageURL, policy: 'strict-origin-when-cross-origin' } }).catch(error => status(error.message, true)) },
-      { label: 'Copy link address', click: () => clipboard.writeText(params.linkURL) },
+      ...(rules.copy ? [] : [{ label: 'Copy link address', click: () => clipboard.writeText(params.linkURL) }]),
       { type: 'separator' }
     );
   }
   if (params.mediaType === 'image' && /^https?:/i.test(params.srcURL)) {
     template.push(
       { label: 'Open image in new tab', click: () => addTab(params.srcURL).catch(error => status(error.message, true)) },
-      { label: 'Copy image address', click: () => clipboard.writeText(params.srcURL) },
+      ...(rules.copy ? [] : [{ label: 'Copy image address', click: () => clipboard.writeText(params.srcURL) }]),
       { type: 'separator' }
     );
   }
@@ -564,13 +584,13 @@ function showContextMenu(webContents, params) {
       { label: 'Undo', role: 'undo', enabled: params.editFlags.canUndo },
       { label: 'Redo', role: 'redo', enabled: params.editFlags.canRedo },
       { type: 'separator' },
-      { label: 'Cut', role: 'cut', enabled: params.editFlags.canCut },
-      { label: 'Copy', role: 'copy', enabled: params.editFlags.canCopy },
+      { label: 'Cut', role: 'cut', enabled: params.editFlags.canCut && !rules.copy },
+      { label: 'Copy', role: 'copy', enabled: params.editFlags.canCopy && !rules.copy },
       { label: 'Paste', role: 'paste', enabled: params.editFlags.canPaste },
       { label: 'Select all', role: 'selectAll', enabled: params.editFlags.canSelectAll },
       { type: 'separator' }
     );
-  } else if (params.selectionText.trim()) {
+  } else if (params.selectionText.trim() && !rules.copy) {
     template.push({ label: 'Copy', role: 'copy' }, { type: 'separator' });
   }
   template.push(
@@ -578,7 +598,7 @@ function showContextMenu(webContents, params) {
     { label: 'Forward', enabled: webContents.navigationHistory.canGoForward(), click: () => webContents.navigationHistory.goForward() },
     { label: 'Reload', click: () => webContents.reload() },
     { type: 'separator' },
-    { label: 'Inspect', click: () => webContents.inspectElement(params.x, params.y) }
+    { label: 'Inspect', enabled: !(rules.uploads || rules.copy || rules.downloads), click: () => webContents.inspectElement(params.x, params.y) }
   );
   Menu.buildFromTemplate(template).popup({ window: BrowserWindow.fromWebContents(webContents) || mainWindow });
 }
@@ -612,7 +632,10 @@ function handleShortcut(input, source) {
   if ((command && key === 'r') || key === 'f5') return run(() => input.shift || (key === 'f5' && command) ? web.reloadIgnoringCache() : web.reload());
   if ((input.alt && !command && key === 'arrowleft') || (mac && command && key === '[')) return run(() => web.navigationHistory.canGoBack() && web.navigationHistory.goBack());
   if ((input.alt && !command && key === 'arrowright') || (mac && command && key === ']')) return run(() => web.navigationHistory.canGoForward() && web.navigationHistory.goForward());
-  if (key === 'f12' || (command && input.shift && key === 'i')) return run(() => web.toggleDevTools());
+  if (key === 'f12' || (command && input.shift && key === 'i')) {
+    const rules = dataRules(web.getURL());
+    return run(() => rules.uploads || rules.copy || rules.downloads ? status('Developer tools are disabled on this site by the administrator', true) : web.toggleDevTools());
+  }
   if (command && (key === '=' || key === '+')) return run(() => web.setZoomLevel(Math.min(web.getZoomLevel() + 0.5, 5)));
   if (command && key === '-') return run(() => web.setZoomLevel(Math.max(web.getZoomLevel() - 0.5, -5)));
   if (command && key === '0') return run(() => web.setZoomLevel(0));
@@ -840,6 +863,8 @@ async function installSnapshot(snapshot, previous) {
   // Turning the unlock code on locks running browsers too; turning it off releases a locked one.
   if (isLocked()) engageLock();
   else if (lockShown) await releaseLock();
+  await applySchedule();
+  runCommands(snapshot.commands).catch(error => status(error.message, true));
   publishTabs();
   publishNavigationState();
 }
@@ -1097,7 +1122,7 @@ function isLocked() {
 
 // Pages are hidden while the unlock screen or the update-required screen is shown.
 function pagesHidden() {
-  return lockShown || Boolean(updateRequired);
+  return lockShown || Boolean(updateRequired) || scheduleBlocked;
 }
 
 function hidePages() {
@@ -1114,6 +1139,7 @@ async function showPages() {
   for (const item of tabs.values()) if (!item.view.webContents.isDestroyed()) item.view.webContents.setAudioMuted(false);
   if (tabs.size) await selectTab(activeTabId ?? [...tabs.keys()][0]);
   else if (initialTabsRequested) await openInitialTabs();
+  while (pendingOpens.length && !pagesHidden()) await addTab(pendingOpens.shift());
 }
 
 function engageLock() {
@@ -1134,7 +1160,8 @@ function lockState() {
   return {
     locked: lockShown,
     deviceName: config.deviceName,
-    update: updateRequired ? { version: updateRequired, current: app.getVersion() } : null
+    update: updateRequired ? { version: updateRequired, current: app.getVersion() } : null,
+    schedule: scheduleBlocked ? scheduleText() : null
   };
 }
 
@@ -1211,6 +1238,292 @@ async function unlock(code) {
   saveConfig();
   await releaseLock();
   return { ok: true };
+}
+
+// ---- Idle lock ----------------------------------------------------------------------------------
+// With an unlock code in use, the browser locks again after a period without keyboard or mouse use, and
+// optionally when the computer's screen locks or it sleeps.
+
+function relock() {
+  if (!clientLock() || !config.secrets.deviceToken) return false;
+  unlocked = false;
+  engageLock();
+  return true;
+}
+
+function watchIdle() {
+  const lockWithSystem = () => { if (unlocked && clientLock()?.lockOnSystemLock) relock(); };
+  powerMonitor.on('lock-screen', lockWithSystem);
+  powerMonitor.on('suspend', lockWithSystem);
+  setInterval(() => {
+    const lock = clientLock();
+    if (!unlocked || lockShown || !lock || !(Number(lock.idleMinutes) > 0)) return;
+    if (powerMonitor.getSystemIdleTime() >= Number(lock.idleMinutes) * 60) relock();
+  }, 5000);
+}
+
+// ---- Allowed hours ------------------------------------------------------------------------------
+
+const WEEKDAYS = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+
+function minutesOf(value) {
+  const match = /^(\d{2}):(\d{2})$/.exec(String(value || ''));
+  return match ? Number(match[1]) * 60 + Number(match[2]) : NaN;
+}
+
+// True when the browser may be used now. Times are in the administrator's time zone, and a range such as
+// 22:00-06:00 continues past midnight.
+function scheduleOpen(now = new Date()) {
+  const schedule = config.secrets.cache.settings.schedule;
+  if (!schedule?.enabled) return true;
+  const start = minutesOf(schedule.start);
+  const end = minutesOf(schedule.end);
+  const days = Array.isArray(schedule.days) ? schedule.days.map(Number) : [];
+  if (Number.isNaN(start) || Number.isNaN(end)) return true;
+  let parts;
+  try {
+    parts = Object.fromEntries(new Intl.DateTimeFormat('en-US', { timeZone: schedule.timeZone || 'UTC', weekday: 'short', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })
+      .formatToParts(now).map(part => [part.type, part.value]));
+  } catch {
+    return true;
+  }
+  const day = WEEKDAYS[parts.weekday];
+  const minute = Number(parts.hour) * 60 + Number(parts.minute);
+  if (start === end) return days.includes(day);
+  if (start < end) return days.includes(day) && minute >= start && minute < end;
+  return (days.includes(day) && minute >= start) || (days.includes((day + 6) % 7) && minute < end);
+}
+
+function scheduleText() {
+  const schedule = config.secrets.cache.settings.schedule || {};
+  const names = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const days = (schedule.days || []).map(day => names[day]).filter(Boolean).join(', ');
+  return { days, start: schedule.start, end: schedule.end, timeZone: schedule.timeZone };
+}
+
+async function applySchedule() {
+  const blocked = Boolean(config.secrets.deviceToken) && !scheduleOpen();
+  if (blocked === scheduleBlocked) return;
+  scheduleBlocked = blocked;
+  if (blocked) hidePages();
+  send('browser:lock', lockState());
+  if (!blocked) await showPages();
+}
+
+// ---- Administrator actions ----------------------------------------------------------------------
+
+async function runCommands(commands) {
+  const done = new Set(config.secrets.doneCommands);
+  for (const command of commands || []) {
+    if (!done.has(command.id)) {
+      done.add(command.id);
+      config.secrets.doneCommands = [...done].slice(-100);
+      saveConfig();
+      try { await runCommand(command); } catch (error) { status(`Administrator action failed — ${error.message}`, true); }
+    }
+    // Acknowledged even when repeated, so a lost acknowledgement is retried.
+    api(`/api/client/commands/${encodeURIComponent(command.id)}/ack`, { method: 'POST', body: '{}' }).catch(() => { });
+  }
+}
+
+async function runCommand(command) {
+  switch (command.type) {
+    case 'lock':
+      status(relock() ? 'Locked by the administrator' : 'The administrator asked to lock this browser, but no unlock code is set');
+      break;
+    case 'close-tabs':
+      closedTabs.length = 0;
+      config.secrets.session = { tabs: [], active: 0 };
+      saveConfig();
+      for (const id of [...tabs.keys()]) await closeTab(id);
+      status('All tabs were closed by the administrator');
+      break;
+    case 'clear-site': {
+      const domain = normalizedDomain(command.argument);
+      if (!domain) return;
+      await clearSiteCookies(domain);
+      for (const [key, entry] of appliedCookies) if (domainWithin(entry.domain, domain)) appliedCookies.delete(key);
+      for (const tab of tabs.values()) if (!tab.view.webContents.isDestroyed() && domainWithin(hostOf(tab.view.webContents.getURL()), domain)) tab.view.webContents.reload();
+      status(`Cookies for ${domain} were cleared by the administrator`);
+      break;
+    }
+    case 'open-url':
+      if (!/^https?:\/\//i.test(command.argument)) return;
+      if (pagesHidden()) pendingOpens.push(command.argument);
+      else await addTab(command.argument);
+      break;
+    case 'restart':
+      saveSessionState();
+      app.relaunch();
+      app.quit();
+      break;
+    default:
+      break;
+  }
+}
+
+// ---- Site filter --------------------------------------------------------------------------------
+// Decides which sites pages may open (address bar, links, redirects, popups). Resources a page loads from
+// other sites are not filtered, so allowed sites keep working.
+
+function siteAllowed(url) {
+  const host = hostOf(url);
+  if (!host) return true;
+  const filter = config.secrets.cache.settings.siteFilter;
+  if (!filter || filter.mode === 'off') return true;
+  const listed = filter.domains.some(domain => domainWithin(host, domain));
+  return filter.mode === 'allow' ? listed : !listed;
+}
+
+function blockedPage(url) {
+  const host = hostOf(url).replace(/[<>&"]/g, '');
+  const html = `<!doctype html><meta charset="utf-8"><title>Blocked</title><body style="font:15px system-ui;margin:12vh auto;max-width:520px;color:#263246"><h1 style="font-size:22px">${host} is blocked</h1><p>Your administrator does not allow this browser to open this site.</p></body>`;
+  return `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
+}
+
+function filterNavigation() {
+  browserSession.webRequest.onBeforeRequest({ urls: ['http://*/*', 'https://*/*'] }, (details, callback) => {
+    if ((details.resourceType === 'mainFrame' || details.resourceType === 'subFrame') && !siteAllowed(details.url)) {
+      callback({ cancel: true });
+      const web = details.webContents || (details.webContentsId ? webContents.fromId(details.webContentsId) : undefined);
+      if (details.resourceType === 'mainFrame' && web && !web.isDestroyed()) setImmediate(() => web.loadURL(blockedPage(details.url)).catch(() => { }));
+      status(`${hostOf(details.url)} is blocked by the administrator`, true);
+      return;
+    }
+    callback({});
+  });
+}
+
+// ---- Data controls ------------------------------------------------------------------------------
+// Downloads, file uploads and copying text can be blocked on chosen sites (all sites when none are listed).
+// This keeps honest users from moving data out; it is not protection against screenshots or a determined user.
+
+function dataRules(url) {
+  const controls = config.secrets.cache.settings.dataControls || {};
+  const host = hostOf(url);
+  const applies = host && (!controls.domains?.length || controls.domains.some(domain => domainWithin(host, domain)));
+  return applies ? { downloads: Boolean(controls.blockDownloads), uploads: Boolean(controls.blockUploads), copy: Boolean(controls.blockCopy) } : { downloads: false, uploads: false, copy: false };
+}
+
+function guardScript(rules) {
+  return `(() => {
+  if (window.__sharedBrowserGuard) return;
+  window.__sharedBrowserGuard = true;
+  const stop = event => { event.preventDefault(); event.stopImmediatePropagation(); };
+  if (${rules.uploads}) {
+    document.addEventListener('click', event => {
+      const target = event.target;
+      const input = target && (target.matches?.('input[type=file]') ? target : target.control?.type === 'file' ? target.control : null);
+      if (input) stop(event);
+    }, true);
+    for (const type of ['dragover', 'drop']) document.addEventListener(type, event => { if (event.dataTransfer && Array.from(event.dataTransfer.types || []).includes('Files')) stop(event); }, true);
+    const picker = HTMLInputElement.prototype.showPicker;
+    HTMLInputElement.prototype.showPicker = function () { if (this.type === 'file') throw new DOMException('File uploads are blocked by the administrator', 'NotAllowedError'); return picker.call(this); };
+    if (window.showOpenFilePicker) window.showOpenFilePicker = () => Promise.reject(new DOMException('File uploads are blocked by the administrator', 'NotAllowedError'));
+    if (window.showDirectoryPicker) window.showDirectoryPicker = window.showOpenFilePicker;
+  }
+  if (${rules.copy}) {
+    for (const type of ['copy', 'cut']) document.addEventListener(type, stop, true);
+    if (navigator.clipboard) {
+      const refuse = () => Promise.reject(new DOMException('Copying is blocked by the administrator', 'NotAllowedError'));
+      navigator.clipboard.writeText = refuse;
+      navigator.clipboard.write = refuse;
+    }
+  }
+})();`;
+}
+
+function guardFrame(frame) {
+  if (!frame || frame.isDestroyed?.()) return;
+  const rules = dataRules(frame.url);
+  if (rules.uploads || rules.copy) frame.executeJavaScript(guardScript(rules)).catch(() => { });
+}
+
+function protectPage(web) {
+  web.on('dom-ready', () => guardFrame(web.mainFrame));
+  web.on('did-frame-finish-load', (_event, isMainFrame, processId, routingId) => {
+    if (!isMainFrame) guardFrame(webFrameMain.fromId(processId, routingId));
+  });
+  // Developer tools would get around the guards, so they stay closed on protected sites.
+  web.on('devtools-opened', () => {
+    const rules = dataRules(web.getURL());
+    if (rules.uploads || rules.copy || rules.downloads) web.closeDevTools();
+  });
+}
+
+// ---- Downloads ----------------------------------------------------------------------------------
+
+function downloadSummary(entry) {
+  const { item, ...rest } = entry;
+  return rest;
+}
+
+function publishDownloads() {
+  send('browser:downloads', downloads.map(downloadSummary));
+}
+
+function uniqueDownloadPath(name) {
+  const folder = app.getPath('downloads');
+  fs.mkdirSync(folder, { recursive: true });
+  const parsed = path.parse(name.replace(/[\\/:*?"<>|]/g, '_') || 'download');
+  let candidate = path.join(folder, parsed.base);
+  for (let index = 1; fs.existsSync(candidate) && index < 1000; index++) candidate = path.join(folder, `${parsed.name} (${index})${parsed.ext}`);
+  return candidate;
+}
+
+function trackDownload(event, item, source) {
+  const pageUrl = source && !source.isDestroyed() ? source.getURL() : '';
+  const entry = { id: nextDownloadId++, name: item.getFilename(), url: item.getURL(), path: '', state: 'progressing', received: 0, total: item.getTotalBytes(), startedAt: Date.now(), item };
+  downloads.unshift(entry);
+  if (downloads.length > 100) downloads.length = 100;
+  if (dataRules(pageUrl || item.getURL()).downloads) {
+    event.preventDefault();
+    entry.state = 'blocked';
+    status(`Downloads are blocked on ${hostOf(pageUrl || item.getURL())} by the administrator`, true);
+    publishDownloads();
+    return;
+  }
+  entry.path = uniqueDownloadPath(entry.name);
+  item.setSavePath(entry.path);
+  status(`Downloading ${entry.name}…`);
+  let lastPublish = 0;
+  item.on('updated', (_event, state) => {
+    entry.state = state === 'interrupted' ? 'interrupted' : item.isPaused() ? 'paused' : 'progressing';
+    entry.received = item.getReceivedBytes();
+    entry.total = item.getTotalBytes();
+    if (Date.now() - lastPublish > 400) { lastPublish = Date.now(); publishDownloads(); }
+    if (state === 'progressing' && !item.isPaused() && entry.total > 0) status(`Downloading ${entry.name} (${Math.round(entry.received / entry.total * 100)}%)…`);
+  });
+  item.once('done', (_event, state) => {
+    entry.state = state;
+    entry.received = item.getReceivedBytes();
+    entry.item = undefined;
+    if (state === 'completed') status(`Downloaded ${entry.name}`);
+    else if (state === 'interrupted') status(`Download failed: ${entry.name}`, true);
+    else status(`Download cancelled: ${entry.name}`);
+    publishDownloads();
+  });
+  publishDownloads();
+  send('browser:download-started', downloadSummary(entry));
+}
+
+function downloadAction(id, action) {
+  const entry = downloads.find(item => item.id === Number(id));
+  if (!entry) return;
+  if (action === 'pause') entry.item?.pause();
+  else if (action === 'resume' && entry.item?.canResume()) entry.item.resume();
+  else if (action === 'cancel') entry.item?.cancel();
+  else if (action === 'open' && entry.state === 'completed') shell.openPath(entry.path);
+  else if (action === 'show' && entry.path) shell.showItemInFolder(entry.path);
+  else if (action === 'remove' && !entry.item) downloads.splice(downloads.indexOf(entry), 1);
+  if (action === 'pause') entry.state = 'paused';
+  if (action === 'resume') entry.state = 'progressing';
+  publishDownloads();
+}
+
+function clearDownloads() {
+  for (let index = downloads.length - 1; index >= 0; index--) if (!downloads[index].item) downloads.splice(index, 1);
+  publishDownloads();
 }
 
 // ---- Accounts -----------------------------------------------------------------------------------
@@ -1528,9 +1841,21 @@ function showBookmarksMenu(position) {
     if (newTab || !web || web.isDestroyed()) addTab(url).catch(error => status(error.message, true));
     else web.loadURL(normalizeAddress(url)).catch(error => status(error.message, true));
   };
-  const template = bookmarks.length
-    ? bookmarks.map(item => ({ label: String(item.title || item.url).slice(0, 80).replace(/&/g, '&&'), toolTip: item.url, click: (_item, _window, event) => open(item.url, event) }))
-    : [{ label: 'No shared bookmarks yet', enabled: false }];
+  const entry = item => ({ label: String(item.title || item.url).slice(0, 80).replace(/&/g, '&&'), toolTip: item.url, click: (_item, _window, event) => open(item.url, event) });
+  // Bookmarks with a folder are grouped in submenus, in the order the folders first appear.
+  const folders = new Map();
+  const template = [];
+  for (const item of bookmarks) {
+    const folder = String(item.folder || '').trim();
+    if (!folder) { template.push(entry(item)); continue; }
+    if (!folders.has(folder)) {
+      const submenu = [];
+      folders.set(folder, submenu);
+      template.push({ label: `📁 ${folder.slice(0, 60).replace(/&/g, '&&')}`, submenu });
+    }
+    folders.get(folder).push(entry(item));
+  }
+  if (!template.length) template.push({ label: 'No shared bookmarks yet', enabled: false });
   template.push(
     { type: 'separator' },
     { label: 'Hold Ctrl (⌘) or Shift to open in a new tab', enabled: false },
@@ -1549,20 +1874,7 @@ function activeWebContents() {
 }
 
 function configureDownloads() {
-  browserSession.on('will-download', (_event, item) => {
-    const name = item.getFilename();
-    status(`Downloading ${name}…`);
-    item.on('updated', (_e, state) => {
-      if (state !== 'progressing' || item.isPaused()) return;
-      const total = item.getTotalBytes();
-      if (total > 0) status(`Downloading ${name} (${Math.round(item.getReceivedBytes() / total * 100)}%)…`);
-    });
-    item.once('done', (_e, state) => {
-      if (state === 'completed') status(`Downloaded ${name}`);
-      else if (state === 'interrupted') status(`Download failed: ${name}`, true);
-      else status(`Download cancelled: ${name}`);
-    });
-  });
+  browserSession.on('will-download', trackDownload);
 }
 
 function proxyLogin(authInfo, callback) {
@@ -1693,6 +2005,9 @@ function registerIpc() {
     })
   };
   ipcMain.handle('browser:unlock', (_, code) => unlock(code));
+  ipcMain.handle('browser:downloads', () => downloads.map(downloadSummary));
+  ipcMain.handle('browser:download-action', (_, id, action) => downloadAction(id, String(action)));
+  ipcMain.handle('browser:clear-downloads', clearDownloads);
   ipcMain.handle('browser:check-updates', checkForUpdates);
   ipcMain.handle('browser:install-update', installUpdate);
   ipcMain.handle('browser:bootstrap', () => ({ lock: lockState(), config: publicConfig(), update: updateState, tabs: tabSummaries(), bookmarks: config.secrets.cache.bookmarks, announcements: visibleAnnouncements() }));
@@ -1822,6 +2137,9 @@ app.whenReady().then(async () => {
   for (const item of [browserSession, session.fromPartition(UPDATER_PARTITION, { cache: false })]) item.setCertificateVerifyProc(verifyCertificate);
   configurePrivacyPermissions();
   configureDownloads();
+  filterNavigation();
+  watchIdle();
+  setInterval(() => applySchedule().catch(() => { }), 20000);
   registerIpc();
   setupUpdater();
   createWindow();
