@@ -75,6 +75,18 @@ describe('dashboard', () => {
     assert.equal((await server.status()).announcements[0].level, 'critical');
   });
 
+  test('lists the accounts of a site and the browsers using them', async () => {
+    // A second account for dash.example; the first one is limited to WB1, so WB2 uses the new one.
+    await page.click('#new-profile');
+    await page.fill('#profile-name', 'work');
+    await page.fill('#profile-domain', 'dash.example');
+    await page.click('#cookies .remove');
+    await page.click('#profile-form .actions button');
+    await waitFor(async () => /account of 2/.test(await page.textContent('#profiles')), { message: 'accounts listed' });
+    assert.match(await page.textContent('.profile:has-text("work")'), /account of 2 · used by WB2/);
+    assert.match(await page.textContent('.profile:has-text("dash.example · 1 cookie")'), /used by WB1/);
+  });
+
   test('deletes selected profiles and purges the rest', async () => {
     for (const domain of ['bulk-a.example', 'bulk-b.example', 'bulk-c.example']) {
       await server.admin('/profiles', 'POST', { name: domain, domain, enabled: true, cookies: [{ name: 'c', value: '1', domain, path: '/', secure: true, httpOnly: true, sameSite: 'Lax' }] });

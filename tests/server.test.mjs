@@ -95,6 +95,71 @@ describe('management API', () => {
     await assert.rejects(server.admin('/profiles', 'POST', { name: 'Nobody', domain: 'nobody.example', enabled: true, shareWithAllDevices: false, allowedDeviceIds: [], cookies: [] }), /Select at least one/);
   });
 
+  test('a site can have several accounts and each browser switches between them', async () => {
+    const primary = await server.enroll(randomDeviceId(), 'accounts-primary');
+    const other = await server.enroll(randomDeviceId(), 'accounts-other');
+    await server.settings({ primaryDeviceId: primary.id });
+    const snapshot = async device => (await server.device(device, '/snapshot')).json();
+    const site = async device => {
+      const data = await snapshot(device);
+      return { profiles: data.profiles.filter(item => item.domain === 'git.example'), accounts: data.accounts.filter(item => item.domain === 'git.example'), revision: data.revision };
+    };
+    const alice = await server.admin('/profiles', 'POST', { name: 'alice', domain: 'git.example', enabled: true, cookies: [cookie('user', 'alice', 'git.example')] });
+    // The same name twice is refused; a different name adds a second account.
+    await assert.rejects(server.admin('/profiles', 'POST', { name: 'Alice', domain: 'git.example', enabled: true, cookies: [] }), /already has an account named/);
+    const bob = await server.admin('/profiles', 'POST', { name: 'bob', domain: 'git.example', enabled: true, cookies: [cookie('user', 'bob', 'git.example')] });
+
+    // Browsers start on the first account and only receive its cookies.
+    let view = await site(other);
+    assert.deepEqual(view.profiles.map(item => item.cookies[0].value), ['alice']);
+    assert.deepEqual(view.accounts.map(item => [item.name, item.active, item.cookieCount]), [['alice', true, 1], ['bob', false, 1]]);
+    assert.equal(view.accounts.some(item => 'cookies' in item), false);
+
+    // Switching changes only that browser, and does not wake the others with a new revision.
+    const before = view.revision;
+    const switched = await server.device(other, `/accounts/${bob.id}/switch`, 'POST');
+    assert.equal(switched.status, 200);
+    assert.deepEqual((await switched.json()).profiles.filter(item => item.domain === 'git.example').map(item => item.cookies[0].value), ['bob']);
+    view = await site(other);
+    assert.equal(view.revision, before);
+    assert.deepEqual(view.accounts.map(item => item.active), [false, true]);
+    assert.deepEqual((await site(primary)).profiles.map(item => item.cookies[0].value), ['alice']);
+    assert.equal((await server.device(other, `/snapshot?since=${before}`)).status, 204);
+    let listed = (await server.status()).profiles.filter(item => item.domain === 'git.example');
+    assert.deepEqual(listed.map(item => [item.name, item.accounts, item.usedBy.includes('accounts-other'), item.usedBy.includes('accounts-primary')]), [['alice', 2, false, true], ['bob', 2, true, false]]);
+
+    // The primary browser's cookies go to the account it uses.
+    await server.device(primary, `/accounts/${bob.id}/switch`, 'POST');
+    await server.device(primary, '/sync', 'POST', { pageUrl: 'https://git.example/', complete: true, cookies: [cookie('user', 'bob-2', 'git.example')] });
+    listed = (await server.status()).profiles.filter(item => item.domain === 'git.example');
+    assert.deepEqual(listed.map(item => item.cookies.map(entry => entry.name)), [['user'], ['user']]);
+    assert.deepEqual((await site(other)).profiles.map(item => item.cookies[0].value), ['bob-2']);
+    assert.deepEqual((await site(primary)).profiles.map(item => item.cookies[0].value), ['bob-2']);
+
+    // Only the primary browser adds accounts; the new one starts empty and becomes its account.
+    const denied = await server.device(other, '/accounts', 'POST', { name: 'carol', pageUrl: 'https://www.git.example/login' });
+    assert.equal(denied.status, 403);
+    const created = await server.device(primary, '/accounts', 'POST', { name: 'carol', pageUrl: 'https://www.git.example/login' });
+    assert.equal(created.status, 201);
+    const carol = (await created.json()).accounts.find(item => item.name === 'carol');
+    assert.deepEqual([carol.domain, carol.active, carol.cookieCount], ['git.example', true, 0]);
+    assert.equal((await server.device(primary, '/accounts', 'POST', { name: 'CAROL', pageUrl: 'https://git.example/' })).status, 400);
+    await server.device(primary, '/sync', 'POST', { pageUrl: 'https://git.example/', complete: true, cookies: [cookie('user', 'carol', 'git.example')] });
+    listed = (await server.status()).profiles.filter(item => item.domain === 'git.example');
+    assert.deepEqual(listed.map(item => [item.name, item.cookies.length]), [['alice', 1], ['bob', 1], ['carol', 1]]);
+    assert.equal((await site(other)).accounts.length, 3);
+
+    // An account the browser may not use cannot be selected; a disabled one falls back to the first.
+    const hidden = await server.admin('/profiles', 'POST', { name: 'hidden', domain: 'git.example', enabled: true, shareWithAllDevices: false, allowedDeviceIds: [primary.id], cookies: [] });
+    assert.equal((await server.device(other, `/accounts/${hidden.id}/switch`, 'POST')).status, 404);
+    await server.admin(`/profiles/${bob.id}`, 'PUT', { name: 'bob', domain: 'git.example', enabled: false, cookies: [] });
+    assert.deepEqual((await site(other)).profiles.map(item => item.name), ['alice']);
+    assert.equal((await server.device(other, `/accounts/${bob.id}/switch`, 'POST')).status, 404);
+    const audit = (await server.status()).audit.map(item => item.action);
+    assert.ok(audit.includes('account.switched') && audit.includes('account.created'));
+    await server.admin('/profiles/delete', 'POST', { ids: [alice.id, bob.id, carol.id, hidden.id] });
+  });
+
   test('bookmarks and search URL validation', async () => {
     const saved = await server.admin('/bookmarks', 'PUT', [{ title: '', url: 'https://github.com' }, { title: 'Docs', url: 'https://example.com/docs' }]);
     assert.deepEqual(saved.map(item => item.title), ['github.com', 'Docs']);

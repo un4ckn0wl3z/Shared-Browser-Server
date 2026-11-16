@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import { after, before, describe, test } from 'node:test';
 import {
-  PUBLIC_IP, launchBrowser, publicAddressAvailable, randomDeviceId, sleep, startOrigin, startServer, startSite,
+  PUBLIC_IP, ROOT, launchBrowser, publicAddressAvailable, randomDeviceId, sleep, startOrigin, startServer, startSite,
   tempDir, waitFor, writeClientProfile
 } from './lib/harness.mjs';
 
@@ -99,6 +101,53 @@ describe('Electron browsers sharing a session', () => {
       cookies: (await server.profile('localhost')).cookies.map(item => ({ ...item, value: '' }))
     });
     await waitFor(async () => (await wb2.cookies(site.origin)).includes('pref=dark'), { message: 'WB2 regained the profile' });
+  });
+
+  test('a second account for the site: added on the primary, switched on each browser', async () => {
+    await wb1.navigate(`${site.origin}/`);
+    await waitFor(async () => /👤/.test(await wb1.window.textContent('#account')), { message: 'account button' });
+    assert.ok(await wb1.window.isVisible('#account'));
+    // The account menu is native; open the add-account dialog the way its menu item does.
+    await wb1.app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].webContents.send('browser:add-account', { domain: 'localhost' }));
+    await wb1.window.waitForSelector('#account-dialog[open]');
+    await wb1.window.fill('#account-name', 'second');
+    await wb1.window.click('#account-form button.primary');
+    await wb1.window.waitForSelector('#account-dialog[open]', { state: 'detached' });
+    // The primary is signed out of the site and its next sign-in is saved as the new account.
+    await waitFor(async () => !(await wb1.cookies(site.origin)).includes('pref='), { message: 'WB1 signed out' });
+    await waitFor(async () => /second/.test(await wb1.window.textContent('#account')), { message: 'WB1 shows second account' });
+    await wb1.navigate(`${site.origin}/other-login`);
+    const accounts = async () => (await server.status()).profiles.filter(item => item.domain === 'localhost');
+    await waitFor(async () => (await accounts()).find(item => item.name === 'second')?.cookies.some(item => item.name === 'other'), { message: 'second account saved' });
+    let [first, second] = await accounts();
+    assert.ok(first.cookies.some(item => item.name === 'pref') && !first.cookies.some(item => item.name === 'other'));
+    // WB2 still uses the first account, then switches.
+    assert.ok((await wb2.cookies(site.origin)).includes('pref=dark'));
+    await wb2.navigate(`${site.origin}/`);
+    await waitFor(async () => /\(2\)/.test(await wb2.window.textContent('#account')), { message: 'WB2 sees two accounts' });
+    await wb2.window.evaluate(id => window.sharedBrowser.switchAccount(id), second.id);
+    await waitFor(async () => {
+      const cookies = await wb2.cookies(site.origin);
+      return cookies.includes('other=1') && !cookies.includes('pref=');
+    }, { message: 'WB2 on the second account' });
+    await wb2.window.evaluate(id => window.sharedBrowser.switchAccount(id), first.id);
+    await waitFor(async () => {
+      const cookies = await wb2.cookies(site.origin);
+      return cookies.includes('pref=dark') && !cookies.includes('other=');
+    }, { message: 'WB2 back on the first account' });
+    // Switching the primary back must not copy its cookies into the other account.
+    // Switching reloads the site's tabs; leave the page that sets the second account's cookie first.
+    await wb1.navigate(`${site.origin}/`);
+    await wb1.window.evaluate(id => window.sharedBrowser.switchAccount(id), first.id);
+    await waitFor(async () => {
+      const cookies = await wb1.cookies(site.origin);
+      return cookies.includes('pref=dark') && !cookies.includes('other=');
+    }, { message: 'WB1 back on the first account' });
+    await sleep(2500);
+    [first, second] = await accounts();
+    assert.deepEqual(first.cookies.map(item => item.name).sort(), ['pref']);
+    assert.deepEqual(second.cookies.map(item => item.name), ['other']);
+    await server.admin('/profiles/delete', 'POST', { ids: [second.id] });
   });
 
   test('shared bookmarks reach the browser', async () => {
@@ -244,7 +293,7 @@ describe('Electron browser in Managed proxy mode', () => {
     assert.equal(status.settings.networkPolicy, 'strict');
     await waitFor(async () => (await server.status()).devices.find(item => item.name === 'WB3')?.networkMode === 'strict', { message: 'WB3 reports strict' });
     const device = (await server.status()).devices.find(item => item.name === 'WB3');
-    assert.equal(device.clientVersion, '1.3.0');
+    assert.equal(device.clientVersion, JSON.parse(fs.readFileSync(path.join(ROOT, 'electron-client/package.json'), 'utf8')).version);
     // Loopback goes through the proxy too, and pages refuse non-proxied WebRTC.
     assert.notEqual(await browser.route('http://127.0.0.1/'), 'DIRECT');
     const policies = await browser.app.evaluate(({ webContents }) => webContents.getAllWebContents().filter(item => /^https?:|about:blank/.test(item.getURL())).map(item => item.getWebRTCIPHandlingPolicy()));

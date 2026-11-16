@@ -14,6 +14,7 @@ public sealed partial class SharedStateStore
     private const int MaxCookiesPerRequest = 200;
     private const int MaxBookmarks = 200;
     private const int MaxAnnouncements = 50;
+    private const int MaxAccountsPerSite = 20;
     private static readonly TimeSpan ExpiredAnnouncementRetention = TimeSpan.FromDays(7);
     private static readonly string[] AnnouncementLevels = ["info", "warning", "critical"];
     private const string CodeAlphabet = "ABCDEFGHJKMNPQRSTVWXYZ23456789";
@@ -37,6 +38,8 @@ public sealed partial class SharedStateStore
     private DateTimeOffset _lastBackup;
     private volatile SharedSnapshot _snapshot = null!;
     private volatile IReadOnlyDictionary<string, DeviceAuth> _deviceIndex = new Dictionary<string, DeviceAuth>();
+    private volatile IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>> _accountChoices = new Dictionary<string, IReadOnlyDictionary<string, string>>();
+    private static readonly IReadOnlyDictionary<string, string> NoChoices = new Dictionary<string, string>();
     private TaskCompletionSource _revisionChanged = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private long _publishedRevision = -1;
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> _liveConnections = new();
@@ -60,17 +63,47 @@ public sealed partial class SharedStateStore
     public BrowserSettings Settings => _snapshot.Settings;
     public SharedSnapshot Snapshot() => _snapshot;
 
-    /// <summary>The snapshot one device may see: profiles restricted to other devices are left out.</summary>
+    /// <summary>
+    /// The snapshot one device may see: profiles restricted to other devices are left out, and of a site
+    /// with several accounts only the one this device uses carries cookies (the rest are listed in Accounts).
+    /// </summary>
     public SharedSnapshot SnapshotFor(string deviceId)
     {
         var snapshot = _snapshot;
-        if (snapshot.Profiles.All(profile => profile.ShareWithAllDevices) && snapshot.Announcements.All(item => item.ShareWithAllDevices)) return snapshot;
+        var choices = _accountChoices.GetValueOrDefault(deviceId) ?? NoChoices;
+        var profiles = new List<SessionProfile>();
+        var accounts = new List<ClientAccount>();
+        foreach (var site in snapshot.Profiles.Where(profile => Shares(profile, deviceId)).GroupBy(profile => profile.Domain))
+        {
+            var usable = site.Where(profile => profile.Enabled).ToList();
+            // Disabled profiles still go out: they tell a browser that sharing for the site is switched off.
+            if (usable.Count == 0) { profiles.AddRange(site); continue; }
+            var active = PickAccount(usable, choices.GetValueOrDefault(site.Key));
+            profiles.Add(active);
+            accounts.AddRange(usable.Select(profile => new ClientAccount(profile.Id, profile.Name, profile.Domain, profile == active, profile.Cookies.Count)));
+        }
         return snapshot with
         {
-            Profiles = snapshot.Profiles.Where(profile => profile.ShareWithAllDevices || profile.AllowedDeviceIds.Contains(deviceId)).ToList(),
-            Announcements = snapshot.Announcements.Where(item => item.ShareWithAllDevices || item.AllowedDeviceIds.Contains(deviceId)).ToList()
+            Profiles = profiles,
+            Announcements = snapshot.Announcements.Where(item => item.ShareWithAllDevices || item.AllowedDeviceIds.Contains(deviceId)).ToList(),
+            Accounts = accounts
         };
     }
+
+    private static bool Shares(SessionProfile profile, string deviceId) => profile.ShareWithAllDevices || profile.AllowedDeviceIds.Contains(deviceId);
+    private static SessionProfile PickAccount(IReadOnlyList<SessionProfile> usable, string? choice) => usable.FirstOrDefault(profile => profile.Id == choice) ?? usable[0];
+
+    /// <summary>The account a device uses for a site (profiles with the same domain), or null when none is enabled.</summary>
+    private SessionProfile? ActiveAccountLocked(DeviceRecord? device, IEnumerable<SessionProfile> site, bool requireAccess)
+    {
+        var enabled = site.Where(profile => profile.Enabled).ToList();
+        if (enabled.Count == 0) return null;
+        var usable = device is null ? enabled : enabled.Where(profile => Shares(profile, device.Id)).ToList();
+        if (usable.Count == 0) return requireAccess ? null : enabled[0];
+        return PickAccount(usable, device?.ActiveProfiles.GetValueOrDefault(enabled[0].Domain));
+    }
+
+    private bool IsPrimaryLocked(string deviceId) => string.Equals(_state.Settings.PrimaryDeviceId, deviceId, StringComparison.OrdinalIgnoreCase);
 
     /// <summary>Completes when the revision differs from <paramref name="known"/>, or after the timeout.</summary>
     public async Task WaitForRevisionChangeAsync(long known, TimeSpan timeout, CancellationToken cancellationToken)
@@ -148,6 +181,8 @@ public sealed partial class SharedStateStore
                 updatedAt = _state.UpdatedAt,
                 profiles = _state.Profiles.Select(profile => new
                 {
+                    accounts = _state.Profiles.Count(item => item.Domain == profile.Domain),
+                    usedBy = _state.Devices.Where(device => !device.Revoked && ActiveAccountLocked(device, _state.Profiles.Where(item => item.Domain == profile.Domain), true) == profile).Select(device => device.Name).ToList(),
                     profile.Id,
                     profile.Name,
                     profile.Domain,
@@ -469,7 +504,12 @@ public sealed partial class SharedStateStore
                 AllowedDeviceIds = input.ShareWithAllDevices ? [] : allowed,
                 Cookies = cookies
             };
-            if (_state.Profiles.Where((_, position) => position != index).Any(item => item.Domain == domain)) throw new InvalidOperationException("A profile for this domain already exists");
+            var others = _state.Profiles.Where((_, position) => position != index).Where(item => item.Domain == domain).ToList();
+            if (others.Any(item => string.Equals(item.Name, clean.Name, StringComparison.OrdinalIgnoreCase)))
+                throw new InvalidOperationException(others.Count == 1 && index < 0 && clean.Name == domain
+                    ? $"{domain} already has a profile. Give this one a different name to add it as another account"
+                    : $"{domain} already has an account named '{clean.Name}'");
+            if (others.Count >= MaxAccountsPerSite) throw new InvalidOperationException($"A site can have at most {MaxAccountsPerSite} accounts");
             if (index < 0) _state.Profiles.Add(clean); else _state.Profiles[index] = clean;
             BumpRevision();
             await SaveLockedAsync();
@@ -630,6 +670,70 @@ public sealed partial class SharedStateStore
         finally { _gate.Release(); }
     }
 
+    // ---- Accounts ---------------------------------------------------------------------------------
+
+    /// <summary>
+    /// Makes <paramref name="profileId"/> the account this device uses for its site. Only this device's
+    /// snapshot changes, so the revision stays the same and other browsers are not woken up.
+    /// </summary>
+    public async Task<SessionProfile> SwitchAccountAsync(string deviceId, string profileId)
+    {
+        await _gate.WaitAsync();
+        try
+        {
+            var device = _state.Devices.First(item => item.Id == deviceId);
+            var profile = _state.Profiles.FirstOrDefault(item => item.Id == profileId && item.Enabled && Shares(item, deviceId)) ?? throw new KeyNotFoundException();
+            device.ActiveProfiles[profile.Domain] = profile.Id;
+            // Forget choices for sites that no longer exist.
+            foreach (var domain in device.ActiveProfiles.Keys.Where(domain => !_state.Profiles.Any(item => item.Domain == domain)).ToList()) device.ActiveProfiles.Remove(domain);
+            await SaveLockedAsync(backup: false);
+            return PublicProfile(profile);
+        }
+        finally { _gate.Release(); }
+    }
+
+    /// <summary>
+    /// Adds an empty account for the site of the page and switches this device to it, so the next sign-in
+    /// on that site is saved as the new account. Only the primary browser saves cookies, so only it may.
+    /// </summary>
+    public async Task<SessionProfile> CreateAccountAsync(string deviceId, CreateAccountRequest request)
+    {
+        if (!Uri.TryCreate(request.PageUrl, UriKind.Absolute, out var page) || page.Scheme is not ("http" or "https")) throw new InvalidOperationException("Open the site you want to add an account for first");
+        var host = NormalizeDomain(page.Host);
+        var name = CleanName(request.Name, "");
+        if (name.Length == 0) throw new InvalidOperationException("Enter a name for the account");
+        await _gate.WaitAsync();
+        try
+        {
+            if (_state.Settings.AutoShareCookies && string.IsNullOrWhiteSpace(_state.Settings.PrimaryDeviceId)) _state.Settings.PrimaryDeviceId = deviceId;
+            if (!IsPrimaryLocked(deviceId)) throw new UnauthorizedAccessException("Only the primary browser can add accounts, because only its sign-ins are saved");
+            var device = _state.Devices.First(item => item.Id == deviceId);
+            var site = _state.Profiles.Where(item => DomainMatches(host, item.Domain)).GroupBy(item => item.Domain).OrderByDescending(group => group.Key.Length).FirstOrDefault()?.ToList() ?? [];
+            var domain = site.Count > 0 ? site[0].Domain : host;
+            if (!ValidDomain(domain)) throw new InvalidOperationException("Invalid site");
+            if (site.Any(item => string.Equals(item.Name, name, StringComparison.OrdinalIgnoreCase))) throw new InvalidOperationException($"{domain} already has an account named '{name}'");
+            if (site.Count >= MaxAccountsPerSite) throw new InvalidOperationException($"A site can have at most {MaxAccountsPerSite} accounts");
+            // The new account is shared like the one the browser is using now, and always with the browser adding it.
+            var template = ActiveAccountLocked(device, site, false) ?? site.FirstOrDefault();
+            var shareWithAll = template?.ShareWithAllDevices ?? true;
+            var profile = new SessionProfile
+            {
+                Id = Guid.NewGuid().ToString("N"),
+                Name = name,
+                Domain = domain,
+                Enabled = true,
+                ShareWithAllDevices = shareWithAll,
+                AllowedDeviceIds = shareWithAll ? [] : [.. template!.AllowedDeviceIds.Append(deviceId).Distinct()]
+            };
+            _state.Profiles.Add(profile);
+            device.ActiveProfiles[domain] = profile.Id;
+            BumpRevision();
+            await SaveLockedAsync();
+            return PublicProfile(profile);
+        }
+        finally { _gate.Release(); }
+    }
+
     // ---- Cookie synchronization -------------------------------------------------------------------
 
     public async Task<int> SyncCookiesAsync(string deviceId, SyncRequest request)
@@ -654,11 +758,12 @@ public sealed partial class SharedStateStore
                 return 0;
             }
             var host = NormalizeDomain(page.Host);
-            var profile = _state.Profiles.Where(item => DomainMatches(host, item.Domain)).OrderByDescending(item => item.Domain.Length).FirstOrDefault();
+            var site = _state.Profiles.Where(item => DomainMatches(host, item.Domain)).GroupBy(item => item.Domain).OrderByDescending(group => group.Key.Length).FirstOrDefault();
+            // Cookies go to the account this browser has switched to. A site whose profiles are all disabled
+            // blocks sharing for its domain; it must not be shadowed by an automatic one.
+            var profile = site is null ? null : ActiveAccountLocked(device, site, false);
             var profileCreated = false;
-            // A disabled profile blocks sharing for its domain; it must not be shadowed by an automatic one.
-            if (profile is { Enabled: false }) profile = null;
-            else if (profile is null && _state.Settings.AutoShareCookies && incomingCookies.Count > 0)
+            if (site is null && _state.Settings.AutoShareCookies && incomingCookies.Count > 0)
             {
                 if (!ValidDomain(host)) return 0;
                 profile = new SessionProfile { Id = Guid.NewGuid().ToString("N"), Name = host, Domain = host, Enabled = true };
@@ -805,6 +910,7 @@ public sealed partial class SharedStateStore
             profile.Cookies ??= [];
             profile.AllowedDeviceIds ??= [];
         }
+        foreach (var device in disk.Devices) device.ActiveProfiles ??= [];
         foreach (var cookie in disk.Profiles.SelectMany(profile => profile.Cookies)) cookie.Value = Decrypt(cookie.Value);
         return disk;
     }
@@ -816,7 +922,7 @@ public sealed partial class SharedStateStore
             Revision = _state.Revision,
             UpdatedAt = _state.UpdatedAt,
             Settings = CloneSettings(_state.Settings),
-            Devices = _state.Devices.Select(device => new DeviceRecord { Id = device.Id, Name = device.Name, TokenHash = device.TokenHash, EnrolledAt = device.EnrolledAt, LastSeenAt = device.LastSeenAt, Revoked = device.Revoked, ClientVersion = device.ClientVersion, NetworkMode = device.NetworkMode, MaxConnections = device.MaxConnections, MonthlyQuotaGb = device.MonthlyQuotaGb, RateLimitMbps = device.RateLimitMbps }).ToList(),
+            Devices = _state.Devices.Select(device => new DeviceRecord { Id = device.Id, Name = device.Name, TokenHash = device.TokenHash, EnrolledAt = device.EnrolledAt, LastSeenAt = device.LastSeenAt, Revoked = device.Revoked, ClientVersion = device.ClientVersion, NetworkMode = device.NetworkMode, MaxConnections = device.MaxConnections, MonthlyQuotaGb = device.MonthlyQuotaGb, RateLimitMbps = device.RateLimitMbps, ActiveProfiles = new(device.ActiveProfiles) }).ToList(),
             Profiles = _state.Profiles.Select(CloneProfile).ToList(),
             Bookmarks = _state.Bookmarks.Select(CloneBookmark).ToList(),
             EnrollmentCodes = _state.EnrollmentCodes.Select(code => new EnrollmentCode { Id = code.Id, CodeHash = code.CodeHash, Label = code.Label, CreatedAt = code.CreatedAt, ExpiresAt = code.ExpiresAt, UsedAt = code.UsedAt, UsedByDeviceId = code.UsedByDeviceId, Revoked = code.Revoked }).ToList(),
@@ -858,6 +964,8 @@ public sealed partial class SharedStateStore
                 .Select(item => new ClientAnnouncement(item.Id, item.Title, item.Message, item.Level, item.Url, item.CreatedAt, item.ExpiresAt) { ShareWithAllDevices = item.ShareWithAllDevices, AllowedDeviceIds = [.. item.AllowedDeviceIds] })
                 .ToList());
         _deviceIndex = _state.Devices.ToDictionary(device => device.Id, device => new DeviceAuth(device.Id, device.Name, device.TokenHash, device.Revoked, device.MaxConnections, device.MonthlyQuotaGb, device.RateLimitMbps));
+        _accountChoices = _state.Devices.Where(device => device.ActiveProfiles.Count > 0)
+            .ToDictionary(device => device.Id, device => (IReadOnlyDictionary<string, string>)new Dictionary<string, string>(device.ActiveProfiles));
         if (_state.Revision != _publishedRevision)
         {
             _publishedRevision = _state.Revision;

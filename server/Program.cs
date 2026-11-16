@@ -108,9 +108,8 @@ app.MapGet("/api/client/snapshot", async (HttpContext context, SharedStateStore 
     var device = DeviceAuthorized(context.Request, store);
     if (device is null) return Results.Unauthorized();
     await store.TouchDeviceAsync(device.Id, context.Request.Query["deviceName"].ToString(), context.Request.Query["version"].ToString(), context.Request.Query["mode"].ToString());
-    var snapshot = store.SnapshotFor(device.Id);
-    if (long.TryParse(context.Request.Query["since"], out var since) && since == snapshot.Revision) return Results.NoContent();
-    return Results.Json(snapshot);
+    if (long.TryParse(context.Request.Query["since"], out var since) && since == store.Revision) return Results.NoContent();
+    return Results.Json(store.SnapshotFor(device.Id));
 });
 
 // Server-Sent Events: one "revision" event whenever the shared state changes, and a comment every
@@ -165,6 +164,35 @@ app.MapPost("/api/client/sync", async (HttpContext context, SyncRequest request,
         var snapshot = store.SnapshotFor(device.Id);
         return Results.Json(new SyncResponse(snapshot.Revision, changed, snapshot));
     }
+    catch (InvalidOperationException error) { return Results.BadRequest(new { error = error.Message }); }
+});
+
+// Switches this browser to another account of a site. Returns the browser's new snapshot.
+app.MapPost("/api/client/accounts/{id}/switch", async (HttpContext context, string id, SharedStateStore store) =>
+{
+    var device = DeviceAuthorized(context.Request, store);
+    if (device is null) return Results.Unauthorized();
+    try
+    {
+        var profile = await store.SwitchAccountAsync(device.Id, id);
+        audit.Record($"device:{device.Name}", "account.switched", profile.Domain, profile.Name, Ip(context));
+        return Results.Json(store.SnapshotFor(device.Id));
+    }
+    catch (KeyNotFoundException) { return Results.NotFound(new { error = "That account is not available to this browser" }); }
+});
+
+// The primary browser adds an empty account for a site and is switched to it, ready to sign in.
+app.MapPost("/api/client/accounts", async (HttpContext context, CreateAccountRequest request, SharedStateStore store) =>
+{
+    var device = DeviceAuthorized(context.Request, store);
+    if (device is null) return Results.Unauthorized();
+    try
+    {
+        var profile = await store.CreateAccountAsync(device.Id, request);
+        audit.Record($"device:{device.Name}", "account.created", profile.Domain, profile.Name, Ip(context));
+        return Results.Json(store.SnapshotFor(device.Id), statusCode: StatusCodes.Status201Created);
+    }
+    catch (UnauthorizedAccessException error) { return Results.Json(new { error = error.Message }, statusCode: StatusCodes.Status403Forbidden); }
     catch (InvalidOperationException error) { return Results.BadRequest(new { error = error.Message }); }
 });
 

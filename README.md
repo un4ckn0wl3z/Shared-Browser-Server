@@ -76,6 +76,7 @@ The primary-writer model prevents a logged-out secondary browser from replacing 
 - Per-browser proxy usage statistics and limits (open connections, monthly data, speed)
 - TLS between browsers and the proxy, with the certificate pinned by the browsers
 - Per-profile access: share a domain with all browsers or only selected ones
+- Several accounts per site (for example two GitHub users), switched per browser from the toolbar
 - Live updates over Server-Sent Events
 - Audit log, automatic vault backups, and vault export/import
 - Announcements from the administrator to all or selected browsers
@@ -200,7 +201,7 @@ docker compose up -d --build
 ### Upgrading
 
 - The server reads vaults written by earlier versions as they are; there is nothing to migrate. Settings added later start with the previous behavior: profiles and announcements go to all browsers, the administrator token still enrolls browsers, and proxy TLS is off.
-- Older browsers keep working against a newer server. They do not show announcements, keep polling instead of receiving live updates, and (before 1.1) do not remove cookies from profiles they lose access to.
+- Older browsers keep working against a newer server. They do not show announcements, keep polling instead of receiving live updates, and (before 1.1) do not remove cookies from profiles they lose access to. Browsers before 1.4 cannot switch accounts and always use a site's first account.
 - Update every browser that uses Managed proxy mode to 1.2 or newer before turning on proxy TLS.
 - With the server released alongside browser 1.3, **Browser connection mode** defaults to requiring the managed proxy with Strict privacy, also on existing installations. Enable the proxy before upgrading the server, or set the mode to **Let each browser choose** afterwards, otherwise 1.3 browsers stop loading websites until the proxy is on. Browsers before 1.3 keep their own setting.
 - Restarting the server briefly interrupts open proxy connections; browsers reconnect and resume syncing on their own.
@@ -259,7 +260,7 @@ pnpm start --profile=WB3
 
 On Windows, `Open-WB1.cmd`, `Open-WB2.cmd`, and `Open-WB3.cmd` in the repository root start the WB1, WB2, and WB3 profiles after the dependencies are installed.
 
-On Linux, make the AppImage executable and pass the profile name the same way (`chmod +x Shared-Browser-*.AppImage`, then `./Shared-Browser-1.2.0-linux-x86_64.AppImage --profile=WB1`). AppImages need FUSE; on Ubuntu 22.04 and newer install `libfuse2` (`libfuse2t64` on 24.04). Started from the AppImage, the client updates itself.
+On Linux, make the AppImage executable and pass the profile name the same way (`chmod +x Shared-Browser-*.AppImage`, then `./Shared-Browser-1.4.0-linux-x86_64.AppImage --profile=WB1`). AppImages need FUSE; on Ubuntu 22.04 and newer install `libfuse2` (`libfuse2t64` on 24.04). Started from the AppImage, the client updates itself.
 
 Each profile name gets its own browser storage, device identity, encrypted device token, and offline cache. All profiles connect to the same management server and shared vault.
 
@@ -274,6 +275,12 @@ The installed client checks GitHub Releases at startup and every four hours. Its
 The address bar accepts full URLs, bare host names (`github.com`, or `localhost:3000` which opens over HTTP), and search terms, which use the search URL configured in the dashboard (DuckDuckGo by default; leave it empty to disable searching). The ★ button lists the shared bookmarks; hold Ctrl (⌘) or Shift to open one in a new tab. Middle-click a tab to close it, and double-click the empty tab strip to open a new one. Download progress is shown in the status text.
 
 Keyboard shortcuts (⌘ instead of Ctrl on macOS): Ctrl+T new tab, Ctrl+Shift+T reopen the last closed tab, Ctrl+W close tab, Ctrl+Tab / Ctrl+Shift+Tab switch tabs, Ctrl+L focus the address bar, Ctrl+F or F3 find in page (Enter / Shift+Enter for next and previous, Esc to close), Ctrl+R or F5 reload, Ctrl+Shift+R hard reload, Alt+← / Alt+→ back and forward, Ctrl+= / Ctrl+- / Ctrl+0 zoom, and F12 developer tools. Right-click a page for copy/paste, link, and Inspect actions. Links that open a new tab load as tabs; `window.open` popups open as real windows so sign-in and approval flows that report back to their opener keep working.
+
+### Switching between accounts
+
+A site can have several shared accounts, for example two GitHub users. When the current site has a shared session, the toolbar shows an account button (👤 with the account's name, and the number of accounts when there is more than one). Its menu lists the site's accounts; choosing one switches this browser only: the browser replaces the site's cookies with that account's and reloads the site's open tabs. Other browsers keep the account they use, and a browser that never switched uses the site's first account.
+
+To add an account, open the site in the primary browser and choose **Add another account…** from the account menu. Give it a name; the browser signs out of the site so you can sign in with the other user, and that sign-in is saved as the new account. Secondary browsers only switch between accounts, because only the primary browser's sign-ins are saved. An administrator can also add an account in the dashboard: create a profile with the site's domain and a different name. The dashboard shows, for each account, which browsers use it.
 
 Open tabs and the window size and position are restored the next time a profile starts. Tab addresses are stored encrypted along with the device credentials.
 
@@ -355,6 +362,7 @@ A tunnel stays open as long as data flows and closes after 10 minutes without tr
 - Only the primary browser can publish cookie/session changes. This prevents a logged-out secondary browser from overwriting a logged-in session.
 - The primary browser publishes a complete cookie list per domain, and only for domains whose cookies changed. Cookies it no longer has (for example after signing out) are removed from the vault. A cookie typed into the dashboard is protected until the primary browser has received it; after that it is removed on sign-out like any other cookie. Secondary browsers delete a removed cookie only while it still holds the value they received.
 - A disabled profile stops sharing for its domain; the primary browser does not recreate an automatic profile for it.
+- Profiles with the same domain are accounts of one site (at most 20, each with its own name). Each browser receives cookies only for the account it uses, and the primary browser's changes are saved to the account it uses. A browser whose account is disabled, deleted or no longer shared with it moves to the site's first account it can use. Switching accounts changes only that browser and does not create a new revision for the others.
 - Profile edits in the dashboard keep stored cookie values when the value field is left empty, so one cookie can be changed without re-entering the others.
 - The server announces every new revision over Server-Sent Events, and browsers pull the snapshot immediately. Polling remains as a safety net (every 30 seconds while the event stream is connected, every 2.5 seconds otherwise): browsers send the revision they already have and the server answers `204 No Content` when nothing changed. After errors, polling backs off up to one minute.
 - Profiles can still be disabled or removed from the dashboard when a domain should not be shared. Tick several profiles and use **Delete selected**, or **Purge all** (confirmed by typing `PURGE`) to empty the vault; both save a backup first, so either can be undone under **Vault backups**. Other browsers remove the deleted cookies, while the primary browser keeps its own and, with automatic sharing on, shares a domain again the next time its cookies there change.

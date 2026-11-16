@@ -110,6 +110,12 @@ function updateState(state) {
   const reload = element('reload');
   reload.textContent = loading ? '✕' : '↻';
   reload.title = loading ? 'Stop loading' : 'Reload';
+  const account = element('account');
+  account.hidden = !state.account;
+  if (state.account) {
+    account.textContent = `👤 ${state.account.name}${state.account.count > 1 ? ` (${state.account.count})` : ''} ▾`;
+    account.title = `Shared accounts for ${state.account.domain}`;
+  }
 }
 
 function updateUpdate(value) {
@@ -202,6 +208,38 @@ element('bookmarks').addEventListener('click', event => {
   const rect = event.currentTarget.getBoundingClientRect();
   api.showBookmarks({ x: rect.left, y: rect.bottom + 2 });
 });
+element('account').addEventListener('click', event => {
+  const rect = event.currentTarget.getBoundingClientRect();
+  api.showAccounts({ x: rect.left, y: rect.bottom + 2 });
+});
+const accountDialog = element('account-dialog');
+// Like Settings, the dialog would sit under the page view, so the main process hides the view meanwhile.
+async function openAccountDialog(value) {
+  await api.setSettingsOpen(true);
+  element('account-site').textContent = value?.domain || '';
+  element('account-name').value = '';
+  element('account-error').textContent = '';
+  if (!accountDialog.open) accountDialog.showModal();
+  element('account-name').focus();
+}
+function closeAccountDialog() {
+  if (accountDialog.open) accountDialog.close();
+  api.setSettingsOpen(false);
+}
+element('account-close').addEventListener('click', closeAccountDialog);
+element('account-cancel').addEventListener('click', closeAccountDialog);
+accountDialog.addEventListener('cancel', event => { event.preventDefault(); closeAccountDialog(); });
+element('account-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  element('account-error').textContent = '';
+  try {
+    await api.addAccount(element('account-name').value);
+    closeAccountDialog();
+  } catch (failure) {
+    element('account-error').textContent = failure.message.replace(/^Error invoking remote method '[^']+': (Error: )?/, '');
+  }
+});
+api.onAddAccount(openAccountDialog);
 findText.addEventListener('input', () => runFind(true, false));
 findText.addEventListener('keydown', event => {
   if (event.key === 'Enter') { event.preventDefault(); runFind(!event.shiftKey, true); }

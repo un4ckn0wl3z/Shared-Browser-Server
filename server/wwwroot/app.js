@@ -235,10 +235,12 @@ function renderProfiles() {
     container.innerHTML = '<p class="empty">No shared profiles yet.</p>';
     return;
   }
-  for (const profile of [...state.profiles].sort((a, b) => a.domain.localeCompare(b.domain))) {
+  // Accounts of the same site sit together, in the order browsers fall back to them.
+  const order = new Map(state.profiles.map((profile, index) => [profile.id, index]));
+  for (const profile of [...state.profiles].sort((a, b) => a.domain.localeCompare(b.domain) || order.get(a.id) - order.get(b.id))) {
     const element = document.createElement('div');
     element.className = `profile${selectedProfiles.has(profile.id) ? ' selected' : ''}`;
-    element.innerHTML = `<label class="pick"><input type="checkbox" aria-label="Select ${esc(profile.domain)}"${selectedProfiles.has(profile.id) ? ' checked' : ''}><div><strong>${profile.enabled ? '●' : '○'} ${esc(profile.name)}</strong><span>${esc(profile.domain)} · ${profile.cookieCount} cookie(s)${profile.enabled ? '' : ' · disabled'}</span></div></label><button class="secondary">Edit</button>`;
+    element.innerHTML = `<label class="pick"><input type="checkbox" aria-label="Select ${esc(profile.domain)}"${selectedProfiles.has(profile.id) ? ' checked' : ''}><div><strong>${profile.enabled ? '●' : '○'} ${esc(profile.name)}</strong><span>${esc(profile.domain)} · ${profile.cookieCount} cookie(s)${profile.enabled ? '' : ' · disabled'}${profile.accounts > 1 ? ` · account of ${profile.accounts} · ${profile.usedBy?.length ? `used by ${esc(profile.usedBy.join(', '))}` : 'used by no browser'}` : ''}</span></div></label><button class="secondary">Edit</button>`;
     element.querySelector('input').onchange = event => {
       if (event.target.checked) selectedProfiles.add(profile.id); else selectedProfiles.delete(profile.id);
       element.classList.toggle('selected', event.target.checked);

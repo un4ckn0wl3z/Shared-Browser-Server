@@ -88,6 +88,7 @@ function defaultSnapshot() {
       proxy: { enabled: false, host: '127.0.0.1', port: 8899, allowedPorts: '80,443', bypassList: 'localhost;127.0.0.1' }
     },
     profiles: [],
+    accounts: [],
     bookmarks: [],
     announcements: []
   };
@@ -192,6 +193,11 @@ function normalizeSnapshot(input) {
   if (typeof input.settings.searchUrl !== 'string') input.settings.searchUrl = fallback.settings.searchUrl;
   input.settings.proxy ||= fallback.settings.proxy;
   input.profiles = Array.isArray(input.profiles) ? input.profiles : [];
+  // Servers before 1.4 do not send accounts; the account button then stays hidden.
+  input.accounts = Array.isArray(input.accounts)
+    ? input.accounts.filter(item => item && typeof item.id === 'string' && typeof item.domain === 'string')
+      .map(item => ({ id: item.id, name: String(item.name || item.domain), domain: normalizedDomain(item.domain), active: item.active === true, cookieCount: Number(item.cookieCount) || 0 }))
+    : [];
   input.bookmarks = Array.isArray(input.bookmarks) ? input.bookmarks.filter(item => item && /^https?:\/\//i.test(item.url || '')) : [];
   input.announcements = Array.isArray(input.announcements)
     ? input.announcements.filter(item => item && typeof item.id === 'string' && ['info', 'warning', 'critical'].includes(item.level))
@@ -417,7 +423,8 @@ function publishNavigationState() {
     url: currentUrl === 'about:blank' ? '' : currentUrl,
     loading: tab?.view.webContents.isLoading() || false,
     canGoBack: tab?.view.webContents.navigationHistory.canGoBack() || false,
-    canGoForward: tab?.view.webContents.navigationHistory.canGoForward() || false
+    canGoForward: tab?.view.webContents.navigationHistory.canGoForward() || false,
+    account: accountState(currentUrl)
   });
 }
 
@@ -1047,6 +1054,111 @@ function scheduleCookiePush() {
   cookiePushTimer = setTimeout(() => pushAllStoredCookies(), 900);
 }
 
+// ---- Accounts -----------------------------------------------------------------------------------
+// A site can have several shared accounts (session profiles with the same domain), for example two
+// GitHub users. The server sends cookies only for the account this browser uses; switching asks the
+// server to change that, then replaces the site's cookies here and reloads the site's tabs.
+
+function hostOf(url) {
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === 'https:' || parsed.protocol === 'http:' ? parsed.hostname.toLowerCase() : '';
+  } catch {
+    return '';
+  }
+}
+
+function domainWithin(host, domain) {
+  return Boolean(host && domain) && (host === domain || host.endsWith(`.${domain}`));
+}
+
+// The accounts of the most specific shared site that covers the URL's host.
+function siteAccounts(url, accounts = config.secrets.cache.accounts) {
+  const host = hostOf(url);
+  const matching = accounts.filter(item => domainWithin(host, item.domain));
+  const domain = matching.reduce((best, item) => item.domain.length > best.length ? item.domain : best, '');
+  return { host, domain, accounts: matching.filter(item => item.domain === domain) };
+}
+
+function accountState(url) {
+  const site = siteAccounts(url);
+  if (!site.accounts.length) return null;
+  const active = site.accounts.find(item => item.active) || site.accounts[0];
+  return { domain: site.domain, name: active.name, count: site.accounts.length };
+}
+
+function accountLabel(item) {
+  const detail = item.cookieCount ? `${item.cookieCount} cookie${item.cookieCount === 1 ? '' : 's'}` : 'not signed in';
+  return `${item.name.slice(0, 60)} — ${detail}`.replace(/&/g, '&&');
+}
+
+function showAccountsMenu(position) {
+  const web = activeWebContents();
+  const site = siteAccounts(web?.getURL() || '');
+  if (!site.accounts.length) return;
+  const template = [{ label: `Accounts for ${site.domain}`, enabled: false }];
+  for (const item of site.accounts) {
+    template.push({
+      label: accountLabel(item),
+      type: 'radio',
+      checked: item.active,
+      click: () => { if (!item.active) switchAccount(item.id).catch(error => status(`Account switch failed — ${error.message}`, true)); }
+    });
+  }
+  template.push({ type: 'separator' }, isPrimary()
+    ? { label: 'Add another account…', click: () => send('browser:add-account', { domain: site.domain }) }
+    : { label: 'Accounts are added from the primary browser', enabled: false });
+  Menu.buildFromTemplate(template).popup({
+    window: mainWindow,
+    x: Math.round(Number(position?.x) || 0),
+    y: Math.round(Number(position?.y) || chromeHeight)
+  });
+}
+
+async function clearSiteCookies(domain) {
+  const cookies = (await browserSession.cookies.get({})).filter(cookie => domainWithin(normalizedDomain(cookie.domain), domain));
+  for (const cookie of cookies) {
+    const url = `${cookie.secure ? 'https' : 'http'}://${normalizedDomain(cookie.domain)}${cookie.path || '/'}`;
+    try { await browserSession.cookies.remove(url, cookie.name); } catch { }
+  }
+}
+
+// Runs in the server queue, so a cookie publish cannot interleave: one queued before the switch still
+// goes to the old account, and the publish triggered by clearing the cookies goes to the new one.
+function changeAccount(pathname, body, pageUrl, clear) {
+  return serialized(async () => {
+    const snapshot = normalizeSnapshot(await api(pathname, { method: 'POST', body: JSON.stringify(body) }));
+    const domain = siteAccounts(pageUrl, snapshot.accounts).domain || hostOf(pageUrl);
+    if (clear) await clearSiteCookies(domain);
+    for (const [key, entry] of appliedCookies) if (domainWithin(entry.domain, domain)) appliedCookies.delete(key);
+    await installSnapshot(snapshot, config.secrets.cache);
+    for (const tab of tabs.values()) {
+      const web = tab.view.webContents;
+      if (!web.isDestroyed() && domainWithin(hostOf(web.getURL()), domain)) web.reload();
+    }
+    publishNavigationState();
+    return siteAccounts(pageUrl, snapshot.accounts).accounts.find(item => item.active);
+  });
+}
+
+async function switchAccount(id) {
+  const account = config.secrets.cache.accounts.find(item => item.id === id);
+  if (!account) throw new Error('That account is no longer shared with this browser');
+  await changeAccount(`/api/client/accounts/${encodeURIComponent(id)}/switch`, {}, `https://${account.domain}/`, true);
+  status(`Using ${account.name} on ${account.domain}`);
+}
+
+// Adds an empty account and signs this browser out of the site, so the next sign-in is saved as it.
+async function addAccount(name) {
+  const pageUrl = activeWebContents()?.getURL() || '';
+  const site = siteAccounts(pageUrl);
+  if (!site.host) throw new Error('Open the site you want to add an account for first');
+  if (!isPrimary()) throw new Error('Accounts are added from the primary browser');
+  // The first account of a site keeps the session this browser already has.
+  const account = await changeAccount('/api/client/accounts', { name, pageUrl }, pageUrl, site.accounts.length > 0);
+  status(`Sign in to ${account?.domain || site.host} to save the ${account?.name || name} account`);
+}
+
 async function configureProxy() {
   const proxy = config.secrets.cache.settings.proxy;
   if (config.strictPrivacy && config.networkMode !== 'managed') {
@@ -1422,6 +1534,9 @@ function registerIpc() {
     layoutActiveView();
   });
   ipcMain.handle('browser:show-bookmarks', (_, position) => showBookmarksMenu(position));
+  ipcMain.handle('browser:show-accounts', (_, position) => showAccountsMenu(position));
+  ipcMain.handle('browser:add-account', (_, name) => addAccount(String(name || '').trim().slice(0, 80)));
+  ipcMain.handle('browser:switch-account', (_, id) => switchAccount(String(id || '')));
   ipcMain.handle('browser:reopen-tab', reopenClosedTab);
   ipcMain.handle('browser:find', (_, text, options) => {
     const web = activeWebContents();
