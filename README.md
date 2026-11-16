@@ -419,7 +419,9 @@ The dashboard's **Activity** section lists enrollments, enrollment codes, settin
 
 ### Backups, export and import
 
-The server copies `state.json` into `backups/` at most once an hour (`SHARED_BROWSER_BACKUP_INTERVAL_MINUTES`) and keeps the newest 48 (`SHARED_BROWSER_BACKUP_KEEP`). The dashboard's **Vault backups** section lists them and restores any of them, and can export the current vault or import an exported one. Every import or restore first saves the current vault as another backup.
+The server copies `state.json` into `backups/` at most once an hour (`SHARED_BROWSER_BACKUP_INTERVAL_MINUTES`), and only when the vault changes, and keeps the newest 48 (`SHARED_BROWSER_BACKUP_KEEP`); older ones are deleted automatically. The safety backups taken before a bulk delete, purge, import or restore count toward the same 48. With the defaults that is about two days of hourly backups on a busy vault, and longer on a quiet one; the dashboard shows the oldest backup kept.
+
+The dashboard's **Vault backups** section lists the backups, restores any of them, and deletes the ones you no longer want (a deleted backup cannot be restored). It can also export the current vault or import an exported one. Every import or restore first saves the current vault as another backup.
 
 Backups and exports keep cookie values encrypted with `SHARED_BROWSER_DATA_KEY`, so they can only be restored on a server with the same data key; a vault written with another key is refused. They do contain device token hashes and enrollment state, so store them as carefully as the data volume.
 

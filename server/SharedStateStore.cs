@@ -265,6 +265,7 @@ public sealed partial class SharedStateStore
                 settings = _snapshot.Settings,
                 proxy = proxyStatus,
                 backups = ListBackups(),
+                backupPolicy = new { keep = _backupKeep, intervalMinutes = (int)_backupInterval.TotalMinutes },
                 audit
             };
         }
@@ -977,6 +978,21 @@ public sealed partial class SharedStateStore
         var path = Path.Combine(_backupDirectory, name);
         if (!File.Exists(path)) throw new KeyNotFoundException();
         return await ImportAsync(await File.ReadAllTextAsync(path), "restore");
+    }
+
+    /// <summary>Deletes one backup file. Returns false when it does not exist.</summary>
+    public async Task<bool> DeleteBackupAsync(string name)
+    {
+        if (!BackupName().IsMatch(name)) throw new InvalidOperationException("Invalid backup name");
+        await _gate.WaitAsync();
+        try
+        {
+            var path = Path.Combine(_backupDirectory, name);
+            if (!File.Exists(path)) return false;
+            File.Delete(path);
+            return true;
+        }
+        finally { _gate.Release(); }
     }
 
     [GeneratedRegex(@"^state-\d{8}T\d{6}Z(-[a-z]+(-[a-z]+)*)?\.json$")]

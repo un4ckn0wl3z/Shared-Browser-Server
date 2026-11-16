@@ -474,14 +474,27 @@ function formatBytes(value) {
 function renderBackups() {
   const body = $('#backups');
   body.replaceChildren();
+  const policy = state.backupPolicy;
+  if (policy) {
+    const oldest = state.backups?.length ? new Date(state.backups[state.backups.length - 1].createdAt).toLocaleString() : '';
+    $('#backup-policy').textContent = `Keeps the newest ${policy.keep} backups and deletes older ones automatically. An automatic backup is saved at most every ${policy.intervalMinutes} minutes while the vault changes, so a quiet vault keeps backups for longer.${oldest ? ` Oldest kept: ${oldest}.` : ''} Change with SHARED_BROWSER_BACKUP_KEEP and SHARED_BROWSER_BACKUP_INTERVAL_MINUTES.`;
+  }
   if (!state.backups?.length) {
     body.innerHTML = '<tr><td colspan="4" class="empty">No backups yet</td></tr>';
     return;
   }
   for (const backup of state.backups) {
     const row = document.createElement('tr');
-    row.innerHTML = `<td><code>${esc(backup.name)}</code></td><td>${esc(new Date(backup.createdAt).toLocaleString())}</td><td>${esc(formatBytes(backup.size))}</td><td><button class="secondary">Restore</button></td>`;
-    row.querySelector('button').onclick = async () => {
+    row.innerHTML = `<td><code>${esc(backup.name)}</code></td><td>${esc(new Date(backup.createdAt).toLocaleString())}</td><td>${esc(formatBytes(backup.size))}</td><td class="actions"><button class="secondary">Restore</button><button class="danger">Delete</button></td>`;
+    row.querySelector('.danger').onclick = async () => {
+      if (!confirm(`Delete ${backup.name}? It cannot be restored afterwards.`)) return;
+      try {
+        await api(`/backups/${encodeURIComponent(backup.name)}`, { method: 'DELETE' });
+        await load();
+        toast(`Deleted ${backup.name}`);
+      } catch (error) { toast(error.message, true); }
+    };
+    row.querySelector('.secondary').onclick = async () => {
       if (!confirm(`Restore ${backup.name}? The current vault is backed up first, then replaced. Browsers pick up the restored vault on their next sync.`)) return;
       try {
         const result = await api(`/backups/${encodeURIComponent(backup.name)}/restore`, { method: 'POST', body: '{}' });

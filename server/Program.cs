@@ -430,6 +430,18 @@ app.MapPost("/api/admin/import", async (HttpContext context, SharedStateStore st
     catch (InvalidOperationException error) { return Results.BadRequest(new { error = error.Message }); }
 }).WithMetadata(new Microsoft.AspNetCore.Mvc.RequestSizeLimitAttribute(256L * 1024 * 1024));
 
+app.MapDelete("/api/admin/backups/{name}", async (HttpContext context, string name, SharedStateStore store) =>
+{
+    if (!Admin(context)) return Results.Unauthorized();
+    try
+    {
+        if (!await store.DeleteBackupAsync(name)) return Results.NotFound(new { error = "Backup not found" });
+        Record(context, "backup.deleted", name);
+        return Results.NoContent();
+    }
+    catch (InvalidOperationException error) { return Results.BadRequest(new { error = error.Message }); }
+});
+
 app.MapPost("/api/admin/backups/{name}/restore", async (HttpContext context, string name, SharedStateStore store) =>
 {
     if (!Admin(context)) return Results.Unauthorized();

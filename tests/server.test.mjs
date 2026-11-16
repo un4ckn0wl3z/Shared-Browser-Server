@@ -335,6 +335,21 @@ describe('management API', () => {
     await assert.rejects(server.admin('/backups/..%2Fstate.json/restore', 'POST', {}), { status: 400 });
   });
 
+  test('backups can be deleted one by one', async () => {
+    await server.admin('/profiles', 'POST', { name: 'Backup', domain: 'backup-delete.example', enabled: true, cookies: [] });
+    await server.admin('/profiles/purge', 'POST', { confirm: true });
+    const status = await server.status();
+    assert.ok(status.backupPolicy.keep >= 1 && status.backupPolicy.intervalMinutes >= 1);
+    const [first] = status.backups;
+    assert.ok(first);
+    const remove = name => server.admin(`/backups/${encodeURIComponent(name)}`, 'DELETE', undefined, true);
+    assert.equal((await remove(first.name)).status, 204);
+    assert.ok(!(await server.status()).backups.some(item => item.name === first.name));
+    assert.equal((await remove(first.name)).status, 404);
+    assert.equal((await remove('state.json')).status, 400);
+    assert.ok((await server.status()).audit.some(item => item.action === 'backup.deleted' && item.target === first.name));
+  });
+
   test('audit log records administration and failed sign-ins', async () => {
     assert.equal((await fetch(`${server.url}/api/admin/status`, { headers: { authorization: 'Bearer wrong' } })).status, 401);
     const actions = (await server.status()).audit.map(item => item.action);

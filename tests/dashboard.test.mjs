@@ -197,6 +197,13 @@ describe('dashboard', () => {
 
   test('lists backups and the audit log', async () => {
     await waitFor(async () => (await page.locator('#backups tr').count()) >= 1 && !(await page.textContent('#backups')).includes('No backups'), { message: 'backup rows' });
+    assert.match(await page.textContent('#backup-policy'), /Keeps the newest \d+ backups/);
+    const count = await page.locator('#backups tr').count();
+    page.once('dialog', dialog => dialog.accept());
+    await page.click('#backups tr:first-child button.danger');
+    await waitFor(async () => (await page.locator('#backups tr').count()) === count - 1 || /No backups/.test(await page.textContent('#backups')), { message: 'backup deleted' });
+    await page.click('#refresh');
+    await waitFor(async () => (await page.textContent('#audit')).includes('backup.deleted'), { message: 'deletion audited' });
     const audit = await page.textContent('#audit');
     for (const action of ['client_lock.updated', 'enrollment_code.created', 'device.enrolled', 'profile.updated', 'settings.updated', 'announcement.sent', 'profiles.deleted', 'profiles.purged']) assert.ok(audit.includes(action), action);
   });
