@@ -115,6 +115,11 @@ public sealed class DeviceRecord
     public int? MaxConnections { get; set; }
     public double? MonthlyQuotaGb { get; set; }
     public double? RateLimitMbps { get; set; }
+    /// <summary>
+    /// Which account this browser uses for a site that has several (profile domain → profile ID).
+    /// A site without an entry, or whose entry no longer exists, uses its first enabled account.
+    /// </summary>
+    public Dictionary<string, string> ActiveProfiles { get; set; } = [];
 }
 
 /// <summary>A single-use code an administrator hands to one browser instead of the administrator token.</summary>
@@ -148,7 +153,18 @@ public sealed record EnrollmentCodeResponse(string Id, string Code, string Label
 /// </summary>
 public sealed record SyncRequest(long KnownRevision, string PageUrl, List<SharedCookie>? Cookies, bool Complete = false);
 public sealed record SyncResponse(long Revision, int ChangedCookies, SharedSnapshot Snapshot);
-public sealed record SharedSnapshot(long Revision, DateTimeOffset UpdatedAt, BrowserSettings Settings, List<SessionProfile> Profiles, List<SharedBookmark> Bookmarks, List<ClientAnnouncement> Announcements);
+/// <summary>
+/// Profiles holds, per site, only the account the receiving browser uses, so clients that predate account
+/// switching keep working. Accounts lists every account the browser may switch to (without cookies).
+/// </summary>
+public sealed record SharedSnapshot(long Revision, DateTimeOffset UpdatedAt, BrowserSettings Settings, List<SessionProfile> Profiles, List<SharedBookmark> Bookmarks, List<ClientAnnouncement> Announcements)
+{
+    public List<ClientAccount> Accounts { get; init; } = [];
+}
+/// <summary>One account (session profile) of a site that a browser can switch to.</summary>
+public sealed record ClientAccount(string Id, string Name, string Domain, bool Active, int CookieCount);
+/// <summary>Adds an empty account for the site of PageUrl, which the primary browser then signs in to.</summary>
+public sealed record CreateAccountRequest(string? Name, string? PageUrl);
 public sealed record AnnouncementRequest(string? Title, string? Message, string? Level, string? Url, int? ExpiresInMinutes, bool ShareWithAllDevices = true, List<string>? AllowedDeviceIds = null);
 /// <summary>What a browser receives. Targeting stays on the server.</summary>
 public sealed record ClientAnnouncement(string Id, string Title, string Message, string Level, string Url, DateTimeOffset CreatedAt, DateTimeOffset? ExpiresAt)

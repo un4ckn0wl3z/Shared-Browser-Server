@@ -18,6 +18,7 @@
       <input id="address" aria-label="Address" placeholder="Search or enter address" autocomplete="off" spellcheck="false">
       <button id="go">Go</button>
       <button id="bookmarks" title="Shared bookmarks">★</button>
+      <button id="account" class="account" title="Shared accounts for this site" hidden></button>
       <div id="find-bar" class="find-bar" hidden>
         <input id="find-text" aria-label="Find in page" placeholder="Find in page" autocomplete="off" spellcheck="false">
         <span id="find-count"></span>
@@ -57,6 +58,18 @@
       <div id="update-result" class="info" hidden></div>
       <div id="settings-error" class="error"></div>
       <div class="actions"><button type="button" id="cancel">Cancel</button><button type="submit" class="primary">Save and restart</button></div>
+    </form>
+  </dialog>
+  <dialog id="account-dialog">
+    <form id="account-form">
+      <div class="dialog-title">
+        <div><strong>Add another account</strong><small id="account-site"></small></div>
+        <button type="button" id="account-close" class="compact">×</button>
+      </div>
+      <div class="info">The account you use now stays saved. This browser only clears the site's cookies locally, so the site shows its sign-in page; sign in with the other user and that session is saved as the new account. Switch between them with the account button. Do not use the site's own Sign out on an account you want to keep: that ends the saved session on the site's side.</div>
+      <label>Account name<input id="account-name" maxlength="80" required autocomplete="off" placeholder="For example: work, alice"></label>
+      <div id="account-error" class="error"></div>
+      <div class="actions"><button type="button" id="account-cancel">Cancel</button><button type="submit" class="primary">Add and sign in</button></div>
     </form>
   </dialog>
   <script src="renderer.js"></script>
