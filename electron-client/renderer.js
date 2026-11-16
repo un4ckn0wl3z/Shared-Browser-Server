@@ -342,6 +342,10 @@ const lockScreen = element('lock-screen');
 function updateLock(value) {
   requiredUpdate = value?.update || null;
   renderUpdateScreen();
+  const schedule = value?.schedule;
+  element('schedule-screen').hidden = !schedule;
+  if (schedule) element('schedule-text').textContent = `Allowed: ${schedule.days || 'no days'}, ${schedule.start}–${schedule.end} (${schedule.timeZone}).`;
+  if (schedule || requiredUpdate) for (const open of [dialog, accountDialog, downloadsDialog]) if (open.open) open.close();
   const locked = Boolean(value?.locked);
   const wasLocked = !lockScreen.hidden;
   lockScreen.hidden = !locked;
@@ -369,6 +373,83 @@ element('lock-form').addEventListener('submit', async event => {
   }
 });
 api.onLock(updateLock);
+
+// ---- Downloads ----
+const downloadsDialog = element('downloads-dialog');
+let downloadList = [];
+function formatSize(bytes) {
+  if (!bytes) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  const index = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1000)));
+  return `${(bytes / 1000 ** index).toFixed(index ? 1 : 0)} ${units[index]}`;
+}
+function renderDownloads(list) {
+  downloadList = list || [];
+  const active = downloadList.filter(item => item.state === 'progressing' || item.state === 'paused').length;
+  const badge = element('downloads-badge');
+  badge.hidden = active === 0;
+  badge.textContent = String(active);
+  const container = element('downloads-list');
+  if (!downloadList.length) {
+    container.innerHTML = '<p class="empty">No downloads in this session.</p>';
+    return;
+  }
+  container.replaceChildren(...downloadList.map(item => {
+    const row = document.createElement('div');
+    row.className = `download ${item.state}`;
+    const name = document.createElement('strong');
+    name.textContent = item.name;
+    name.title = item.url;
+    const detail = document.createElement('small');
+    const size = item.total ? `${formatSize(item.received)} of ${formatSize(item.total)}` : formatSize(item.received);
+    detail.textContent = {
+      progressing: `Downloading — ${size}`,
+      paused: `Paused — ${size}`,
+      completed: `Done — ${formatSize(item.received)}`,
+      cancelled: 'Cancelled',
+      interrupted: 'Failed',
+      blocked: 'Blocked by the administrator'
+    }[item.state] || item.state;
+    const actions = document.createElement('div');
+    actions.className = 'row-actions';
+    const button = (label, action) => {
+      const control = document.createElement('button');
+      control.type = 'button';
+      control.textContent = label;
+      control.dataset.action = action;
+      control.addEventListener('click', () => api.downloadAction(item.id, action));
+      return control;
+    };
+    if (item.state === 'progressing') actions.append(button('Pause', 'pause'), button('Cancel', 'cancel'));
+    else if (item.state === 'paused') actions.append(button('Resume', 'resume'), button('Cancel', 'cancel'));
+    else if (item.state === 'completed') actions.append(button('Open', 'open'), button('Show in folder', 'show'));
+    else actions.append(button('Remove', 'remove'));
+    row.append(name, actions, detail);
+    if (item.state === 'progressing' || item.state === 'paused') {
+      const bar = document.createElement('progress');
+      bar.max = item.total || 1;
+      bar.value = item.total ? item.received : 0;
+      if (!item.total) bar.removeAttribute('value');
+      row.append(bar);
+    }
+    return row;
+  }));
+}
+async function openDownloads() {
+  await api.setSettingsOpen(true);
+  renderDownloads(await api.downloads());
+  if (!downloadsDialog.open) downloadsDialog.showModal();
+}
+function closeDownloads() {
+  if (downloadsDialog.open) downloadsDialog.close();
+  api.setSettingsOpen(false);
+}
+element('downloads-button').addEventListener('click', openDownloads);
+element('downloads-close').addEventListener('click', closeDownloads);
+element('downloads-clear').addEventListener('click', () => api.clearDownloads());
+downloadsDialog.addEventListener('cancel', event => { event.preventDefault(); closeDownloads(); });
+api.onDownloads(renderDownloads);
+api.onDownloadStarted(item => { element('downloads-button').title = `Downloads — ${item.name}`; });
 element('update-required-action').addEventListener('click', () => {
   if (lastUpdate.state === 'available' || lastUpdate.state === 'ready') api.installUpdate();
   else api.checkForUpdates();

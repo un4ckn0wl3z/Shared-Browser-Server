@@ -143,6 +143,12 @@ export async function startSite() {
       '/other-login': ['other=1; Path=/; Max-Age=3600']
     }[url.pathname];
     if (cookies) response.setHeader('Set-Cookie', cookies);
+    if (url.pathname === '/file') {
+      response.setHeader('content-type', 'text/plain');
+      response.setHeader('content-disposition', 'attachment; filename="report.txt"');
+      response.end('quarterly numbers');
+      return;
+    }
     response.setHeader('content-type', 'text/html; charset=utf-8');
     response.end(`<title>Test ${url.pathname}</title><p id="c">${request.headers.cookie || ''}</p><p>needle one needle two needle three</p>`);
   });
@@ -284,4 +290,22 @@ export async function launchBrowser(home, profile) {
     async close() { await app.close(); }
   };
   return browser;
+}
+
+/** An HTTP endpoint that records every request (stands in for Discord, Telegram, LINE and S3 in tests). */
+export async function startCapture(status = 200) {
+  const requests = [];
+  const server = http.createServer((request, response) => {
+    const chunks = [];
+    request.on('data', chunk => chunks.push(chunk));
+    request.on('end', () => {
+      const body = Buffer.concat(chunks);
+      requests.push({ method: request.method, url: request.url, headers: request.headers, body, text: body.toString('utf8') });
+      response.statusCode = typeof status === 'function' ? status(request) : status;
+      response.end(response.statusCode < 300 ? '{"ok":true}' : '<Error><Code>AccessDenied</Code></Error>');
+    });
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address();
+  return { port, url: `http://127.0.0.1:${port}`, requests, close: () => new Promise(resolve => server.close(resolve)) };
 }

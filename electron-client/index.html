@@ -19,6 +19,7 @@
       <button id="go">Go</button>
       <button id="bookmarks" title="Shared bookmarks">★</button>
       <button id="account" class="account" title="Shared accounts for this site" hidden></button>
+      <button id="downloads-button" class="downloads-button" title="Downloads">⬇<span id="downloads-badge" class="badge" hidden></span></button>
       <div id="find-bar" class="find-bar" hidden>
         <input id="find-text" aria-label="Find in page" placeholder="Find in page" autocomplete="off" spellcheck="false">
         <span id="find-count"></span>
@@ -46,6 +47,15 @@
     </form>
   </div>
 
+  <div id="schedule-screen" class="lock-screen" hidden>
+    <div class="lock-card">
+      <div class="lock-icon" aria-hidden="true">🕘</div>
+      <h1>Outside the allowed hours</h1>
+      <p id="schedule-text"></p>
+      <small>Your administrator only allows this browser to be used at these times. It opens again on its own.</small>
+    </div>
+  </div>
+
   <div id="update-screen" class="lock-screen" hidden>
     <div class="lock-card">
       <div class="lock-icon" aria-hidden="true">⬆️</div>
@@ -55,6 +65,17 @@
       <button type="button" id="update-required-action" class="primary" hidden></button>
     </div>
   </div>
+
+  <dialog id="downloads-dialog" class="downloads-dialog">
+    <div class="dialog-body">
+      <div class="dialog-title">
+        <div><strong>Downloads</strong><small>Saved to your Downloads folder</small></div>
+        <button type="button" id="downloads-close" class="compact">×</button>
+      </div>
+      <div id="downloads-list" class="downloads-list"></div>
+      <div class="actions"><button type="button" id="downloads-clear">Clear finished</button></div>
+    </div>
+  </dialog>
 
   <dialog id="settings-dialog">
     <form id="settings-form">

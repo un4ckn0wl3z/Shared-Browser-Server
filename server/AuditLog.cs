@@ -55,7 +55,11 @@ public sealed class AuditLog
             catch (IOException error) { _logger.LogWarning(error, "Could not write the audit log"); }
         }
         _logger.LogInformation("Audit {Action} by {Actor} on {Target} {Details}", action, actor, target, details);
+        try { Recorded?.Invoke(entry); } catch (Exception error) { _logger.LogWarning(error, "Audit listener failed"); }
     }
+
+    /// <summary>Raised after every entry; the notifier turns some of them into alerts.</summary>
+    public event Action<AuditEntry>? Recorded;
 
     /// <summary>Records a failed sign-in at most once per address and action every few minutes.</summary>
     public void RecordFailure(string action, string ip, string details = "")

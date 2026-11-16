@@ -10,6 +10,11 @@ builder.Services.AddSingleton<ProxyUsageTracker>();
 builder.Services.AddSingleton<SharedStateStore>();
 builder.Services.AddSingleton<ForwardProxyService>();
 builder.Services.AddHostedService(provider => provider.GetRequiredService<ForwardProxyService>());
+builder.Services.AddSingleton<Notifier>();
+builder.Services.AddHostedService(provider => provider.GetRequiredService<Notifier>());
+builder.Services.AddSingleton<OffsiteUploader>();
+builder.Services.AddHostedService(provider => provider.GetRequiredService<OffsiteUploader>());
+builder.Services.AddHostedService<HealthMonitor>();
 var app = builder.Build();
 
 var adminToken = Environment.GetEnvironmentVariable("SHARED_BROWSER_ADMIN_TOKEN");
@@ -45,6 +50,9 @@ app.UseDefaultFiles();
 app.UseStaticFiles(new StaticFileOptions { OnPrepareResponse = file => file.Context.Response.Headers.CacheControl = "no-cache" });
 
 var audit = app.Services.GetRequiredService<AuditLog>();
+// Events the vault notices itself (a shared session signed out, a backup that failed) go to the audit log,
+// which also turns them into alerts.
+app.Services.GetRequiredService<SharedStateStore>().Activity += (action, target, details) => audit.Record("server", action, target, details);
 
 string Ip(HttpContext context) => context.Connection.RemoteIpAddress?.ToString() ?? "";
 
@@ -212,6 +220,16 @@ app.MapPost("/api/client/unlock-report", (HttpContext context, UnlockReport repo
     return Results.NoContent();
 });
 
+// Browsers acknowledge each administrator action after running it, so it is not delivered again.
+app.MapPost("/api/client/commands/{id}/ack", async (HttpContext context, string id, SharedStateStore store) =>
+{
+    var device = DeviceAuthorized(context.Request, store);
+    if (device is null) return Results.Unauthorized();
+    var command = await store.RemoveCommandAsync(device.Id, id);
+    if (command is not null) audit.Record($"device:{device.Name}", "device.command_done", device.Name, CommandLabel(command), Ip(context));
+    return Results.NoContent();
+});
+
 // ---- Administration -------------------------------------------------------------------------------
 
 app.MapGet("/api/admin/status", async (HttpContext context, SharedStateStore store, ForwardProxyService proxy) =>
@@ -239,6 +257,81 @@ app.MapPut("/api/admin/client-lock", async (HttpContext context, ClientLockReque
         var changes = await store.SetClientLockAsync(request);
         Record(context, "client_lock.updated", "", changes);
         return Results.Json(new { store.Settings.ClientLock.Enabled, store.Settings.ClientLock.ChangedAt });
+    }
+    catch (InvalidOperationException error) { return Results.BadRequest(new { error = error.Message }); }
+});
+
+app.MapPut("/api/admin/notifications", async (HttpContext context, NotificationSettings settings, SharedStateStore store) =>
+{
+    if (!Admin(context)) return Results.Unauthorized();
+    try
+    {
+        var summary = await store.SetNotificationsAsync(settings);
+        Record(context, "notifications.updated", "", summary);
+        return Results.Json(Notifier.Public(store.NotificationSettings()));
+    }
+    catch (InvalidOperationException error) { return Results.BadRequest(new { error = error.Message }); }
+});
+
+app.MapPost("/api/admin/notifications/test", async (HttpContext context, SharedStateStore store, Notifier notifier) =>
+{
+    if (!Admin(context)) return Results.Unauthorized();
+    var results = await notifier.SendAsync(store.NotificationSettings(), "Test notification", "Alerts from Shared Browser reach this channel.", context.RequestAborted);
+    if (results.Count == 0) return Results.BadRequest(new { error = "Set up Discord, Telegram or LINE first" });
+    Record(context, "notifications.tested", "", string.Join("; ", results.Select(item => $"{item.Channel}: {(item.Ok ? "ok" : item.Error)}")));
+    return Results.Json(new { results });
+});
+
+app.MapPut("/api/admin/offsite-backup", async (HttpContext context, OffsiteBackupSettings settings, SharedStateStore store) =>
+{
+    if (!Admin(context)) return Results.Unauthorized();
+    try
+    {
+        var summary = await store.SetOffsiteBackupAsync(settings);
+        Record(context, "offsite_backup.updated", "", summary);
+        return Results.Json(OffsiteUploader.Public(store.OffsiteSettings()));
+    }
+    catch (InvalidOperationException error) { return Results.BadRequest(new { error = error.Message }); }
+});
+
+app.MapPost("/api/admin/offsite-backup/upload", async (HttpContext context, OffsiteUploader uploader) =>
+{
+    if (!Admin(context)) return Results.Unauthorized();
+    var (name, error) = await uploader.UploadLatestAsync(context.RequestAborted);
+    return error.Length == 0 ? Results.Json(new { ok = true, name }) : Results.BadRequest(new { error, name });
+});
+
+app.MapPost("/api/admin/devices/{id}/commands", async (HttpContext context, string id, DeviceCommandRequest request, SharedStateStore store) =>
+{
+    if (!Admin(context)) return Results.Unauthorized();
+    try
+    {
+        var command = await store.AddCommandAsync(id, request);
+        if (command is null) return Results.NotFound(new { error = "Browser not found" });
+        Record(context, "device.command_sent", store.DeviceName(id), CommandLabel(command));
+        return Results.Json(command, statusCode: StatusCodes.Status201Created);
+    }
+    catch (InvalidOperationException error) { return Results.BadRequest(new { error = error.Message }); }
+});
+
+app.MapDelete("/api/admin/devices/{id}/commands/{commandId}", async (HttpContext context, string id, string commandId, SharedStateStore store) =>
+{
+    if (!Admin(context)) return Results.Unauthorized();
+    var command = await store.RemoveCommandAsync(id, commandId);
+    if (command is null) return Results.NotFound(new { error = "The action already ran or was cancelled" });
+    Record(context, "device.command_cancelled", store.DeviceName(id), CommandLabel(command));
+    return Results.NoContent();
+});
+
+app.MapPut("/api/admin/devices/{id}/settings", async (HttpContext context, string id, DeviceSettingsRequest request, SharedStateStore store) =>
+{
+    if (!Admin(context)) return Results.Unauthorized();
+    try
+    {
+        var summary = await store.SetDeviceSettingsAsync(id, request);
+        if (summary is null) return Results.NotFound(new { error = "Browser not found" });
+        Record(context, "device.settings_updated", store.DeviceName(id), summary);
+        return Results.NoContent();
     }
     catch (InvalidOperationException error) { return Results.BadRequest(new { error = error.Message }); }
 });
@@ -456,6 +549,8 @@ app.MapPost("/api/admin/backups/{name}/restore", async (HttpContext context, str
 });
 
 app.Run();
+
+static string CommandLabel(DeviceCommand command) => command.Argument.Length > 0 ? $"{command.Type} {command.Argument}" : command.Type;
 
 static IResult UpdateRequired(SharedStateStore store) =>
     Results.Json(new { error = store.UpdateRequiredMessage, updateRequired = true, minimumVersion = store.Settings.MinimumClientVersion }, statusCode: StatusCodes.Status426UpgradeRequired);

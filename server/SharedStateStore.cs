@@ -40,8 +40,23 @@ public sealed partial class SharedStateStore
     private DateTimeOffset _lastBackup;
     private volatile SharedSnapshot _snapshot = null!;
     private volatile IReadOnlyDictionary<string, DeviceAuth> _deviceIndex = new Dictionary<string, DeviceAuth>();
-    private volatile IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>> _accountChoices = new Dictionary<string, IReadOnlyDictionary<string, string>>();
+    private volatile IReadOnlyDictionary<string, DeviceView> _deviceViews = new Dictionary<string, DeviceView>();
+    private volatile NotificationSettings _notifications = new();
+    private volatile OffsiteBackupSettings _offsite = new();
     private static readonly IReadOnlyDictionary<string, string> NoChoices = new Dictionary<string, string>();
+
+    /// <summary>What one browser's snapshot needs beyond the shared state (published with the snapshot).</summary>
+    private sealed record DeviceView(IReadOnlyDictionary<string, string> Choices, string HomePage, SiteFilterSettings? SiteFilter, bool ScheduleExempt, List<ClientCommand> Commands);
+
+    /// <summary>Raised (on the thread pool, never under the gate) for events the audit log and alerts should know about.</summary>
+    public event Action<string, string, string>? Activity;
+    /// <summary>Raised with the file name after every backup is written.</summary>
+    public event Action<string>? BackupCreated;
+    public string BackupDirectory => _backupDirectory;
+    private void RaiseActivity(string action, string target, string details) => Task.Run(() => Activity?.Invoke(action, target, details));
+
+    public NotificationSettings NotificationSettings() => _notifications;
+    public OffsiteBackupSettings OffsiteSettings() => _offsite;
     private TaskCompletionSource _revisionChanged = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private long _publishedRevision = -1;
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> _liveConnections = new();
@@ -72,7 +87,8 @@ public sealed partial class SharedStateStore
     public SharedSnapshot SnapshotFor(string deviceId)
     {
         var snapshot = _snapshot;
-        var choices = _accountChoices.GetValueOrDefault(deviceId) ?? NoChoices;
+        var view = _deviceViews.GetValueOrDefault(deviceId);
+        var choices = view?.Choices ?? NoChoices;
         var profiles = new List<SessionProfile>();
         var accounts = new List<ClientAccount>();
         foreach (var site in snapshot.Profiles.Where(profile => Shares(profile, deviceId)).GroupBy(profile => profile.Domain))
@@ -84,11 +100,22 @@ public sealed partial class SharedStateStore
             profiles.Add(active);
             accounts.AddRange(usable.Select(profile => new ClientAccount(profile.Id, profile.Name, profile.Domain, profile == active, profile.Cookies.Count)));
         }
+        var settings = snapshot.Settings;
+        if (view is not null && (view.HomePage.Length > 0 || view.SiteFilter is not null || view.ScheduleExempt))
+        {
+            settings = CloneSettings(settings);
+            settings.Proxy.CertificateSha256 = snapshot.Settings.Proxy.CertificateSha256;
+            if (view.HomePage.Length > 0) settings.HomePage = view.HomePage;
+            if (view.SiteFilter is not null) settings.SiteFilter = CloneSiteFilter(view.SiteFilter);
+            if (view.ScheduleExempt) settings.Schedule.Enabled = false;
+        }
         return snapshot with
         {
+            Settings = settings,
             Profiles = profiles,
             Announcements = snapshot.Announcements.Where(item => item.ShareWithAllDevices || item.AllowedDeviceIds.Contains(deviceId)).ToList(),
-            Accounts = accounts
+            Accounts = accounts,
+            Commands = view?.Commands ?? []
         };
     }
 
@@ -205,6 +232,8 @@ public sealed partial class SharedStateStore
                 profiles = _state.Profiles.Select(profile => new
                 {
                     accounts = _state.Profiles.Count(item => item.Domain == profile.Domain),
+                    profile.SessionCookie,
+                    health = SessionHealth(profile, _state.Notifications.ExpiryWarningDays),
                     // False when a sharing list is in use and does not cover the profile: the primary browser no longer updates it.
                     listed = ShareableSiteLocked(profile.Domain) is not null,
                     usedBy = _state.Devices.Where(device => !device.Revoked && ActiveAccountLocked(device, _state.Profiles.Where(item => item.Domain == profile.Domain), true) == profile).Select(device => device.Name).ToList(),
@@ -227,6 +256,10 @@ public sealed partial class SharedStateStore
                     device.ClientVersion,
                     device.NetworkMode,
                     limitOverrides = new { device.MaxConnections, device.MonthlyQuotaGb, device.RateLimitMbps },
+                    device.HomePage,
+                    device.SiteFilter,
+                    device.ScheduleExempt,
+                    pendingCommands = device.Commands.Where(command => command.CreatedAt > now - CommandLifetime).Select(CloneCommand).ToList(),
                     usage = usage(device.Id),
                     primary = device.Id == _state.Settings.PrimaryDeviceId,
                     live = _liveConnections.GetValueOrDefault(device.Id) > 0
@@ -266,6 +299,8 @@ public sealed partial class SharedStateStore
                 proxy = proxyStatus,
                 backups = ListBackups(),
                 backupPolicy = new { keep = _backupKeep, intervalMinutes = (int)_backupInterval.TotalMinutes },
+                notifications = Notifier.Public(_state.Notifications),
+                offsiteBackup = OffsiteUploader.Public(_state.OffsiteBackup),
                 audit
             };
         }
@@ -417,6 +452,10 @@ public sealed partial class SharedStateStore
         if (!AutoShareScopes.Contains(scope)) throw new InvalidOperationException("Automatic sharing must cover all sites or only the listed sites");
         var sharedSites = CleanSiteList(settings.AutoShareDomains);
         if (settings.AutoShareCookies && scope == "listed" && sharedSites.Count == 0) throw new InvalidOperationException("List at least one site to share, or choose another sharing option");
+        var siteFilter = CleanSiteFilter(settings.SiteFilter);
+        var schedule = CleanSchedule(settings.Schedule);
+        var dataControls = settings.DataControls ?? new DataControls();
+        dataControls = new DataControls { BlockDownloads = dataControls.BlockDownloads, BlockUploads = dataControls.BlockUploads, BlockCopy = dataControls.BlockCopy, Domains = CleanSiteList(dataControls.Domains) };
         await _gate.WaitAsync();
         try
         {
@@ -429,6 +468,9 @@ public sealed partial class SharedStateStore
             Compare("primary browser", before.PrimaryDeviceId.Length == 0 ? "automatic" : DeviceName(before.PrimaryDeviceId), primaryDeviceId.Length == 0 ? "automatic" : DeviceName(primaryDeviceId));
             Compare("automatic sharing", SharingSummary(before.AutoShareCookies, before.AutoShareScope), SharingSummary(settings.AutoShareCookies, scope));
             Compare("shared sites", string.Join(", ", before.AutoShareDomains), string.Join(", ", sharedSites));
+            Compare("site filter", $"{before.SiteFilter.Mode} {string.Join(", ", before.SiteFilter.Domains)}".Trim(), $"{siteFilter.Mode} {string.Join(", ", siteFilter.Domains)}".Trim());
+            Compare("allowed hours", ScheduleSummary(before.Schedule), ScheduleSummary(schedule));
+            Compare("data controls", DataControlsSummary(before.DataControls), DataControlsSummary(dataControls));
             Compare("admin-token enrollment", before.AllowAdminTokenEnrollment, settings.AllowAdminTokenEnrollment);
             Compare("proxy enabled", before.Proxy.Enabled, settings.Proxy.Enabled);
             Compare("proxy endpoint", $"{before.Proxy.Host}:{before.Proxy.Port}", $"{settings.Proxy.Host}:{settings.Proxy.Port}");
@@ -458,7 +500,10 @@ public sealed partial class SharedStateStore
                 Proxy = CloneProxySettings(settings.Proxy),
                 // The unlock code has its own endpoint; saving the other settings never changes it.
                 ClientLock = CloneClientLock(before.ClientLock),
-                MinimumClientVersion = minimumVersion
+                MinimumClientVersion = minimumVersion,
+                SiteFilter = siteFilter,
+                Schedule = schedule,
+                DataControls = dataControls
             };
             BumpRevision();
             await SaveLockedAsync();
@@ -505,6 +550,7 @@ public sealed partial class SharedStateStore
     {
         var code = (request.Code ?? "").Trim().Normalize(NormalizationForm.FormC);
         if (code.Length > 0 && (code.Length is < 4 or > 128 || code.Any(char.IsControl))) throw new InvalidOperationException("The unlock code must be 4 to 128 characters");
+        if (request.IdleMinutes is < 0 or > 24 * 60) throw new InvalidOperationException("Lock after idle must be between 0 (never) and 1440 minutes");
         await _gate.WaitAsync();
         try
         {
@@ -512,6 +558,8 @@ public sealed partial class SharedStateStore
             if (request.Enabled && code.Length == 0 && current.Hash.Length == 0) throw new InvalidOperationException("Enter an unlock code");
             var next = CloneClientLock(current);
             next.Enabled = request.Enabled;
+            next.IdleMinutes = request.IdleMinutes;
+            next.LockOnSystemLock = request.LockOnSystemLock;
             if (code.Length > 0)
             {
                 var salt = RandomNumberGenerator.GetBytes(16);
@@ -523,6 +571,8 @@ public sealed partial class SharedStateStore
             var changes = new List<string>();
             if (current.Enabled != next.Enabled) changes.Add(next.Enabled ? "enabled" : "disabled");
             if (code.Length > 0) changes.Add("code changed");
+            if (current.IdleMinutes != next.IdleMinutes) changes.Add(next.IdleMinutes > 0 ? $"locks after {next.IdleMinutes} idle minutes" : "no idle lock");
+            if (current.LockOnSystemLock != next.LockOnSystemLock) changes.Add(next.LockOnSystemLock ? "locks with the computer" : "does not lock with the computer");
             if (changes.Count == 0) return "no changes";
             _state.Settings.ClientLock = next;
             BumpRevision();
@@ -556,7 +606,8 @@ public sealed partial class SharedStateStore
             var text = (item.Url ?? "").Trim();
             if (!Uri.TryCreate(text, UriKind.Absolute, out var url) || url.Scheme is not ("http" or "https") || text.Length > 2000) throw new InvalidOperationException($"Bookmark URL is invalid: {text}");
             var title = string.IsNullOrWhiteSpace(item.Title) ? url.Host : item.Title.Trim();
-            return new SharedBookmark { Title = title[..Math.Min(120, title.Length)], Url = url.AbsoluteUri };
+            var folder = CleanName(item.Folder, "");
+            return new SharedBookmark { Title = title[..Math.Min(120, title.Length)], Url = url.AbsoluteUri, Folder = folder[..Math.Min(60, folder.Length)] };
         }).ToList();
         await _gate.WaitAsync();
         try
@@ -602,6 +653,7 @@ public sealed partial class SharedStateStore
             {
                 Id = id ?? Guid.NewGuid().ToString("N"),
                 Name = CleanName(input.Name, domain),
+                SessionCookie = CleanName(input.SessionCookie, "").Replace(" ", ""),
                 Domain = domain,
                 Enabled = input.Enabled,
                 ShareWithAllDevices = input.ShareWithAllDevices,
@@ -774,6 +826,175 @@ public sealed partial class SharedStateStore
         finally { _gate.Release(); }
     }
 
+    // ---- Notifications and offsite backups ---------------------------------------------------------
+
+    public async Task<string> SetNotificationsAsync(NotificationSettings input)
+    {
+        await _gate.WaitAsync();
+        try
+        {
+            _state.Notifications = Notifier.Clean(input, _state.Notifications);
+            await SaveLockedAsync(backup: false);
+            var channels = new[] { _state.Notifications.DiscordWebhookUrl.Length > 0 ? "Discord" : "", _state.Notifications.TelegramBotToken.Length > 0 ? "Telegram" : "", _state.Notifications.LineChannelToken.Length > 0 ? "LINE" : "" }.Where(item => item.Length > 0).ToList();
+            return $"channels: {(channels.Count == 0 ? "none" : string.Join(", ", channels))}; events: {string.Join(", ", _state.Notifications.Events)}";
+        }
+        finally { _gate.Release(); }
+    }
+
+    public async Task<string> SetOffsiteBackupAsync(OffsiteBackupSettings input)
+    {
+        await _gate.WaitAsync();
+        try
+        {
+            var current = _state.OffsiteBackup;
+            var clean = OffsiteUploader.Clean(input, current);
+            clean.LastUploadAt = current.LastUploadAt;
+            clean.LastUploadName = current.LastUploadName;
+            clean.LastError = current.LastError;
+            _state.OffsiteBackup = clean;
+            await SaveLockedAsync(backup: false);
+            return clean.Enabled ? $"to {clean.Endpoint}/{clean.Bucket}/{clean.Prefix}" : "disabled";
+        }
+        finally { _gate.Release(); }
+    }
+
+    public async Task RecordOffsiteResultAsync(string name, string error)
+    {
+        await _gate.WaitAsync();
+        try
+        {
+            if (error.Length == 0) { _state.OffsiteBackup.LastUploadAt = DateTimeOffset.UtcNow; _state.OffsiteBackup.LastUploadName = name; }
+            _state.OffsiteBackup.LastError = error;
+            await SaveLockedAsync(backup: false);
+        }
+        finally { _gate.Release(); }
+    }
+
+    // ---- Session health ---------------------------------------------------------------------------
+
+    /// <summary>
+    /// The cookies that hold a profile's sign-in: the one named in the profile, or else HttpOnly cookies that
+    /// are not short-lived (anti-bot and CSRF cookies that last less than a day are left out).
+    /// </summary>
+    private static List<SharedCookie> SignInCookies(SessionProfile profile)
+    {
+        if (profile.SessionCookie.Length > 0) return profile.Cookies.Where(cookie => cookie.Name == profile.SessionCookie).ToList();
+        return profile.Cookies.Where(cookie => cookie.HttpOnly && (cookie.ExpiresAt is not { } expires || expires - cookie.UpdatedAt.ToUnixTimeSeconds() >= 24 * 60 * 60)).ToList();
+    }
+
+    private static string ProfileLabel(SessionProfile profile) => profile.Name == profile.Domain ? profile.Domain : $"{profile.Domain} ({profile.Name})";
+
+    private static object SessionHealth(SessionProfile profile, int warningDays)
+    {
+        var lastUpdate = profile.Cookies.Select(cookie => (DateTimeOffset?)cookie.UpdatedAt).Max();
+        if (profile.Cookies.Count == 0) return new { state = "empty", expiresAt = (DateTimeOffset?)null, lastUpdate };
+        var signIn = SignInCookies(profile);
+        if (signIn.Count == 0) return new { state = "signed-out", expiresAt = (DateTimeOffset?)null, lastUpdate };
+        var expiry = signIn.Where(cookie => cookie.ExpiresAt is not null).Select(cookie => cookie.ExpiresAt!.Value).DefaultIfEmpty(0).Min();
+        if (expiry == 0) return new { state = "ok", expiresAt = (DateTimeOffset?)null, lastUpdate };
+        var expiresAt = DateTimeOffset.FromUnixTimeSeconds((long)expiry);
+        return new { state = expiresAt - DateTimeOffset.UtcNow < TimeSpan.FromDays(warningDays) ? "expiring" : "ok", expiresAt = (DateTimeOffset?)expiresAt, lastUpdate };
+    }
+
+    /// <summary>Enabled profiles whose sign-in expires within the warning period: (label, expiry).</summary>
+    public async Task<List<(string Label, DateTimeOffset ExpiresAt)>> ExpiringSessionsAsync()
+    {
+        await _gate.WaitAsync();
+        try
+        {
+            var limit = DateTimeOffset.UtcNow.AddDays(_state.Notifications.ExpiryWarningDays).ToUnixTimeSeconds();
+            return _state.Profiles.Where(profile => profile.Enabled)
+                .Select(profile => (profile, expiry: SignInCookies(profile).Where(cookie => cookie.ExpiresAt is not null).Select(cookie => cookie.ExpiresAt!.Value).DefaultIfEmpty(0).Min()))
+                .Where(item => item.expiry > 0 && item.expiry < limit)
+                .Select(item => (ProfileLabel(item.profile), DateTimeOffset.FromUnixTimeSeconds((long)item.expiry)))
+                .ToList();
+        }
+        finally { _gate.Release(); }
+    }
+
+    public async Task<List<(string Id, string Name, DateTimeOffset LastSeenAt, bool Revoked)>> DeviceStatusesAsync()
+    {
+        await _gate.WaitAsync();
+        try { return _state.Devices.Select(device => (device.Id, device.Name, device.LastSeenAt, device.Revoked)).ToList(); }
+        finally { _gate.Release(); }
+    }
+
+    // ---- Per-browser settings and commands --------------------------------------------------------
+
+    public static readonly string[] CommandTypes = ["lock", "close-tabs", "clear-site", "restart", "open-url"];
+    private static readonly TimeSpan CommandLifetime = TimeSpan.FromDays(1);
+
+    public async Task<DeviceCommand?> AddCommandAsync(string deviceId, DeviceCommandRequest request)
+    {
+        var type = (request.Type ?? "").Trim().ToLowerInvariant();
+        if (!CommandTypes.Contains(type)) throw new InvalidOperationException("Unknown action");
+        var argument = (request.Argument ?? "").Trim();
+        if (type == "open-url")
+        {
+            if (!Uri.TryCreate(argument, UriKind.Absolute, out var url) || url.Scheme is not ("http" or "https") || argument.Length > 2000) throw new InvalidOperationException("Enter an HTTP or HTTPS address to open");
+            argument = url.AbsoluteUri;
+        }
+        else if (type == "clear-site")
+        {
+            var sites = CleanSiteList([argument]);
+            if (sites.Count != 1) throw new InvalidOperationException("Enter the site whose cookies should be cleared, for example github.com");
+            argument = sites[0];
+        }
+        else argument = "";
+        await _gate.WaitAsync();
+        try
+        {
+            var device = _state.Devices.FirstOrDefault(item => item.Id == deviceId);
+            if (device is null) return null;
+            device.Commands.RemoveAll(command => command.CreatedAt < DateTimeOffset.UtcNow - CommandLifetime);
+            if (device.Commands.Count >= 20) throw new InvalidOperationException("This browser already has 20 actions waiting. It runs them the next time it connects");
+            var command = new DeviceCommand { Id = Guid.NewGuid().ToString("N"), Type = type, Argument = argument, CreatedAt = DateTimeOffset.UtcNow };
+            device.Commands.Add(command);
+            BumpRevision();
+            await SaveLockedAsync(backup: false);
+            return CloneCommand(command);
+        }
+        finally { _gate.Release(); }
+    }
+
+    /// <summary>Removes a pending command: the browser ran it (acknowledged) or the administrator cancelled it.</summary>
+    public async Task<DeviceCommand?> RemoveCommandAsync(string deviceId, string commandId)
+    {
+        await _gate.WaitAsync();
+        try
+        {
+            var device = _state.Devices.FirstOrDefault(item => item.Id == deviceId);
+            var command = device?.Commands.FirstOrDefault(item => item.Id == commandId);
+            if (command is null) return null;
+            device!.Commands.Remove(command);
+            await SaveLockedAsync(backup: false);
+            return command;
+        }
+        finally { _gate.Release(); }
+    }
+
+    public async Task<string?> SetDeviceSettingsAsync(string deviceId, DeviceSettingsRequest request)
+    {
+        var homePage = (request.HomePage ?? "").Trim();
+        if (homePage.Length > 0)
+        {
+            if (!Uri.TryCreate(homePage, UriKind.Absolute, out var home) || home.Scheme is not ("http" or "https") || homePage.Length > 2000) throw new InvalidOperationException("Home page must be empty or an HTTP or HTTPS address");
+            homePage = home.AbsoluteUri;
+        }
+        var filter = request.SiteFilter is null ? null : CleanSiteFilter(request.SiteFilter);
+        await _gate.WaitAsync();
+        try
+        {
+            var device = _state.Devices.FirstOrDefault(item => item.Id == deviceId);
+            if (device is null) return null;
+            (device.HomePage, device.SiteFilter, device.ScheduleExempt) = (homePage, filter, request.ScheduleExempt);
+            BumpRevision();
+            await SaveLockedAsync();
+            return $"{device.Name}: home page {(homePage.Length == 0 ? "shared" : homePage)}; site filter {(filter is null ? "shared" : $"{filter.Mode} {string.Join(", ", filter.Domains)}".Trim())}; {(request.ScheduleExempt ? "any time" : "allowed hours apply")}";
+        }
+        finally { _gate.Release(); }
+    }
+
     // ---- Accounts ---------------------------------------------------------------------------------
 
     /// <summary>
@@ -891,6 +1112,7 @@ public sealed partial class SharedStateStore
             var changed = 0;
             var adopted = false;
             var seen = new HashSet<string>();
+            var signedIn = SignInCookies(profile).Count > 0;
             foreach (var incoming in incomingCookies.Take(MaxCookiesPerRequest))
             {
                 var cookie = ValidateCookie(incoming, profile.Domain, deviceId);
@@ -915,6 +1137,8 @@ public sealed partial class SharedStateStore
             if (request.Complete)
             {
                 changed += profile.Cookies.RemoveAll(item => item.Domain == host && item.SourceDeviceId != AdminSource && !seen.Contains(CookieKey(item)));
+                // The primary browser no longer holds the sign-in: everyone sharing this profile is now signed out.
+                if (signedIn && SignInCookies(profile).Count == 0) RaiseActivity(NotificationEvents.SessionLost, ProfileLabel(profile), $"signed out on {_state.Devices.First(item => item.Id == deviceId).Name}");
             }
             if (changed > 0 || profileCreated || settingsChanged)
             {
@@ -1000,6 +1224,14 @@ public sealed partial class SharedStateStore
 
     private async Task<string> BackupLockedAsync(string suffix = "")
     {
+        var name = await WriteBackupLockedAsync(suffix);
+        var created = BackupCreated;
+        if (created is not null) _ = Task.Run(() => created(name));
+        return name;
+    }
+
+    private async Task<string> WriteBackupLockedAsync(string suffix)
+    {
         await SaveLockedAsync(publish: false, backup: false);
         var name = $"state-{DateTimeOffset.UtcNow:yyyyMMdd'T'HHmmss'Z'}{(suffix.Length > 0 ? "-" + suffix : "")}.json";
         File.Copy(_path, Path.Combine(_backupDirectory, name), true);
@@ -1044,7 +1276,29 @@ public sealed partial class SharedStateStore
             profile.Cookies ??= [];
             profile.AllowedDeviceIds ??= [];
         }
-        foreach (var device in disk.Devices) device.ActiveProfiles ??= [];
+        foreach (var device in disk.Devices)
+        {
+            device.ActiveProfiles ??= [];
+            device.HomePage ??= "";
+            device.Commands ??= [];
+        }
+        disk.Settings.SiteFilter ??= new SiteFilterSettings();
+        disk.Settings.SiteFilter.Domains ??= [];
+        disk.Settings.Schedule ??= new UsageSchedule();
+        disk.Settings.Schedule.Days ??= [];
+        disk.Settings.DataControls ??= new DataControls();
+        disk.Settings.DataControls.Domains ??= [];
+        foreach (var bookmark in disk.Bookmarks) bookmark.Folder ??= "";
+        foreach (var profile in disk.Profiles) profile.SessionCookie ??= "";
+        disk.Notifications ??= new NotificationSettings();
+        disk.Notifications.Events ??= [];
+        disk.Notifications.DiscordWebhookUrl = Decrypt(disk.Notifications.DiscordWebhookUrl ?? "");
+        disk.Notifications.TelegramBotToken = Decrypt(disk.Notifications.TelegramBotToken ?? "");
+        disk.Notifications.TelegramChatId ??= "";
+        disk.Notifications.LineChannelToken = Decrypt(disk.Notifications.LineChannelToken ?? "");
+        disk.Notifications.LineTo ??= "";
+        disk.OffsiteBackup ??= new OffsiteBackupSettings();
+        disk.OffsiteBackup.SecretAccessKey = Decrypt(disk.OffsiteBackup.SecretAccessKey ?? "");
         foreach (var cookie in disk.Profiles.SelectMany(profile => profile.Cookies)) cookie.Value = Decrypt(cookie.Value);
         return disk;
     }
@@ -1056,7 +1310,7 @@ public sealed partial class SharedStateStore
             Revision = _state.Revision,
             UpdatedAt = _state.UpdatedAt,
             Settings = CloneSettings(_state.Settings),
-            Devices = _state.Devices.Select(device => new DeviceRecord { Id = device.Id, Name = device.Name, TokenHash = device.TokenHash, EnrolledAt = device.EnrolledAt, LastSeenAt = device.LastSeenAt, Revoked = device.Revoked, ClientVersion = device.ClientVersion, NetworkMode = device.NetworkMode, MaxConnections = device.MaxConnections, MonthlyQuotaGb = device.MonthlyQuotaGb, RateLimitMbps = device.RateLimitMbps, ActiveProfiles = new(device.ActiveProfiles) }).ToList(),
+            Devices = _state.Devices.Select(device => new DeviceRecord { Id = device.Id, Name = device.Name, TokenHash = device.TokenHash, EnrolledAt = device.EnrolledAt, LastSeenAt = device.LastSeenAt, Revoked = device.Revoked, ClientVersion = device.ClientVersion, NetworkMode = device.NetworkMode, MaxConnections = device.MaxConnections, MonthlyQuotaGb = device.MonthlyQuotaGb, RateLimitMbps = device.RateLimitMbps, ActiveProfiles = new(device.ActiveProfiles), HomePage = device.HomePage, SiteFilter = device.SiteFilter is null ? null : CloneSiteFilter(device.SiteFilter), ScheduleExempt = device.ScheduleExempt, Commands = device.Commands.Select(CloneCommand).ToList() }).ToList(),
             Profiles = _state.Profiles.Select(CloneProfile).ToList(),
             Bookmarks = _state.Bookmarks.Select(CloneBookmark).ToList(),
             EnrollmentCodes = _state.EnrollmentCodes.Select(code => new EnrollmentCode { Id = code.Id, CodeHash = code.CodeHash, Label = code.Label, CreatedAt = code.CreatedAt, ExpiresAt = code.ExpiresAt, UsedAt = code.UsedAt, UsedByDeviceId = code.UsedByDeviceId, Revoked = code.Revoked }).ToList(),
@@ -1064,6 +1318,13 @@ public sealed partial class SharedStateStore
         };
         disk.Settings.Proxy.CertificateSha256 = "";
         foreach (var cookie in disk.Profiles.SelectMany(profile => profile.Cookies)) cookie.Value = Encrypt(cookie.Value);
+        // Webhook URLs, bot tokens and storage keys are as sensitive as cookies.
+        disk.Notifications = CloneNotifications(_state.Notifications);
+        disk.Notifications.DiscordWebhookUrl = EncryptSecret(disk.Notifications.DiscordWebhookUrl);
+        disk.Notifications.TelegramBotToken = EncryptSecret(disk.Notifications.TelegramBotToken);
+        disk.Notifications.LineChannelToken = EncryptSecret(disk.Notifications.LineChannelToken);
+        disk.OffsiteBackup = CloneOffsite(_state.OffsiteBackup);
+        disk.OffsiteBackup.SecretAccessKey = EncryptSecret(disk.OffsiteBackup.SecretAccessKey);
         var temp = _path + ".tmp";
         await File.WriteAllTextAsync(temp, JsonSerializer.Serialize(disk, JsonOptions));
         File.Move(temp, _path, true);
@@ -1071,7 +1332,11 @@ public sealed partial class SharedStateStore
         if (backup && DateTimeOffset.UtcNow - _lastBackup >= _backupInterval)
         {
             try { await BackupLockedAsync(); }
-            catch (IOException error) { _logger.LogWarning(error, "Automatic vault backup failed"); }
+            catch (IOException error)
+            {
+                _logger.LogWarning(error, "Automatic vault backup failed");
+                RaiseActivity(NotificationEvents.BackupFailed, "local backup", error.Message);
+            }
         }
     }
 
@@ -1098,8 +1363,11 @@ public sealed partial class SharedStateStore
                 .Select(item => new ClientAnnouncement(item.Id, item.Title, item.Message, item.Level, item.Url, item.CreatedAt, item.ExpiresAt) { ShareWithAllDevices = item.ShareWithAllDevices, AllowedDeviceIds = [.. item.AllowedDeviceIds] })
                 .ToList());
         _deviceIndex = _state.Devices.ToDictionary(device => device.Id, device => new DeviceAuth(device.Id, device.Name, device.TokenHash, device.Revoked, device.MaxConnections, device.MonthlyQuotaGb, device.RateLimitMbps, device.ClientVersion));
-        _accountChoices = _state.Devices.Where(device => device.ActiveProfiles.Count > 0)
-            .ToDictionary(device => device.Id, device => (IReadOnlyDictionary<string, string>)new Dictionary<string, string>(device.ActiveProfiles));
+        _deviceViews = _state.Devices.ToDictionary(device => device.Id, device => new DeviceView(
+            new Dictionary<string, string>(device.ActiveProfiles), device.HomePage, device.SiteFilter is null ? null : CloneSiteFilter(device.SiteFilter), device.ScheduleExempt,
+            device.Commands.Select(command => new ClientCommand(command.Id, command.Type, command.Argument, command.CreatedAt)).ToList()));
+        _notifications = CloneNotifications(_state.Notifications);
+        _offsite = CloneOffsite(_state.OffsiteBackup);
         if (_state.Revision != _publishedRevision)
         {
             _publishedRevision = _state.Revision;
@@ -1124,6 +1392,8 @@ public sealed partial class SharedStateStore
         var cutoff = DateTimeOffset.UtcNow - CodeRetention;
         _state.EnrollmentCodes.RemoveAll(code => (code.UsedAt ?? (code.Revoked ? code.CreatedAt : code.ExpiresAt)) < cutoff);
     }
+
+    private string EncryptSecret(string value) => value.Length == 0 ? "" : Encrypt(value);
 
     private string Encrypt(string value)
     {
@@ -1208,15 +1478,60 @@ public sealed partial class SharedStateStore
     private static bool CookieEqual(SharedCookie a, SharedCookie b) =>
         a.Name == b.Name && a.Value == b.Value && a.Domain == b.Domain && a.Path == b.Path && a.Secure == b.Secure && a.HttpOnly == b.HttpOnly && a.SameSite == b.SameSite
         && (a.ExpiresAt is null) == (b.ExpiresAt is null) && Math.Abs((a.ExpiresAt ?? 0) - (b.ExpiresAt ?? 0)) < ExpiryTolerance;
-    private static BrowserSettings CloneSettings(BrowserSettings settings) => new() { HomePage = settings.HomePage, SearchUrl = settings.SearchUrl, PrimaryDeviceId = settings.PrimaryDeviceId, AutoShareCookies = settings.AutoShareCookies, AutoShareScope = settings.AutoShareScope, AutoShareDomains = [.. settings.AutoShareDomains], AllowAdminTokenEnrollment = settings.AllowAdminTokenEnrollment, NetworkPolicy = settings.NetworkPolicy, IpCheckUrl = settings.IpCheckUrl, Proxy = CloneProxySettings(settings.Proxy), ClientLock = CloneClientLock(settings.ClientLock), MinimumClientVersion = settings.MinimumClientVersion };
-    private static ClientLockSettings CloneClientLock(ClientLockSettings? value) => value is null ? new() : new() { Enabled = value.Enabled, Salt = value.Salt, Hash = value.Hash, Iterations = value.Iterations, ChangedAt = value.ChangedAt };
+    private static BrowserSettings CloneSettings(BrowserSettings settings) => new() { HomePage = settings.HomePage, SearchUrl = settings.SearchUrl, PrimaryDeviceId = settings.PrimaryDeviceId, AutoShareCookies = settings.AutoShareCookies, AutoShareScope = settings.AutoShareScope, AutoShareDomains = [.. settings.AutoShareDomains], AllowAdminTokenEnrollment = settings.AllowAdminTokenEnrollment, NetworkPolicy = settings.NetworkPolicy, IpCheckUrl = settings.IpCheckUrl, Proxy = CloneProxySettings(settings.Proxy), ClientLock = CloneClientLock(settings.ClientLock), MinimumClientVersion = settings.MinimumClientVersion, SiteFilter = CloneSiteFilter(settings.SiteFilter), Schedule = CloneSchedule(settings.Schedule), DataControls = CloneDataControls(settings.DataControls) };
+    private static ClientLockSettings CloneClientLock(ClientLockSettings? value) => value is null ? new() : new() { Enabled = value.Enabled, Salt = value.Salt, Hash = value.Hash, Iterations = value.Iterations, ChangedAt = value.ChangedAt, IdleMinutes = value.IdleMinutes, LockOnSystemLock = value.LockOnSystemLock };
+    private static SiteFilterSettings CloneSiteFilter(SiteFilterSettings? value) => value is null ? new() : new() { Mode = value.Mode, Domains = [.. value.Domains] };
+    private static UsageSchedule CloneSchedule(UsageSchedule? value) => value is null ? new() : new() { Enabled = value.Enabled, Days = [.. value.Days], Start = value.Start, End = value.End, TimeZone = value.TimeZone };
+    private static DataControls CloneDataControls(DataControls? value) => value is null ? new() : new() { BlockDownloads = value.BlockDownloads, BlockUploads = value.BlockUploads, BlockCopy = value.BlockCopy, Domains = [.. value.Domains] };
+    private static NotificationSettings CloneNotifications(NotificationSettings value) => new()
+    {
+        DiscordWebhookUrl = value.DiscordWebhookUrl, TelegramBotToken = value.TelegramBotToken, TelegramChatId = value.TelegramChatId, LineChannelToken = value.LineChannelToken,
+        LineTo = value.LineTo, Events = [.. value.Events], OfflineMinutes = value.OfflineMinutes, ExpiryWarningDays = value.ExpiryWarningDays
+    };
+    private static OffsiteBackupSettings CloneOffsite(OffsiteBackupSettings value) => new()
+    {
+        Enabled = value.Enabled, Endpoint = value.Endpoint, Region = value.Region, Bucket = value.Bucket, Prefix = value.Prefix, AccessKeyId = value.AccessKeyId,
+        SecretAccessKey = value.SecretAccessKey, LastUploadAt = value.LastUploadAt, LastUploadName = value.LastUploadName, LastError = value.LastError
+    };
+    private static DeviceCommand CloneCommand(DeviceCommand value) => new() { Id = value.Id, Type = value.Type, Argument = value.Argument, CreatedAt = value.CreatedAt };
+
+    public static readonly string[] SiteFilterModes = ["off", "allow", "block"];
+
+    private static SiteFilterSettings CleanSiteFilter(SiteFilterSettings? input)
+    {
+        var mode = (input?.Mode ?? "off").Trim().ToLowerInvariant();
+        if (!SiteFilterModes.Contains(mode)) throw new InvalidOperationException("Site filter must be off, allow or block");
+        var domains = CleanSiteList(input?.Domains);
+        if (mode == "allow" && domains.Count == 0) throw new InvalidOperationException("List at least one site that browsers may open");
+        return new SiteFilterSettings { Mode = mode, Domains = domains };
+    }
+
+    private static UsageSchedule CleanSchedule(UsageSchedule? input)
+    {
+        input ??= new UsageSchedule();
+        static bool Time(string? value) => TimeOnly.TryParseExact(value ?? "", "HH:mm", out _);
+        if (!Time(input.Start) || !Time(input.End)) throw new InvalidOperationException("Allowed hours must be written as HH:mm, for example 09:00");
+        var days = (input.Days ?? []).Where(day => day is >= 0 and <= 6).Distinct().Order().ToList();
+        if (input.Enabled && days.Count == 0) throw new InvalidOperationException("Choose at least one day on which browsers can be used");
+        var zone = (input.TimeZone ?? "").Trim();
+        try { TimeZoneInfo.FindSystemTimeZoneById(zone); }
+        catch (Exception error) when (error is TimeZoneNotFoundException or InvalidTimeZoneException or ArgumentException) { throw new InvalidOperationException($"Unknown time zone '{zone}'. Use a name such as Asia/Bangkok"); }
+        return new UsageSchedule { Enabled = input.Enabled, Days = days, Start = input.Start, End = input.End, TimeZone = zone };
+    }
+
+    private static string ScheduleSummary(UsageSchedule schedule) => schedule.Enabled ? $"{string.Join(",", schedule.Days)} {schedule.Start}-{schedule.End} {schedule.TimeZone}" : "any time";
+    private static string DataControlsSummary(DataControls controls)
+    {
+        var blocked = new[] { controls.BlockDownloads ? "downloads" : "", controls.BlockUploads ? "uploads" : "", controls.BlockCopy ? "copying" : "" }.Where(item => item.Length > 0).ToList();
+        return blocked.Count == 0 ? "none" : $"block {string.Join(", ", blocked)} on {(controls.Domains.Count == 0 ? "all sites" : string.Join(", ", controls.Domains))}";
+    }
     private static ProxySettings CloneProxySettings(ProxySettings settings) => new()
     {
         Enabled = settings.Enabled, Host = settings.Host, Port = settings.Port, AllowedPorts = settings.AllowedPorts, BypassList = settings.BypassList, Tls = settings.Tls, CertificateSha256 = settings.CertificateSha256,
         EgressAddressFamily = settings.EgressAddressFamily, EgressSourceAddress = settings.EgressSourceAddress,
         MaxConnectionsPerDevice = settings.MaxConnectionsPerDevice, MonthlyQuotaGb = settings.MonthlyQuotaGb, RateLimitMbps = settings.RateLimitMbps, RecordDestinations = settings.RecordDestinations
     };
-    private static SharedBookmark CloneBookmark(SharedBookmark item) => new() { Title = item.Title, Url = item.Url };
+    private static SharedBookmark CloneBookmark(SharedBookmark item) => new() { Title = item.Title, Url = item.Url, Folder = item.Folder };
     private static SharedCookie CloneCookie(SharedCookie cookie, string? value = null) => new() { Name = cookie.Name, Value = value ?? cookie.Value, Domain = cookie.Domain, Path = cookie.Path, Secure = cookie.Secure, HttpOnly = cookie.HttpOnly, SameSite = cookie.SameSite, ExpiresAt = cookie.ExpiresAt, UpdatedAt = cookie.UpdatedAt, SourceDeviceId = cookie.SourceDeviceId };
     private static void ValidateProxySettings(ProxySettings proxy)
     {
@@ -1236,6 +1551,7 @@ public sealed partial class SharedStateStore
     private static SessionProfile CloneProfile(SessionProfile profile) => new()
     {
         Id = profile.Id,
+        SessionCookie = profile.SessionCookie,
         Name = profile.Name,
         Domain = profile.Domain,
         Enabled = profile.Enabled,
