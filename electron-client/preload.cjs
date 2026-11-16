@@ -2,6 +2,8 @@ const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('sharedBrowser', {
   bootstrap: () => ipcRenderer.invoke('browser:bootstrap'),
+  unlock: (code) => ipcRenderer.invoke('browser:unlock', code),
+  onLock: (callback) => ipcRenderer.on('browser:lock', (_, value) => callback(value)),
   navigate: (url) => ipcRenderer.invoke('browser:navigate', url),
   back: () => ipcRenderer.invoke('browser:back'),
   forward: () => ipcRenderer.invoke('browser:forward'),

@@ -419,11 +419,47 @@ public sealed partial class SharedStateStore
                 AllowAdminTokenEnrollment = settings.AllowAdminTokenEnrollment,
                 NetworkPolicy = policy,
                 IpCheckUrl = ipCheckUrl,
-                Proxy = CloneProxySettings(settings.Proxy)
+                Proxy = CloneProxySettings(settings.Proxy),
+                // The unlock code has its own endpoint; saving the other settings never changes it.
+                ClientLock = CloneClientLock(before.ClientLock)
             };
             BumpRevision();
             await SaveLockedAsync();
             return changes.Count == 0 ? "no changes" : string.Join("; ", changes);
+        }
+        finally { _gate.Release(); }
+    }
+
+    public const int UnlockCodeIterations = 210_000;
+
+    /// <summary>Turns the browser unlock code on or off, and sets a new code when one is given.</summary>
+    public async Task<string> SetClientLockAsync(ClientLockRequest request)
+    {
+        var code = (request.Code ?? "").Trim().Normalize(NormalizationForm.FormC);
+        if (code.Length > 0 && (code.Length is < 4 or > 128 || code.Any(char.IsControl))) throw new InvalidOperationException("The unlock code must be 4 to 128 characters");
+        await _gate.WaitAsync();
+        try
+        {
+            var current = _state.Settings.ClientLock;
+            if (request.Enabled && code.Length == 0 && current.Hash.Length == 0) throw new InvalidOperationException("Enter an unlock code");
+            var next = CloneClientLock(current);
+            next.Enabled = request.Enabled;
+            if (code.Length > 0)
+            {
+                var salt = RandomNumberGenerator.GetBytes(16);
+                next.Salt = Convert.ToBase64String(salt);
+                next.Hash = Convert.ToBase64String(Rfc2898DeriveBytes.Pbkdf2(Encoding.UTF8.GetBytes(code), salt, UnlockCodeIterations, HashAlgorithmName.SHA256, 32));
+                next.Iterations = UnlockCodeIterations;
+                next.ChangedAt = DateTimeOffset.UtcNow;
+            }
+            var changes = new List<string>();
+            if (current.Enabled != next.Enabled) changes.Add(next.Enabled ? "enabled" : "disabled");
+            if (code.Length > 0) changes.Add("code changed");
+            if (changes.Count == 0) return "no changes";
+            _state.Settings.ClientLock = next;
+            BumpRevision();
+            await SaveLockedAsync();
+            return string.Join(", ", changes);
         }
         finally { _gate.Release(); }
     }
@@ -895,6 +931,9 @@ public sealed partial class SharedStateStore
         disk.Settings.NetworkPolicy = NetworkPolicies.Contains(disk.Settings.NetworkPolicy) ? disk.Settings.NetworkPolicy : "strict";
         disk.Settings.IpCheckUrl ??= "";
         disk.Settings.Proxy ??= new ProxySettings();
+        disk.Settings.ClientLock ??= new ClientLockSettings();
+        disk.Settings.ClientLock.Salt ??= "";
+        disk.Settings.ClientLock.Hash ??= "";
         disk.Profiles ??= [];
         disk.Devices ??= [];
         disk.Bookmarks ??= [];
@@ -1074,7 +1113,8 @@ public sealed partial class SharedStateStore
     private static bool CookieEqual(SharedCookie a, SharedCookie b) =>
         a.Name == b.Name && a.Value == b.Value && a.Domain == b.Domain && a.Path == b.Path && a.Secure == b.Secure && a.HttpOnly == b.HttpOnly && a.SameSite == b.SameSite
         && (a.ExpiresAt is null) == (b.ExpiresAt is null) && Math.Abs((a.ExpiresAt ?? 0) - (b.ExpiresAt ?? 0)) < ExpiryTolerance;
-    private static BrowserSettings CloneSettings(BrowserSettings settings) => new() { HomePage = settings.HomePage, SearchUrl = settings.SearchUrl, PrimaryDeviceId = settings.PrimaryDeviceId, AutoShareCookies = settings.AutoShareCookies, AllowAdminTokenEnrollment = settings.AllowAdminTokenEnrollment, NetworkPolicy = settings.NetworkPolicy, IpCheckUrl = settings.IpCheckUrl, Proxy = CloneProxySettings(settings.Proxy) };
+    private static BrowserSettings CloneSettings(BrowserSettings settings) => new() { HomePage = settings.HomePage, SearchUrl = settings.SearchUrl, PrimaryDeviceId = settings.PrimaryDeviceId, AutoShareCookies = settings.AutoShareCookies, AllowAdminTokenEnrollment = settings.AllowAdminTokenEnrollment, NetworkPolicy = settings.NetworkPolicy, IpCheckUrl = settings.IpCheckUrl, Proxy = CloneProxySettings(settings.Proxy), ClientLock = CloneClientLock(settings.ClientLock) };
+    private static ClientLockSettings CloneClientLock(ClientLockSettings? value) => value is null ? new() : new() { Enabled = value.Enabled, Salt = value.Salt, Hash = value.Hash, Iterations = value.Iterations, ChangedAt = value.ChangedAt };
     private static ProxySettings CloneProxySettings(ProxySettings settings) => new()
     {
         Enabled = settings.Enabled, Host = settings.Host, Port = settings.Port, AllowedPorts = settings.AllowedPorts, BypassList = settings.BypassList, Tls = settings.Tls, CertificateSha256 = settings.CertificateSha256,
