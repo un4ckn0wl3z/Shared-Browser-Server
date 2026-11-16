@@ -219,6 +219,29 @@ describe('management API', () => {
     await server.admin('/profiles/delete', 'POST', { ids: (await server.status()).profiles.filter(item => /(old|listed)\.example$/.test(item.domain)).map(item => item.id) });
   });
 
+  test('a minimum browser version stops outdated browsers until they update', async () => {
+    const device = await server.enroll(randomDeviceId(), 'old-browser');
+    await assert.rejects(server.settings({ minimumClientVersion: '1.x' }), /must look like/);
+    await server.settings({ minimumClientVersion: 'v1.6.0' });
+    assert.equal((await server.status()).settings.minimumClientVersion, '1.6.0');
+    const sync = () => server.device(device, '/sync', 'POST', { pageUrl: 'https://version.example/', cookies: [] });
+    const old = await server.device(device, '/snapshot?version=1.5.0');
+    assert.equal(old.status, 426);
+    const body = await old.json();
+    assert.equal(body.minimumVersion, '1.6.0');
+    assert.match(body.error, /1\.6\.0 or newer is required/);
+    // Requests that do not carry a version use the one the browser last reported.
+    assert.equal((await sync()).status, 426);
+    assert.equal((await server.device(device, '/snapshot')).status, 426);
+    assert.equal((await server.device(device, '/snapshot?version=1.6.0')).status, 200);
+    assert.equal((await sync()).status, 200);
+    // Versions compare numerically, and pre-release suffixes are ignored.
+    assert.equal((await server.device(device, '/snapshot?version=1.10.0-beta.1')).status, 200);
+    assert.equal((await server.device(device, '/snapshot?version=1.5.9')).status, 426);
+    await server.settings({ minimumClientVersion: '' });
+    assert.equal((await server.device(device, '/snapshot?version=1.0.0')).status, 200);
+  });
+
   test('bookmarks and search URL validation', async () => {
     const saved = await server.admin('/bookmarks', 'PUT', [{ title: '', url: 'https://github.com' }, { title: 'Docs', url: 'https://example.com/docs' }]);
     assert.deepEqual(saved.map(item => item.title), ['github.com', 'Docs']);
@@ -414,6 +437,21 @@ describe('forward proxy', () => {
     for (const host of ['127.0.0.1', '10.0.0.1', '100.100.100.100', '169.254.169.254', '[::1]', '[64:ff9b::a00:1]']) {
       assert.equal((await request(`GET http://${host}/ HTTP/1.1\r\nHost: ${host}\r\n${auth}\r\n`)).status, 403, host);
     }
+  });
+
+  test('an outdated browser can only reach the update servers through the proxy', async () => {
+    const auth = `Proxy-Authorization: ${basic(device)}\r\n`;
+    await server.settings({ minimumClientVersion: '1.6.0' });
+    // This browser never reported a version, so it counts as outdated.
+    const refused = await request(`CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n${auth}\r\n`);
+    assert.equal(refused.status, 403);
+    assert.match(refused.head, /or newer is required/);
+    // GitHub passes the version check (and is then refused here only because port 8081 is not allowed).
+    const github = await request(`CONNECT github.com:8081 HTTP/1.1\r\nHost: github.com:8081\r\n${auth}\r\n`);
+    assert.equal(github.status, 403);
+    assert.doesNotMatch(github.head, /or newer is required/);
+    await server.settings({ minimumClientVersion: '' });
+    assert.doesNotMatch((await request(`CONNECT example.com:8081 HTTP/1.1\r\nHost: example.com:8081\r\n${auth}\r\n`)).head, /or newer is required/);
   });
 
   test('plain HTTP responses close the connection so credentials never reach the origin', async t => {

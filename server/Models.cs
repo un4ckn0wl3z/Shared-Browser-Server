@@ -53,6 +53,11 @@ public sealed class BrowserSettings
     public string IpCheckUrl { get; set; } = "https://api64.ipify.org?format=json";
     public ProxySettings Proxy { get; set; } = new();
     public ClientLockSettings ClientLock { get; set; } = new();
+    /// <summary>
+    /// Browsers older than this (for example "1.5.0") cannot synchronize, and the proxy only lets them reach
+    /// GitHub to download the update. Empty allows every version.
+    /// </summary>
+    public string MinimumClientVersion { get; set; } = "";
 }
 
 /// <summary>
@@ -155,7 +160,7 @@ public sealed class EnrollmentCode
     public bool Revoked { get; set; }
 }
 
-public sealed record DeviceAuth(string Id, string Name, string TokenHash, bool Revoked, int? MaxConnections, double? MonthlyQuotaGb, double? RateLimitMbps);
+public sealed record DeviceAuth(string Id, string Name, string TokenHash, bool Revoked, int? MaxConnections, double? MonthlyQuotaGb, double? RateLimitMbps, string ClientVersion = "");
 public sealed record DeviceLimitsRequest(int? MaxConnections, double? MonthlyQuotaGb, double? RateLimitMbps);
 /// <summary>Effective proxy limits for one browser; 0 means unlimited.</summary>
 public sealed record ProxyLimits(int MaxConnections, double MonthlyQuotaGb, double RateLimitMbps)

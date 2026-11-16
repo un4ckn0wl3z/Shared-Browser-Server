@@ -184,6 +184,17 @@ describe('dashboard', () => {
     assert.match(await page.textContent('#devices'), /↑ .* · ↓ /);
   });
 
+  test('requires a minimum browser version', async () => {
+    await page.fill('#min-version', '99.0.0');
+    await page.click('#settings-form > button');
+    await waitFor(async () => (await server.status()).settings.minimumClientVersion === '99.0.0', { message: 'minimum saved' });
+    await waitFor(async () => /UPDATE REQUIRED/.test(await page.textContent('#devices')), { message: 'outdated browsers marked' });
+    assert.match(await page.textContent('#min-version-hint'), /browser\(s\) still need to update/);
+    await page.fill('#min-version', '');
+    await page.click('#settings-form > button');
+    await waitFor(async () => (await server.status()).settings.minimumClientVersion === '', { message: 'minimum cleared' });
+  });
+
   test('lists backups and the audit log', async () => {
     await waitFor(async () => (await page.locator('#backups tr').count()) >= 1 && !(await page.textContent('#backups')).includes('No backups'), { message: 'backup rows' });
     const audit = await page.textContent('#audit');

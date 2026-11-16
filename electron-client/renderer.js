@@ -118,7 +118,36 @@ function updateState(state) {
   }
 }
 
+let requiredUpdate = null;
+let lastUpdate = {};
+
+// Shown when the server requires a newer version: the browser downloads it and restarts on its own.
+function renderUpdateScreen() {
+  element('update-screen').hidden = !requiredUpdate;
+  if (!requiredUpdate) return;
+  element('update-required-text').textContent = `Your administrator requires Shared Browser ${requiredUpdate.version} or newer. This browser is version ${requiredUpdate.current}.`;
+  const value = lastUpdate;
+  const messages = {
+    idle: 'Looking for the update…',
+    checking: 'Looking for the update…',
+    downloading: `Downloading version ${value.version || ''}${value.percent ? ` (${value.percent}%)` : ''}…`,
+    ready: value.restarting ? 'Installing the update. The browser restarts in a few seconds.' : `Version ${value.version} is ready to install.`,
+    available: `Download version ${value.version} from the release page, install it, and start the browser again.`,
+    current: 'No newer version has been published yet. Ask your administrator.',
+    error: `The update could not be downloaded: ${value.error}`
+  };
+  element('update-required-progress').textContent = messages[value.state] || messages.idle;
+  const action = element('update-required-action');
+  const label = value.state === 'available' ? 'Open download page'
+    : value.state === 'ready' && !value.restarting ? 'Restart now'
+    : ['error', 'current'].includes(value.state) ? 'Try again' : '';
+  action.hidden = !label;
+  action.textContent = label;
+}
+
 function updateUpdate(value) {
+  lastUpdate = value || {};
+  renderUpdateScreen();
   const button = element('update');
   button.hidden = !['available', 'downloading', 'ready'].includes(value.state);
   button.disabled = value.state === 'downloading';
@@ -311,6 +340,8 @@ element('settings-form').addEventListener('submit', async event => {
 // The unlock screen covers the whole window; the page views are detached by the main process meanwhile.
 const lockScreen = element('lock-screen');
 function updateLock(value) {
+  requiredUpdate = value?.update || null;
+  renderUpdateScreen();
   const locked = Boolean(value?.locked);
   const wasLocked = !lockScreen.hidden;
   lockScreen.hidden = !locked;
@@ -338,6 +369,10 @@ element('lock-form').addEventListener('submit', async event => {
   }
 });
 api.onLock(updateLock);
+element('update-required-action').addEventListener('click', () => {
+  if (lastUpdate.state === 'available' || lastUpdate.state === 'ready') api.installUpdate();
+  else api.checkForUpdates();
+});
 api.onState(updateState);
 api.onTabs(renderTabs);
 api.onStatus(updateStatus);

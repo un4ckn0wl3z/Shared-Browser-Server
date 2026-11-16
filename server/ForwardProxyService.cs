@@ -12,6 +12,8 @@ public sealed class ForwardProxyService : BackgroundService
     // Tunnels stay open while data flows (downloads, WebSockets, streaming) and close after this much silence.
     private static readonly TimeSpan IdleTimeout = TimeSpan.FromMinutes(10);
     private static readonly TimeSpan RevocationCheckInterval = TimeSpan.FromSeconds(5);
+    /// <summary>Hosts the browsers' updater uses to find and download a GitHub release.</summary>
+    private static readonly HashSet<string> UpdateHosts = ["github.com", "api.github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com", "github-releases.githubusercontent.com"];
     private readonly SharedStateStore _store;
     private readonly ProxyCertificate _certificate;
     private readonly ProxyUsageTracker _usage;
@@ -161,6 +163,12 @@ public sealed class ForwardProxyService : BackgroundService
                 if (!TryGetDestination(request, out var host, out var port, out var originTarget))
                 {
                     await WriteErrorAsync(clientStream, 400, "Bad proxy request", timeout.Token);
+                    return;
+                }
+                // An outdated browser may only download its update (GitHub releases); everything else waits for it.
+                if (_store.IsDeviceOutdated(deviceId) && !UpdateHosts.Contains(host.ToLowerInvariant()))
+                {
+                    await WriteErrorAsync(clientStream, 403, _store.UpdateRequiredMessage, timeout.Token);
                     return;
                 }
                 var settings = _store.Settings.Proxy;

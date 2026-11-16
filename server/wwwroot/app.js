@@ -82,6 +82,11 @@ function render() {
   $('#auto-share-domains').value = (settings.autoShareDomains || []).join('\n');
   updateShareSites();
   $('#allow-admin-enroll').checked = settings.allowAdminTokenEnrollment !== false;
+  $('#min-version').value = settings.minimumClientVersion || '';
+  const versions = state.devices.filter(device => !device.revoked && device.clientVersion).map(device => device.clientVersion);
+  const newest = versions.reduce((best, version) => !best || versionAtLeast(version, best) ? version : best, '');
+  const outdated = settings.minimumClientVersion ? state.devices.filter(device => !device.revoked && !(device.clientVersion && versionAtLeast(device.clientVersion, settings.minimumClientVersion))).length : 0;
+  $('#min-version-hint').textContent = `Older browsers stop syncing and can only download the update through the proxy. Browsers 1.6 and newer install it and restart on their own.${newest ? ` Newest version in use: ${newest}.` : ''}${outdated ? ` ${outdated} browser(s) still need to update.` : ''}`;
 
   const proxy = settings.proxy || {};
   const runtime = state.proxy || {};
@@ -150,6 +155,10 @@ function updatePolicyWarning() {
 
 // Explains, per browser, whether it follows the required connection mode.
 function complianceNote(device) {
+  const minimum = state.settings.minimumClientVersion;
+  if (minimum && !device.revoked && !(device.clientVersion && versionAtLeast(device.clientVersion, minimum))) {
+    return `<span class="pill warn" title="Below the minimum browser version ${minimum}: cannot sync until it updates">UPDATE REQUIRED</span>`;
+  }
   if (state.settings.clientLock?.enabled && !device.revoked && !(device.clientVersion && versionAtLeast(device.clientVersion, LOCK_MIN_VERSION))) {
     return `<span class="pill warn" title="Browsers before ${LOCK_MIN_VERSION} do not ask for the unlock code">UPDATE NEEDED</span>`;
   }
@@ -302,6 +311,7 @@ function settingsPayload(proxy) {
     autoShareScope: $('#auto-share-mode').value === 'listed' ? 'listed' : 'all',
     autoShareDomains: $('#auto-share-domains').value.split(/[\s,]+/).filter(Boolean),
     allowAdminTokenEnrollment: $('#allow-admin-enroll').checked,
+    minimumClientVersion: $('#min-version').value.trim(),
     networkPolicy: $('#network-policy').value,
     ipCheckUrl: $('#ip-check-url').value,
     proxy: proxy || state.settings.proxy

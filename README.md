@@ -78,6 +78,7 @@ The primary-writer model prevents a logged-out secondary browser from replacing 
 - Per-profile access: share a domain with all browsers or only selected ones
 - Several accounts per site (for example two GitHub users), switched per browser from the toolbar
 - Optional unlock code that browsers ask for every time they start, turned on, off or changed from the dashboard
+- A minimum browser version that makes outdated browsers update before they can sync or browse
 - Live updates over Server-Sent Events
 - Audit log, automatic vault backups, and vault export/import
 - Announcements from the administrator to all or selected browsers
@@ -385,6 +386,16 @@ The first version deliberately uses the central server as the authority. Direct 
 ### Browsers
 
 The dashboard's **Managed browsers** table shows each enrolled browser, when it was last seen, and a **LIVE** badge while it holds the live event stream. **Revoke** stops a browser from syncing or using the proxy (and closes its open proxy tunnels) but keeps its record so it can be restored; **Delete** removes it, and it must enroll again with a new code to reconnect. The primary session browser is marked **PRIMARY**.
+
+### Required browser version
+
+Set **Minimum browser version** in Browser settings (for example `1.6.0`) to make every older browser update. Leave it empty to allow any version. The hint below the field shows the newest version in use and how many browsers still need to update, and the browsers table marks them **UPDATE REQUIRED**.
+
+- Browsers 1.6 and newer hide their pages behind an **Update required** screen, download the update, and restart into it on their own (Windows and the Linux AppImage). The macOS build is unsigned and cannot update itself: the screen opens the release page to download the new DMG.
+- Older browsers (1.1 to 1.5) do not know the setting, but the server refuses to sync with them and the managed proxy lets them reach only GitHub, so they can still download the update. Their status bar shows the reason, and pages through the proxy fail to load. On Windows and Linux they usually have the update downloaded already (they check at startup and every four hours, and the proxy still lets that through), so closing and reopening the browser installs it.
+- Browsers in Direct mode can still open websites, but they receive no new or changed sessions until they update.
+- Set it only to a version that is already published under GitHub Releases, otherwise browsers have nothing to update to.
+- Lowering the minimum or clearing it releases waiting browsers within a second or two, without a restart.
 
 ### Unlock code
 

@@ -277,6 +277,23 @@ describe('Electron browsers sharing a session', () => {
     assert.ok(audit.includes('browser.unlocked') && audit.includes('browser.unlock_failed'));
   });
 
+  test('a browser below the minimum version shows the update screen until it updates', async () => {
+    const attached = () => wb2.app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].contentView.children.length);
+    await server.settings({ minimumClientVersion: '99.0.0' });
+    await wb2.window.waitForSelector('#update-screen:not([hidden])');
+    assert.match(await wb2.window.textContent('#update-required-text'), /requires Shared Browser 99\.0\.0 or newer/);
+    await waitFor(async () => (await attached()) === 0, { message: 'pages hidden' });
+    await assert.rejects(wb2.window.evaluate(() => window.sharedBrowser.newTab('about:blank')), /Update the browser first/);
+    // A development build cannot download updates, so the screen reports that and offers to try again.
+    await waitFor(async () => /could not be downloaded/.test(await wb2.window.textContent('#update-required-progress')), { message: 'update attempt reported' });
+    assert.equal(await wb2.window.textContent('#update-required-action'), 'Try again');
+    assert.match((await server.status()).devices.find(item => item.name === 'WB2').clientVersion, /^\d+\.\d+\.\d+$/);
+    // Lowering the requirement releases the browser without a restart.
+    await server.settings({ minimumClientVersion: '' });
+    await wb2.window.waitForSelector('#update-screen', { state: 'hidden' });
+    await waitFor(async () => (await attached()) === 1, { message: 'pages shown again' });
+  });
+
   test('purging the vault removes shared cookies from the other browser but not from the primary', async () => {
     await waitFor(async () => (await wb2.cookies(site.origin)).includes('pref=dark'), { message: 'WB2 has the shared cookie' });
     await server.admin('/profiles/purge', 'POST', { confirm: true });

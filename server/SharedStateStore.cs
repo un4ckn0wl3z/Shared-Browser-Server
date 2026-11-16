@@ -138,6 +138,27 @@ public sealed partial class SharedStateStore
     }
 
     public static readonly string[] NetworkPolicies = ["choice", "managed", "strict"];
+
+    /// <summary>True when a minimum browser version is set and <paramref name="version"/> is older or unknown.</summary>
+    public bool IsOutdated(string? version)
+    {
+        var minimum = ParseClientVersion(_snapshot.Settings.MinimumClientVersion);
+        if (minimum is null) return false;
+        var actual = ParseClientVersion(version);
+        return actual is null || actual < minimum;
+    }
+
+    /// <summary>Uses the version the browser last reported (for requests that do not carry it).</summary>
+    public bool IsDeviceOutdated(string deviceId) => IsOutdated(_deviceIndex.TryGetValue(deviceId, out var device) ? device.ClientVersion : "");
+
+    public string UpdateRequiredMessage => $"Shared Browser {_snapshot.Settings.MinimumClientVersion} or newer is required. Install the update, or restart the browser if it has already downloaded it.";
+
+    private static Version? ParseClientVersion(string? value)
+    {
+        var core = (value ?? "").Split('-', '+')[0].Trim();
+        if (!Version.TryParse(core, out var parsed)) return null;
+        return new Version(parsed.Major, parsed.Minor, Math.Max(0, parsed.Build));
+    }
     private static readonly string[] NetworkModes = ["direct", "managed", "strict"];
 
     public async Task<string?> SetDeviceLimitsAsync(string id, DeviceLimitsRequest request)
@@ -389,6 +410,8 @@ public sealed partial class SharedStateStore
         if (ipCheckUrl.Length > 0 && (ipCheckUrl.Length > 500 || !Uri.TryCreate(ipCheckUrl, UriKind.Absolute, out var check) || check.Scheme is not ("http" or "https"))) throw new InvalidOperationException("IP check URL must be empty or an HTTP or HTTPS URL");
         settings.Proxy ??= new ProxySettings();
         ValidateProxySettings(settings.Proxy);
+        var minimumVersion = (settings.MinimumClientVersion ?? "").Trim().TrimStart('v', 'V');
+        if (minimumVersion.Length > 0 && !System.Text.RegularExpressions.Regex.IsMatch(minimumVersion, @"^\d{1,4}\.\d{1,4}\.\d{1,4}$")) throw new InvalidOperationException("Minimum browser version must look like 1.5.0, or be empty");
         var scope = (settings.AutoShareScope ?? "all").Trim().ToLowerInvariant();
         if (!AutoShareScopes.Contains(scope)) throw new InvalidOperationException("Automatic sharing must cover all sites or only the listed sites");
         var sharedSites = CleanSiteList(settings.AutoShareDomains);
@@ -413,6 +436,7 @@ public sealed partial class SharedStateStore
             Compare("bypass list", before.Proxy.BypassList, settings.Proxy.BypassList);
             Compare("browser connection mode", before.NetworkPolicy, policy);
             Compare("IP check URL", before.IpCheckUrl, ipCheckUrl);
+            Compare("minimum browser version", before.MinimumClientVersion.Length == 0 ? "any" : before.MinimumClientVersion, minimumVersion.Length == 0 ? "any" : minimumVersion);
             Compare("egress family", before.Proxy.EgressAddressFamily, settings.Proxy.EgressAddressFamily);
             Compare("egress source", before.Proxy.EgressSourceAddress, settings.Proxy.EgressSourceAddress);
             Compare("default connection limit", before.Proxy.MaxConnectionsPerDevice, settings.Proxy.MaxConnectionsPerDevice);
@@ -432,7 +456,8 @@ public sealed partial class SharedStateStore
                 IpCheckUrl = ipCheckUrl,
                 Proxy = CloneProxySettings(settings.Proxy),
                 // The unlock code has its own endpoint; saving the other settings never changes it.
-                ClientLock = CloneClientLock(before.ClientLock)
+                ClientLock = CloneClientLock(before.ClientLock),
+                MinimumClientVersion = minimumVersion
             };
             BumpRevision();
             await SaveLockedAsync();
@@ -985,6 +1010,7 @@ public sealed partial class SharedStateStore
         disk.Settings.ClientLock ??= new ClientLockSettings();
         disk.Settings.AutoShareScope = AutoShareScopes.Contains(disk.Settings.AutoShareScope) ? disk.Settings.AutoShareScope : "all";
         disk.Settings.AutoShareDomains ??= [];
+        disk.Settings.MinimumClientVersion ??= "";
         disk.Settings.ClientLock.Salt ??= "";
         disk.Settings.ClientLock.Hash ??= "";
         disk.Profiles ??= [];
@@ -1055,7 +1081,7 @@ public sealed partial class SharedStateStore
                 .OrderByDescending(item => item.CreatedAt)
                 .Select(item => new ClientAnnouncement(item.Id, item.Title, item.Message, item.Level, item.Url, item.CreatedAt, item.ExpiresAt) { ShareWithAllDevices = item.ShareWithAllDevices, AllowedDeviceIds = [.. item.AllowedDeviceIds] })
                 .ToList());
-        _deviceIndex = _state.Devices.ToDictionary(device => device.Id, device => new DeviceAuth(device.Id, device.Name, device.TokenHash, device.Revoked, device.MaxConnections, device.MonthlyQuotaGb, device.RateLimitMbps));
+        _deviceIndex = _state.Devices.ToDictionary(device => device.Id, device => new DeviceAuth(device.Id, device.Name, device.TokenHash, device.Revoked, device.MaxConnections, device.MonthlyQuotaGb, device.RateLimitMbps, device.ClientVersion));
         _accountChoices = _state.Devices.Where(device => device.ActiveProfiles.Count > 0)
             .ToDictionary(device => device.Id, device => (IReadOnlyDictionary<string, string>)new Dictionary<string, string>(device.ActiveProfiles));
         if (_state.Revision != _publishedRevision)
@@ -1166,7 +1192,7 @@ public sealed partial class SharedStateStore
     private static bool CookieEqual(SharedCookie a, SharedCookie b) =>
         a.Name == b.Name && a.Value == b.Value && a.Domain == b.Domain && a.Path == b.Path && a.Secure == b.Secure && a.HttpOnly == b.HttpOnly && a.SameSite == b.SameSite
         && (a.ExpiresAt is null) == (b.ExpiresAt is null) && Math.Abs((a.ExpiresAt ?? 0) - (b.ExpiresAt ?? 0)) < ExpiryTolerance;
-    private static BrowserSettings CloneSettings(BrowserSettings settings) => new() { HomePage = settings.HomePage, SearchUrl = settings.SearchUrl, PrimaryDeviceId = settings.PrimaryDeviceId, AutoShareCookies = settings.AutoShareCookies, AutoShareScope = settings.AutoShareScope, AutoShareDomains = [.. settings.AutoShareDomains], AllowAdminTokenEnrollment = settings.AllowAdminTokenEnrollment, NetworkPolicy = settings.NetworkPolicy, IpCheckUrl = settings.IpCheckUrl, Proxy = CloneProxySettings(settings.Proxy), ClientLock = CloneClientLock(settings.ClientLock) };
+    private static BrowserSettings CloneSettings(BrowserSettings settings) => new() { HomePage = settings.HomePage, SearchUrl = settings.SearchUrl, PrimaryDeviceId = settings.PrimaryDeviceId, AutoShareCookies = settings.AutoShareCookies, AutoShareScope = settings.AutoShareScope, AutoShareDomains = [.. settings.AutoShareDomains], AllowAdminTokenEnrollment = settings.AllowAdminTokenEnrollment, NetworkPolicy = settings.NetworkPolicy, IpCheckUrl = settings.IpCheckUrl, Proxy = CloneProxySettings(settings.Proxy), ClientLock = CloneClientLock(settings.ClientLock), MinimumClientVersion = settings.MinimumClientVersion };
     private static ClientLockSettings CloneClientLock(ClientLockSettings? value) => value is null ? new() : new() { Enabled = value.Enabled, Salt = value.Salt, Hash = value.Hash, Iterations = value.Iterations, ChangedAt = value.ChangedAt };
     private static ProxySettings CloneProxySettings(ProxySettings settings) => new()
     {

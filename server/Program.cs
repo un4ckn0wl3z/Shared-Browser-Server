@@ -109,7 +109,11 @@ app.MapGet("/api/client/snapshot", async (HttpContext context, SharedStateStore 
 {
     var device = DeviceAuthorized(context.Request, store);
     if (device is null) return Results.Unauthorized();
-    await store.TouchDeviceAsync(device.Id, context.Request.Query["deviceName"].ToString(), context.Request.Query["version"].ToString(), context.Request.Query["mode"].ToString());
+    var version = context.Request.Query["version"].ToString();
+    await store.TouchDeviceAsync(device.Id, context.Request.Query["deviceName"].ToString(), version, context.Request.Query["mode"].ToString());
+    // An outdated browser gets no shared data until it updates. 426 tells browsers 1.6+ to show the update screen;
+    // older ones show the message in their status bar. The event stream stays open so they notice when it is lifted.
+    if (store.IsOutdated(version)) return UpdateRequired(store);
     if (long.TryParse(context.Request.Query["since"], out var since) && since == store.Revision) return Results.NoContent();
     return Results.Json(store.SnapshotFor(device.Id));
 });
@@ -162,6 +166,7 @@ app.MapPost("/api/client/sync", async (HttpContext context, SyncRequest request,
     if (device is null) return Results.Unauthorized();
     try
     {
+        if (store.IsDeviceOutdated(device.Id)) return UpdateRequired(store);
         var changed = await store.SyncCookiesAsync(device.Id, request);
         var snapshot = store.SnapshotFor(device.Id);
         return Results.Json(new SyncResponse(snapshot.Revision, changed, snapshot));
@@ -439,6 +444,9 @@ app.MapPost("/api/admin/backups/{name}/restore", async (HttpContext context, str
 });
 
 app.Run();
+
+static IResult UpdateRequired(SharedStateStore store) =>
+    Results.Json(new { error = store.UpdateRequiredMessage, updateRequired = true, minimumVersion = store.Settings.MinimumClientVersion }, statusCode: StatusCodes.Status426UpgradeRequired);
 
 static string DomainList(IReadOnlyList<SessionProfile> profiles)
 {
