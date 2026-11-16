@@ -46,6 +46,16 @@
     </form>
   </div>
 
+  <div id="update-screen" class="lock-screen" hidden>
+    <div class="lock-card">
+      <div class="lock-icon" aria-hidden="true">⬆️</div>
+      <h1>Update required</h1>
+      <p id="update-required-text"></p>
+      <div id="update-required-progress" class="info" role="status"></div>
+      <button type="button" id="update-required-action" class="primary" hidden></button>
+    </div>
+  </div>
+
   <dialog id="settings-dialog">
     <form id="settings-form">
       <div class="dialog-title">

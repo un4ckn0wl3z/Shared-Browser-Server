@@ -61,6 +61,9 @@ let unlockFailures = 0;
 let unlockBlockedUntil = 0;
 // Set once startup reaches the point of opening tabs, so unlocking earlier does not open pages before the proxy is set.
 let initialTabsRequested = false;
+// The minimum version the server requires while this browser is older; pages stay hidden until it updates.
+let updateRequired = '';
+let forcedInstallTimer;
 const tabs = new Map();
 
 function logFatal(error) {
@@ -334,6 +337,7 @@ async function openInitialTabs() {
     engageLock();
     return;
   }
+  if (updateRequired) return;
   const { tabs: urls, active } = config.secrets.session;
   if (!urls.length) {
     await addTab(config.secrets.cache.settings.homePage);
@@ -465,7 +469,7 @@ function normalizeAddress(value) {
 }
 
 async function addTab(url, details) {
-  if (lockShown) return undefined;
+  if (pagesHidden()) return undefined;
   const id = nextTabId++;
   const view = new WebContentsView({
     webPreferences: {
@@ -580,7 +584,7 @@ function showContextMenu(webContents, params) {
 }
 
 function handleShortcut(input, source) {
-  if (input.type !== 'keyDown' || lockShown) return false;
+  if (input.type !== 'keyDown' || pagesHidden()) return false;
   const mac = process.platform === 'darwin';
   const command = mac ? input.meta : input.control;
   const key = input.key.toLowerCase();
@@ -625,7 +629,7 @@ async function selectTab(id) {
     send('browser:find-result', { active: 0, matches: 0, reset: true });
   }
   activeTabId = next.id;
-  if (!settingsOpen && !lockShown) mainWindow.contentView.addChildView(next.view);
+  if (!settingsOpen && !pagesHidden()) mainWindow.contentView.addChildView(next.view);
   layoutActiveView();
   publishTabs();
   publishNavigationState();
@@ -683,7 +687,9 @@ async function api(pathname, options = {}, useDevice = true) {
       let message = '';
       try { message = JSON.parse(text).error || ''; } catch { }
       if (response.status === 401) throw new Error(useDevice ? 'This browser is unauthorized or revoked.' : message || 'The enrollment code or token was not accepted.');
-      throw new Error(message || `Server returned ${response.status}${text ? `: ${text.slice(0, 200)}` : ''}`);
+      let data;
+      try { data = JSON.parse(text); } catch { }
+      throw Object.assign(new Error(message || `Server returned ${response.status}${text ? `: ${text.slice(0, 200)}` : ''}`), { status: response.status, data });
     }
     return text ? JSON.parse(text) : undefined;
   } finally {
@@ -779,11 +785,13 @@ async function pullSnapshot(notify = false) {
       }
       syncFailures = 0;
       authPrompted = false;
+      if (updateRequired) await clearUpdateRequirement();
       status(`${notify ? 'Synchronization complete — ' : ''}Synced r${config.secrets.cache.revision}`);
       return true;
     } catch (error) {
       syncFailures++;
       status(`Offline cache — ${error.message}`, true);
+      if (error.status === 426) requireUpdate(error.data?.minimumVersion);
       // Ask once. Re-opening the dialog on every poll would reset whatever the user is typing in it.
       if (/unauthorized|revoked/i.test(error.message) && !authPrompted) {
         authPrompted = true;
@@ -1087,15 +1095,31 @@ function isLocked() {
   return !unlocked && Boolean(config.secrets.deviceToken) && Boolean(clientLock());
 }
 
-function engageLock() {
-  if (lockShown) return;
-  lockShown = true;
+// Pages are hidden while the unlock screen or the update-required screen is shown.
+function pagesHidden() {
+  return lockShown || Boolean(updateRequired);
+}
+
+function hidePages() {
   const tab = tabs.get(activeTabId);
   if (tab && mainWindow && !mainWindow.isDestroyed()) {
     try { mainWindow.contentView.removeChildView(tab.view); } catch { }
   }
   for (const item of tabs.values()) if (!item.view.webContents.isDestroyed()) item.view.webContents.setAudioMuted(true);
   for (const popup of BrowserWindow.getAllWindows()) if (popup !== mainWindow) popup.close();
+}
+
+async function showPages() {
+  if (pagesHidden()) return;
+  for (const item of tabs.values()) if (!item.view.webContents.isDestroyed()) item.view.webContents.setAudioMuted(false);
+  if (tabs.size) await selectTab(activeTabId ?? [...tabs.keys()][0]);
+  else if (initialTabsRequested) await openInitialTabs();
+}
+
+function engageLock() {
+  if (lockShown) return;
+  lockShown = true;
+  hidePages();
   send('browser:lock', lockState());
 }
 
@@ -1103,13 +1127,50 @@ async function releaseLock() {
   if (!lockShown) return;
   lockShown = false;
   send('browser:lock', lockState());
-  for (const item of tabs.values()) if (!item.view.webContents.isDestroyed()) item.view.webContents.setAudioMuted(false);
-  if (tabs.size) await selectTab(activeTabId ?? [...tabs.keys()][0]);
-  else if (initialTabsRequested) await openInitialTabs();
+  await showPages();
 }
 
 function lockState() {
-  return { locked: lockShown, deviceName: config.deviceName };
+  return {
+    locked: lockShown,
+    deviceName: config.deviceName,
+    update: updateRequired ? { version: updateRequired, current: app.getVersion() } : null
+  };
+}
+
+// ---- Required update ----------------------------------------------------------------------------
+// The server answers 426 when it requires a newer browser. The browser then hides its pages, downloads
+// the update and restarts into it on its own (Windows and Linux AppImage); the macOS build links to the
+// release page.
+
+function requireUpdate(version) {
+  const value = String(version || '').slice(0, 20);
+  if (!/^\d+\.\d+\.\d+$/.test(value) || updateRequired === value) return;
+  if (!updateRequired) hidePages();
+  updateRequired = value;
+  send('browser:lock', lockState());
+  if (updateState.state === 'ready') scheduleForcedInstall();
+  else checkForUpdates().catch(() => { });
+}
+
+async function clearUpdateRequirement() {
+  if (!updateRequired) return;
+  updateRequired = '';
+  clearTimeout(forcedInstallTimer);
+  forcedInstallTimer = undefined;
+  publishUpdate({ restarting: false });
+  send('browser:lock', lockState());
+  await showPages();
+}
+
+function scheduleForcedInstall() {
+  if (!updateRequired || !autoUpdater || forcedInstallTimer) return;
+  publishUpdate({ restarting: true });
+  forcedInstallTimer = setTimeout(() => {
+    quitting = true;
+    saveSessionState();
+    autoUpdater.quitAndInstall(true, true);
+  }, 5000);
 }
 
 async function verifyUnlockCode(code, lock) {
@@ -1530,7 +1591,10 @@ function setupUpdater() {
   autoUpdater.on('update-not-available', () => publishUpdate({ state: 'current' }));
   autoUpdater.on('update-available', info => publishUpdate({ state: 'downloading', version: info.version, percent: 0 }));
   autoUpdater.on('download-progress', progress => publishUpdate({ state: 'downloading', percent: Math.round(progress.percent) }));
-  autoUpdater.on('update-downloaded', info => publishUpdate({ state: 'ready', version: info.version }));
+  autoUpdater.on('update-downloaded', info => {
+    publishUpdate({ state: 'ready', version: info.version });
+    if (updateRequired) scheduleForcedInstall();
+  });
   autoUpdater.on('error', error => publishUpdate({ state: 'error', error: shortError(error) }));
 }
 
@@ -1624,7 +1688,7 @@ const ALLOWED_WHILE_LOCKED = new Set(['browser:bootstrap', 'browser:chrome-heigh
 function registerIpc() {
   const ipcMain = {
     handle: (channel, handler) => electronIpcMain.handle(channel, (...args) => {
-      if (lockShown && !ALLOWED_WHILE_LOCKED.has(channel)) throw new Error('Unlock the browser first');
+      if (pagesHidden() && !ALLOWED_WHILE_LOCKED.has(channel)) throw new Error(updateRequired ? 'Update the browser first' : 'Unlock the browser first');
       return handler(...args);
     })
   };

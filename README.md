@@ -78,6 +78,7 @@ The primary-writer model prevents a logged-out secondary browser from replacing 
 - Per-profile access: share a domain with all browsers or only selected ones
 - Several accounts per site (for example two GitHub users), switched per browser from the toolbar
 - Optional unlock code that browsers ask for every time they start, turned on, off or changed from the dashboard
+- A minimum browser version that makes outdated browsers update before they can sync or browse
 - Live updates over Server-Sent Events
 - Audit log, automatic vault backups, and vault export/import
 - Announcements from the administrator to all or selected browsers
@@ -386,6 +387,16 @@ The first version deliberately uses the central server as the authority. Direct 
 
 The dashboard's **Managed browsers** table shows each enrolled browser, when it was last seen, and a **LIVE** badge while it holds the live event stream. **Revoke** stops a browser from syncing or using the proxy (and closes its open proxy tunnels) but keeps its record so it can be restored; **Delete** removes it, and it must enroll again with a new code to reconnect. The primary session browser is marked **PRIMARY**.
 
+### Required browser version
+
+Set **Minimum browser version** in Browser settings (for example `1.6.0`) to make every older browser update. Leave it empty to allow any version. The hint below the field shows the newest version in use and how many browsers still need to update, and the browsers table marks them **UPDATE REQUIRED**.
+
+- Browsers 1.6 and newer hide their pages behind an **Update required** screen, download the update, and restart into it on their own (Windows and the Linux AppImage). The macOS build is unsigned and cannot update itself: the screen opens the release page to download the new DMG.
+- Older browsers (1.1 to 1.5) do not know the setting, but the server refuses to sync with them and the managed proxy lets them reach only GitHub, so they can still download the update. Their status bar shows the reason, and pages through the proxy fail to load. On Windows and Linux they usually have the update downloaded already (they check at startup and every four hours, and the proxy still lets that through), so closing and reopening the browser installs it.
+- Browsers in Direct mode can still open websites, but they receive no new or changed sessions until they update.
+- Set it only to a version that is already published under GitHub Releases, otherwise browsers have nothing to update to.
+- Lowering the minimum or clearing it releases waiting browsers within a second or two, without a restart.
+
 ### Unlock code
 
 Under **Unlock code** in the dashboard, tick **Require the unlock code when a browser starts**, enter a code (4 to 128 characters), and save. From then on every browser shows a lock screen each time it starts, and no page opens until the code is entered; the saved tabs then come back. Turning the code on also locks browsers that are running at that moment. Change the code by entering a new one (browsers that are already unlocked stay unlocked until they restart), and untick the box to turn it off, which also releases browsers waiting on the lock screen.
@@ -408,7 +419,9 @@ The dashboard's **Activity** section lists enrollments, enrollment codes, settin
 
 ### Backups, export and import
 
-The server copies `state.json` into `backups/` at most once an hour (`SHARED_BROWSER_BACKUP_INTERVAL_MINUTES`) and keeps the newest 48 (`SHARED_BROWSER_BACKUP_KEEP`). The dashboard's **Vault backups** section lists them and restores any of them, and can export the current vault or import an exported one. Every import or restore first saves the current vault as another backup.
+The server copies `state.json` into `backups/` at most once an hour (`SHARED_BROWSER_BACKUP_INTERVAL_MINUTES`), and only when the vault changes, and keeps the newest 48 (`SHARED_BROWSER_BACKUP_KEEP`); older ones are deleted automatically. The safety backups taken before a bulk delete, purge, import or restore count toward the same 48. With the defaults that is about two days of hourly backups on a busy vault, and longer on a quiet one; the dashboard shows the oldest backup kept.
+
+The dashboard's **Vault backups** section lists the backups, restores any of them, and deletes the ones you no longer want (a deleted backup cannot be restored). It can also export the current vault or import an exported one. Every import or restore first saves the current vault as another backup.
 
 Backups and exports keep cookie values encrypted with `SHARED_BROWSER_DATA_KEY`, so they can only be restored on a server with the same data key; a vault written with another key is refused. They do contain device token hashes and enrollment state, so store them as carefully as the data volume.
 

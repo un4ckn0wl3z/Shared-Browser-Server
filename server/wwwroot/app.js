@@ -82,6 +82,11 @@ function render() {
   $('#auto-share-domains').value = (settings.autoShareDomains || []).join('\n');
   updateShareSites();
   $('#allow-admin-enroll').checked = settings.allowAdminTokenEnrollment !== false;
+  $('#min-version').value = settings.minimumClientVersion || '';
+  const versions = state.devices.filter(device => !device.revoked && device.clientVersion).map(device => device.clientVersion);
+  const newest = versions.reduce((best, version) => !best || versionAtLeast(version, best) ? version : best, '');
+  const outdated = settings.minimumClientVersion ? state.devices.filter(device => !device.revoked && !(device.clientVersion && versionAtLeast(device.clientVersion, settings.minimumClientVersion))).length : 0;
+  $('#min-version-hint').textContent = `Older browsers stop syncing and can only download the update through the proxy. Browsers 1.6 and newer install it and restart on their own.${newest ? ` Newest version in use: ${newest}.` : ''}${outdated ? ` ${outdated} browser(s) still need to update.` : ''}`;
 
   const proxy = settings.proxy || {};
   const runtime = state.proxy || {};
@@ -150,6 +155,10 @@ function updatePolicyWarning() {
 
 // Explains, per browser, whether it follows the required connection mode.
 function complianceNote(device) {
+  const minimum = state.settings.minimumClientVersion;
+  if (minimum && !device.revoked && !(device.clientVersion && versionAtLeast(device.clientVersion, minimum))) {
+    return `<span class="pill warn" title="Below the minimum browser version ${minimum}: cannot sync until it updates">UPDATE REQUIRED</span>`;
+  }
   if (state.settings.clientLock?.enabled && !device.revoked && !(device.clientVersion && versionAtLeast(device.clientVersion, LOCK_MIN_VERSION))) {
     return `<span class="pill warn" title="Browsers before ${LOCK_MIN_VERSION} do not ask for the unlock code">UPDATE NEEDED</span>`;
   }
@@ -302,6 +311,7 @@ function settingsPayload(proxy) {
     autoShareScope: $('#auto-share-mode').value === 'listed' ? 'listed' : 'all',
     autoShareDomains: $('#auto-share-domains').value.split(/[\s,]+/).filter(Boolean),
     allowAdminTokenEnrollment: $('#allow-admin-enroll').checked,
+    minimumClientVersion: $('#min-version').value.trim(),
     networkPolicy: $('#network-policy').value,
     ipCheckUrl: $('#ip-check-url').value,
     proxy: proxy || state.settings.proxy
@@ -464,14 +474,27 @@ function formatBytes(value) {
 function renderBackups() {
   const body = $('#backups');
   body.replaceChildren();
+  const policy = state.backupPolicy;
+  if (policy) {
+    const oldest = state.backups?.length ? new Date(state.backups[state.backups.length - 1].createdAt).toLocaleString() : '';
+    $('#backup-policy').textContent = `Keeps the newest ${policy.keep} backups and deletes older ones automatically. An automatic backup is saved at most every ${policy.intervalMinutes} minutes while the vault changes, so a quiet vault keeps backups for longer.${oldest ? ` Oldest kept: ${oldest}.` : ''} Change with SHARED_BROWSER_BACKUP_KEEP and SHARED_BROWSER_BACKUP_INTERVAL_MINUTES.`;
+  }
   if (!state.backups?.length) {
     body.innerHTML = '<tr><td colspan="4" class="empty">No backups yet</td></tr>';
     return;
   }
   for (const backup of state.backups) {
     const row = document.createElement('tr');
-    row.innerHTML = `<td><code>${esc(backup.name)}</code></td><td>${esc(new Date(backup.createdAt).toLocaleString())}</td><td>${esc(formatBytes(backup.size))}</td><td><button class="secondary">Restore</button></td>`;
-    row.querySelector('button').onclick = async () => {
+    row.innerHTML = `<td><code>${esc(backup.name)}</code></td><td>${esc(new Date(backup.createdAt).toLocaleString())}</td><td>${esc(formatBytes(backup.size))}</td><td class="actions"><button class="secondary">Restore</button><button class="danger">Delete</button></td>`;
+    row.querySelector('.danger').onclick = async () => {
+      if (!confirm(`Delete ${backup.name}? It cannot be restored afterwards.`)) return;
+      try {
+        await api(`/backups/${encodeURIComponent(backup.name)}`, { method: 'DELETE' });
+        await load();
+        toast(`Deleted ${backup.name}`);
+      } catch (error) { toast(error.message, true); }
+    };
+    row.querySelector('.secondary').onclick = async () => {
       if (!confirm(`Restore ${backup.name}? The current vault is backed up first, then replaced. Browsers pick up the restored vault on their next sync.`)) return;
       try {
         const result = await api(`/backups/${encodeURIComponent(backup.name)}/restore`, { method: 'POST', body: '{}' });
