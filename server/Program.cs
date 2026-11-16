@@ -40,7 +40,9 @@ app.Use(async (context, next) =>
     await next();
 });
 app.UseDefaultFiles();
-app.UseStaticFiles();
+// The dashboard's page, script and styles change together on every upgrade, so browsers must check for a
+// new copy each time (a cheap 304 when unchanged). A cached old script against a new page breaks the dashboard.
+app.UseStaticFiles(new StaticFileOptions { OnPrepareResponse = file => file.Context.Response.Headers.CacheControl = "no-cache" });
 
 var audit = app.Services.GetRequiredService<AuditLog>();
 

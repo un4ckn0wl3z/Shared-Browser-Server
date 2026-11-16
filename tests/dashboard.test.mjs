@@ -190,6 +190,17 @@ describe('dashboard', () => {
     for (const action of ['client_lock.updated', 'enrollment_code.created', 'device.enrolled', 'profile.updated', 'settings.updated', 'announcement.sent', 'profiles.deleted', 'profiles.purged']) assert.ok(audit.includes(action), action);
   });
 
+  test('a display error does not sign out, and a reload keeps the session', async () => {
+    // Simulates a page and script from different versions: an element the script expects is missing.
+    await page.evaluate(() => document.getElementById('lock-enabled').remove());
+    await page.click('#refresh');
+    await waitFor(async () => /Part of the dashboard could not be shown/.test(await page.textContent('#toast')), { message: 'display error reported' });
+    assert.ok(await page.isVisible('#app'));
+    await page.reload();
+    await page.waitForSelector('#app:not([hidden])');
+    await waitFor(async () => (await page.textContent('#devices')).includes('WB1'), { message: 'still signed in after reload' });
+  });
+
   test('has no script errors', () => {
     assert.deepEqual(errors, []);
   });
