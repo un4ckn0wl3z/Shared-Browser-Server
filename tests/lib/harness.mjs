@@ -285,3 +285,21 @@ export async function launchBrowser(home, profile) {
   };
   return browser;
 }
+
+/** An HTTP endpoint that records every request (stands in for Discord, Telegram, LINE and S3 in tests). */
+export async function startCapture(status = 200) {
+  const requests = [];
+  const server = http.createServer((request, response) => {
+    const chunks = [];
+    request.on('data', chunk => chunks.push(chunk));
+    request.on('end', () => {
+      const body = Buffer.concat(chunks);
+      requests.push({ method: request.method, url: request.url, headers: request.headers, body, text: body.toString('utf8') });
+      response.statusCode = typeof status === 'function' ? status(request) : status;
+      response.end(response.statusCode < 300 ? '{"ok":true}' : '<Error><Code>AccessDenied</Code></Error>');
+    });
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address();
+  return { port, url: `http://127.0.0.1:${port}`, requests, close: () => new Promise(resolve => server.close(resolve)) };
+}

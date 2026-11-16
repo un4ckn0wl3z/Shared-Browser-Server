@@ -10,6 +10,89 @@ public sealed class SharedState
     public List<SharedBookmark> Bookmarks { get; set; } = [];
     public List<EnrollmentCode> EnrollmentCodes { get; set; } = [];
     public List<Announcement> Announcements { get; set; } = [];
+    /// <summary>Server-side only (never sent to browsers); secrets are encrypted on disk.</summary>
+    public NotificationSettings Notifications { get; set; } = new();
+    public OffsiteBackupSettings OffsiteBackup { get; set; } = new();
+}
+
+/// <summary>Where the server sends alerts, and which events it sends.</summary>
+public sealed class NotificationSettings
+{
+    public string DiscordWebhookUrl { get; set; } = "";
+    public string TelegramBotToken { get; set; } = "";
+    public string TelegramChatId { get; set; } = "";
+    public string LineChannelToken { get; set; } = "";
+    public string LineTo { get; set; } = "";
+    public List<string> Events { get; set; } = [.. NotificationEvents.All];
+    /// <summary>A browser counts as offline after this many minutes without contact.</summary>
+    public int OfflineMinutes { get; set; } = 30;
+    /// <summary>Warn this many days before a shared session expires.</summary>
+    public int ExpiryWarningDays { get; set; } = 3;
+}
+
+public static class NotificationEvents
+{
+    public const string SessionLost = "session.lost";
+    public const string SessionExpiring = "session.expiring";
+    public const string DeviceOffline = "device.offline";
+    public const string DeviceEnrolled = "device.enrolled";
+    public const string QuotaReached = "proxy.quota_reached";
+    public const string UnlockFailed = "browser.unlock_failed";
+    public const string BackupFailed = "backup.failed";
+    public static readonly string[] All = [SessionLost, SessionExpiring, DeviceOffline, DeviceEnrolled, QuotaReached, UnlockFailed, BackupFailed];
+}
+
+/// <summary>Copies every vault backup to S3-compatible storage (AWS S3, DigitalOcean Spaces, MinIO, ...).</summary>
+public sealed class OffsiteBackupSettings
+{
+    public bool Enabled { get; set; }
+    /// <summary>For example https://sgp1.digitaloceanspaces.com or https://s3.eu-central-1.amazonaws.com.</summary>
+    public string Endpoint { get; set; } = "";
+    public string Region { get; set; } = "us-east-1";
+    public string Bucket { get; set; } = "";
+    public string Prefix { get; set; } = "shared-browser/";
+    public string AccessKeyId { get; set; } = "";
+    public string SecretAccessKey { get; set; } = "";
+    public DateTimeOffset? LastUploadAt { get; set; }
+    public string LastUploadName { get; set; } = "";
+    public string LastError { get; set; } = "";
+}
+
+/// <summary>Which sites browsers may open: "off", "allow" (only the listed sites) or "block" (all but the listed sites).</summary>
+public sealed class SiteFilterSettings
+{
+    public string Mode { get; set; } = "off";
+    public List<string> Domains { get; set; } = [];
+}
+
+/// <summary>Hours in which browsers can be used, in the given IANA time zone.</summary>
+public sealed class UsageSchedule
+{
+    public bool Enabled { get; set; }
+    /// <summary>0 = Sunday ... 6 = Saturday.</summary>
+    public List<int> Days { get; set; } = [1, 2, 3, 4, 5];
+    public string Start { get; set; } = "09:00";
+    public string End { get; set; } = "18:00";
+    public string TimeZone { get; set; } = "Asia/Bangkok";
+}
+
+/// <summary>Stops downloads, file uploads or copying text on the listed sites (all sites when the list is empty).</summary>
+public sealed class DataControls
+{
+    public bool BlockDownloads { get; set; }
+    public bool BlockUploads { get; set; }
+    public bool BlockCopy { get; set; }
+    public List<string> Domains { get; set; } = [];
+}
+
+/// <summary>An action the administrator asked one browser to perform once.</summary>
+public sealed class DeviceCommand
+{
+    public string Id { get; set; } = "";
+    /// <summary>lock, close-tabs, clear-site, restart or open-url.</summary>
+    public string Type { get; set; } = "";
+    public string Argument { get; set; } = "";
+    public DateTimeOffset CreatedAt { get; set; }
 }
 
 /// <summary>A message from the administrator that browsers show in a banner until the user dismisses it.</summary>
@@ -53,6 +136,9 @@ public sealed class BrowserSettings
     public string IpCheckUrl { get; set; } = "https://api64.ipify.org?format=json";
     public ProxySettings Proxy { get; set; } = new();
     public ClientLockSettings ClientLock { get; set; } = new();
+    public SiteFilterSettings SiteFilter { get; set; } = new();
+    public UsageSchedule Schedule { get; set; } = new();
+    public DataControls DataControls { get; set; } = new();
     /// <summary>
     /// Browsers older than this (for example "1.5.0") cannot synchronize, and the proxy only lets them reach
     /// GitHub to download the update. Empty allows every version.
@@ -71,6 +157,10 @@ public sealed class ClientLockSettings
     public string Hash { get; set; } = "";
     public int Iterations { get; set; }
     public DateTimeOffset? ChangedAt { get; set; }
+    /// <summary>Lock again after this many minutes without keyboard or mouse use (0 = never).</summary>
+    public int IdleMinutes { get; set; }
+    /// <summary>Lock when the computer's screen locks or it goes to sleep.</summary>
+    public bool LockOnSystemLock { get; set; }
 }
 
 public sealed class ProxySettings
@@ -98,6 +188,8 @@ public sealed class ProxySettings
 
 public sealed class SessionProfile
 {
+    /// <summary>Optional name of the cookie that holds the sign-in, used for session health and alerts.</summary>
+    public string SessionCookie { get; set; } = "";
     public string Id { get; set; } = "";
     public string Name { get; set; } = "";
     public string Domain { get; set; } = "";
@@ -123,7 +215,7 @@ public sealed class SharedCookie
     public string SourceDeviceId { get; set; } = "";
 }
 
-public sealed class SharedBookmark { public string Title { get; set; } = ""; public string Url { get; set; } = ""; }
+public sealed class SharedBookmark { public string Title { get; set; } = ""; public string Url { get; set; } = ""; public string Folder { get; set; } = ""; }
 
 public sealed class DeviceRecord
 {
@@ -145,6 +237,13 @@ public sealed class DeviceRecord
     /// A site without an entry, or whose entry no longer exists, uses its first enabled account.
     /// </summary>
     public Dictionary<string, string> ActiveProfiles { get; set; } = [];
+    /// <summary>Overrides the shared home page for this browser (empty uses the shared one).</summary>
+    public string HomePage { get; set; } = "";
+    /// <summary>Null uses the shared site filter; otherwise this browser's own.</summary>
+    public SiteFilterSettings? SiteFilter { get; set; }
+    /// <summary>True: this browser can be used outside the allowed hours.</summary>
+    public bool ScheduleExempt { get; set; }
+    public List<DeviceCommand> Commands { get; set; } = [];
 }
 
 /// <summary>A single-use code an administrator hands to one browser instead of the administrator token.</summary>
@@ -185,13 +284,18 @@ public sealed record SyncResponse(long Revision, int ChangedCookies, SharedSnaps
 public sealed record SharedSnapshot(long Revision, DateTimeOffset UpdatedAt, BrowserSettings Settings, List<SessionProfile> Profiles, List<SharedBookmark> Bookmarks, List<ClientAnnouncement> Announcements)
 {
     public List<ClientAccount> Accounts { get; init; } = [];
+    /// <summary>Actions waiting for this browser; it acknowledges each one after running it.</summary>
+    public List<ClientCommand> Commands { get; init; } = [];
 }
+public sealed record ClientCommand(string Id, string Type, string Argument, DateTimeOffset CreatedAt);
+public sealed record DeviceCommandRequest(string? Type, string? Argument);
+public sealed record DeviceSettingsRequest(string? HomePage, SiteFilterSettings? SiteFilter, bool ScheduleExempt);
 /// <summary>One account (session profile) of a site that a browser can switch to.</summary>
 public sealed record ClientAccount(string Id, string Name, string Domain, bool Active, int CookieCount);
 /// <summary>Adds an empty account for the site of PageUrl, which the primary browser then signs in to.</summary>
 public sealed record CreateAccountRequest(string? Name, string? PageUrl);
 /// <summary>Code null or empty keeps the current code.</summary>
-public sealed record ClientLockRequest(bool Enabled, string? Code);
+public sealed record ClientLockRequest(bool Enabled, string? Code, int IdleMinutes = 0, bool LockOnSystemLock = false);
 public sealed record UnlockReport(bool Success);
 public sealed record AnnouncementRequest(string? Title, string? Message, string? Level, string? Url, int? ExpiresInMinutes, bool ShareWithAllDevices = true, List<string>? AllowedDeviceIds = null);
 /// <summary>What a browser receives. Targeting stays on the server.</summary>

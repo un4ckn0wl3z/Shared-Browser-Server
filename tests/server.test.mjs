@@ -1,8 +1,11 @@
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import { after, before, describe, test } from 'node:test';
 import {
   ADMIN_TOKEN, PUBLIC_IP, SOURCE_IP, basic, connectProxy, publicAddressAvailable, randomDeviceId, readHead, sleep,
-  startEcho, startOrigin, startServer, waitFor
+  startCapture, startEcho, startOrigin, startServer, waitFor
 } from './lib/harness.mjs';
 
 const cookie = (name, value, domain, extra = {}) => ({ name, value, domain, path: '/', secure: true, httpOnly: true, sameSite: 'Lax', ...extra });
@@ -681,5 +684,183 @@ describe('connection policy, egress and per-browser proxy limits', () => {
   test('the egress check reports a bad IP check URL clearly', async () => {
     await server.settings({ ipCheckUrl: '' });
     await assert.rejects(server.admin('/egress-ip', 'POST', {}), /IP check URL/);
+  });
+});
+
+describe('alerts, session health, remote actions and per-browser settings', () => {
+  let server;
+  let capture;
+  let primary;
+  let other;
+  const now = () => Math.floor(Date.now() / 1000);
+  before(async () => {
+    capture = await startCapture();
+    server = await startServer({ env: { SHARED_BROWSER_TELEGRAM_API: capture.url, SHARED_BROWSER_LINE_API: capture.url, SHARED_BROWSER_HEALTH_INTERVAL_SECONDS: '1' } });
+    primary = await server.enroll(randomDeviceId(), 'alert-primary');
+    other = await server.enroll(randomDeviceId(), 'alert-other');
+    await server.settings({ primaryDeviceId: primary.id });
+  });
+  after(async () => {
+    await server?.stop();
+    await capture?.close();
+  });
+  const discord = () => capture.requests.filter(item => item.url.startsWith('/api/webhooks/')).map(item => JSON.parse(item.text));
+
+  test('notification settings are validated, kept secret and can be tested', async () => {
+    await assert.rejects(server.admin('/notifications', 'PUT', { discordWebhookUrl: 'https://example.com/hook', events: [], offlineMinutes: 30, expiryWarningDays: 3 }), /discord\.com\/api\/webhooks/);
+    await assert.rejects(server.admin('/notifications', 'PUT', { telegramBotToken: 'nope', events: [], offlineMinutes: 30, expiryWarningDays: 3 }), /Telegram bot token/);
+    const hook = `${capture.url}/api/webhooks/1/secret-token`;
+    const saved = await server.admin('/notifications', 'PUT', {
+      discordWebhookUrl: hook, telegramBotToken: '123456:ABCDEFGHIJKLMNOPQRSTUVWXYZ', telegramChatId: '-1001', lineChannelToken: 'line-token', lineTo: 'U123',
+      events: ['session.lost', 'session.expiring', 'device.enrolled', 'browser.unlock_failed', 'backup.failed', 'bogus'], offlineMinutes: 30, expiryWarningDays: 3
+    });
+    assert.equal(saved.discordWebhookUrl, '••••••••');
+    assert.ok(!saved.events.includes('bogus'));
+    const status = JSON.stringify(await server.status());
+    assert.ok(!status.includes('secret-token') && !status.includes('ABCDEFGHIJ') && !status.includes('line-token'));
+    // Secrets are encrypted in the vault file and never reach browsers.
+    const vault = fs.readFileSync(path.join(server.data, 'state.json'), 'utf8');
+    assert.ok(!vault.includes('secret-token') && !vault.includes('line-token'));
+    assert.ok(!JSON.stringify(await (await server.device(other, '/snapshot')).json()).includes('webhooks'));
+    // Saving with the masked values keeps the stored secrets.
+    await server.admin('/notifications', 'PUT', { ...saved, telegramChatId: '-1001', events: saved.events });
+    const test = await server.admin('/notifications/test', 'POST', {});
+    assert.deepEqual(test.results.map(item => [item.channel, item.ok]), [['Discord', true], ['Telegram', true], ['LINE', true]]);
+    const [message] = discord();
+    assert.match(message.content, /Test notification/);
+    assert.deepEqual(message.allowed_mentions, { parse: [] });
+    const telegram = capture.requests.find(item => item.url === '/bot123456:ABCDEFGHIJKLMNOPQRSTUVWXYZ/sendMessage');
+    assert.equal(JSON.parse(telegram.text).chat_id, '-1001');
+    const line = capture.requests.find(item => item.url === '/v2/bot/message/push');
+    assert.equal(line.headers.authorization, 'Bearer line-token');
+    assert.equal(JSON.parse(line.text).to, 'U123');
+  });
+
+  test('enrollments and wrong unlock codes raise alerts', async () => {
+    await server.enroll(randomDeviceId(), 'alert-new');
+    await waitFor(() => discord().some(item => /New browser enrolled/.test(item.content) && /alert-new/.test(item.content)), { message: 'enrollment alert' });
+    await server.device(other, '/unlock-report', 'POST', { success: false });
+    await waitFor(() => discord().some(item => /Wrong unlock code/.test(item.content) && /alert-other/.test(item.content)), { message: 'unlock alert' });
+  });
+
+  test('session health, expiry warnings and sign-out alerts', async () => {
+    const push = cookies => server.device(primary, '/sync', 'POST', { pageUrl: 'https://health.example/', complete: true, cookies });
+    // An anti-bot cookie that lives 30 minutes is not the sign-in; the 2-day session cookie is, and expires within 3 days.
+    await push([
+      cookie('user_session', 's1', 'health.example', { expiresAt: now() + 2 * 86400 }),
+      cookie('__cf_bm', 'x', 'health.example', { expiresAt: now() + 1800 }),
+      cookie('theme', 'dark', 'health.example', { httpOnly: false, expiresAt: now() + 365 * 86400 })
+    ]);
+    let profile = await server.profile('health.example');
+    assert.equal(profile.health.state, 'expiring');
+    assert.ok(Math.abs(Date.parse(profile.health.expiresAt) / 1000 - (now() + 2 * 86400)) < 60);
+    await waitFor(() => discord().some(item => /expires soon/.test(item.content) && /health\.example/.test(item.content)), { message: 'expiry alert' });
+    // Naming the session cookie in the profile overrides the guess.
+    await server.admin(`/profiles/${profile.id}`, 'PUT', { name: profile.name, domain: profile.domain, enabled: true, sessionCookie: 'theme', cookies: profile.cookies.map(item => ({ ...item, value: '' })) });
+    profile = await server.profile('health.example');
+    assert.deepEqual([profile.sessionCookie, profile.health.state], ['theme', 'ok']);
+    await server.admin(`/profiles/${profile.id}`, 'PUT', { name: profile.name, domain: profile.domain, enabled: true, sessionCookie: '', cookies: profile.cookies.map(item => ({ ...item, value: '' })) });
+    // Signing out on the primary browser removes the sign-in cookies: that is an alert.
+    await push([cookie('theme', 'dark', 'health.example', { httpOnly: false, expiresAt: now() + 365 * 86400 })]);
+    assert.equal((await server.profile('health.example')).health.state, 'signed-out');
+    await waitFor(() => discord().some(item => /signed out/.test(item.content) && /health\.example/.test(item.content) && /alert-primary/.test(item.content)), { message: 'sign-out alert' });
+    assert.ok((await server.status()).audit.some(item => item.action === 'session.lost'));
+  });
+
+  test('remote actions are delivered once and acknowledged', async () => {
+    const send = body => server.admin(`/devices/${other.id}/commands`, 'POST', body);
+    await assert.rejects(send({ type: 'format-disk' }), /Unknown action/);
+    await assert.rejects(send({ type: 'open-url', argument: 'javascript:alert(1)' }), /HTTP or HTTPS/);
+    const before = (await server.status()).revision;
+    const lock = await send({ type: 'lock' });
+    const open = await send({ type: 'open-url', argument: 'https://example.com/welcome' });
+    const clear = await send({ type: 'clear-site', argument: 'https://www.GitHub.com/login' });
+    assert.equal(clear.argument, 'www.github.com');
+    assert.ok((await server.status()).revision > before);
+    const commands = (await (await server.device(other, '/snapshot')).json()).commands;
+    assert.deepEqual(commands.map(item => item.type), ['lock', 'open-url', 'clear-site']);
+    assert.deepEqual((await (await server.device(primary, '/snapshot')).json()).commands, []);
+    assert.equal((await server.device(other, `/commands/${lock.id}/ack`, 'POST')).status, 204);
+    assert.equal((await server.admin(`/devices/${other.id}/commands/${open.id}`, 'DELETE', undefined, true)).status, 204);
+    const device = (await server.status()).devices.find(item => item.id === other.id);
+    assert.deepEqual(device.pendingCommands.map(item => item.type), ['clear-site']);
+    const audit = (await server.status()).audit.map(item => item.action);
+    for (const action of ['device.command_sent', 'device.command_done', 'device.command_cancelled']) assert.ok(audit.includes(action), action);
+  });
+
+  test('browsing controls: shared settings and per-browser overrides', async () => {
+    await assert.rejects(server.settings({ siteFilter: { mode: 'allow', domains: [] } }), /at least one site/);
+    await assert.rejects(server.settings({ schedule: { enabled: true, days: [1], start: '9am', end: '18:00', timeZone: 'Asia/Bangkok' } }), /HH:mm/);
+    await assert.rejects(server.settings({ schedule: { enabled: true, days: [1], start: '09:00', end: '18:00', timeZone: 'Mars/Base' } }), /Unknown time zone/);
+    await server.settings({
+      homePage: 'https://home.example/',
+      siteFilter: { mode: 'block', domains: ['https://Bad.example/x'] },
+      schedule: { enabled: true, days: [1, 2, 3, 4, 5, 9], start: '08:30', end: '17:30', timeZone: 'Asia/Bangkok' },
+      dataControls: { blockDownloads: true, blockUploads: false, blockCopy: true, domains: ['*.secret.example'] }
+    });
+    let settings = (await (await server.device(other, '/snapshot')).json()).settings;
+    assert.deepEqual(settings.siteFilter, { mode: 'block', domains: ['bad.example'] });
+    assert.deepEqual([settings.schedule.enabled, settings.schedule.days], [true, [1, 2, 3, 4, 5]]);
+    assert.deepEqual(settings.dataControls, { blockDownloads: true, blockUploads: false, blockCopy: true, domains: ['secret.example'] });
+    await assert.rejects(server.admin(`/devices/${other.id}/settings`, 'PUT', { homePage: 'ftp://x', scheduleExempt: false }), /HTTP or HTTPS/);
+    await server.admin(`/devices/${other.id}/settings`, 'PUT', { homePage: 'https://desk.example/', siteFilter: { mode: 'allow', domains: ['work.example'] }, scheduleExempt: true });
+    settings = (await (await server.device(other, '/snapshot')).json()).settings;
+    assert.equal(settings.homePage, 'https://desk.example/');
+    assert.deepEqual(settings.siteFilter, { mode: 'allow', domains: ['work.example'] });
+    assert.equal(settings.schedule.enabled, false);
+    // The other browser keeps the shared settings.
+    const shared = (await (await server.device(primary, '/snapshot')).json()).settings;
+    assert.deepEqual([shared.homePage, shared.siteFilter.mode, shared.schedule.enabled], ['https://home.example/', 'block', true]);
+    await server.admin(`/devices/${other.id}/settings`, 'PUT', { homePage: '', siteFilter: null, scheduleExempt: false });
+    assert.equal((await (await server.device(other, '/snapshot')).json()).settings.homePage, 'https://home.example/');
+    await server.settings({ homePage: '', siteFilter: { mode: 'off', domains: [] }, schedule: { enabled: false, days: [1], start: '09:00', end: '18:00', timeZone: 'Asia/Bangkok' }, dataControls: { blockDownloads: false, blockUploads: false, blockCopy: false, domains: [] } });
+  });
+
+  test('bookmarks keep their folders, and the idle lock is part of the unlock code', async () => {
+    await server.admin('/bookmarks', 'PUT', [{ title: 'Repo', url: 'https://git.example/', folder: ' Work ' }, { title: 'News', url: 'https://news.example/' }]);
+    assert.deepEqual((await (await server.device(other, '/snapshot')).json()).bookmarks.map(item => item.folder), ['Work', '']);
+    await assert.rejects(server.admin('/client-lock', 'PUT', { enabled: true, code: 'abcd', idleMinutes: 5000 }), /1440/);
+    await server.admin('/client-lock', 'PUT', { enabled: true, code: 'abcd', idleMinutes: 10, lockOnSystemLock: true });
+    const lock = (await (await server.device(other, '/snapshot')).json()).settings.clientLock;
+    assert.deepEqual([lock.idleMinutes, lock.lockOnSystemLock], [10, true]);
+    await server.admin('/client-lock', 'PUT', { enabled: false });
+  });
+
+  test('backups are copied to S3-compatible storage with a valid signature', async () => {
+    const storage = await startCapture(request => request.headers.authorization?.includes('Credential=BADKEY/') ? 403 : 200);
+    try {
+      await assert.rejects(server.admin('/offsite-backup', 'PUT', { enabled: true, endpoint: 'http://storage.example', region: 'sgp1', bucket: 'vault', prefix: 'sb', accessKeyId: 'AK', secretAccessKey: 'SK' }), /HTTPS address/);
+      await assert.rejects(server.admin('/offsite-backup', 'PUT', { enabled: true, endpoint: storage.url, region: 'sgp1', bucket: 'vault', prefix: 'sb', accessKeyId: '', secretAccessKey: '' }), /Enter the endpoint/);
+      const saved = await server.admin('/offsite-backup', 'PUT', { enabled: true, endpoint: storage.url, region: 'sgp1', bucket: 'vault', prefix: 'sb', accessKeyId: 'AKTEST', secretAccessKey: 'super-secret' });
+      assert.deepEqual([saved.prefix, saved.secretAccessKey], ['sb/', '••••••••']);
+      assert.ok(!fs.readFileSync(path.join(server.data, 'state.json'), 'utf8').includes('super-secret'));
+      // A bulk delete takes a backup, which is uploaded on its own.
+      await server.admin('/profiles', 'POST', { name: 'Offsite', domain: 'offsite.example', enabled: true, cookies: [] });
+      await server.admin('/profiles/purge', 'POST', { confirm: true });
+      await waitFor(() => storage.requests.some(item => /^\/vault\/sb\/state-.*-before-purge\.json$/.test(item.url)), { message: 'automatic upload' });
+      const upload = storage.requests.find(item => /before-purge/.test(item.url));
+      assert.equal(upload.method, 'PUT');
+      assert.equal(upload.headers['x-amz-content-sha256'], crypto.createHash('sha256').update(upload.body).digest('hex'));
+      // Recompute the AWS Signature Version 4 the way S3 does.
+      const auth = /^AWS4-HMAC-SHA256 Credential=AKTEST\/(\d{8})\/sgp1\/s3\/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=([0-9a-f]{64})$/.exec(upload.headers.authorization);
+      assert.ok(auth, upload.headers.authorization);
+      const canonical = `PUT\n${upload.url}\n\nhost:${upload.headers.host}\nx-amz-content-sha256:${upload.headers['x-amz-content-sha256']}\nx-amz-date:${upload.headers['x-amz-date']}\n\nhost;x-amz-content-sha256;x-amz-date\n${upload.headers['x-amz-content-sha256']}`;
+      const toSign = `AWS4-HMAC-SHA256\n${upload.headers['x-amz-date']}\n${auth[1]}/sgp1/s3/aws4_request\n${crypto.createHash('sha256').update(canonical).digest('hex')}`;
+      const hmac = (key, value) => crypto.createHmac('sha256', key).update(value).digest();
+      const signingKey = hmac(hmac(hmac(hmac('AWS4super-secret', auth[1]), 'sgp1'), 's3'), 'aws4_request');
+      assert.equal(crypto.createHmac('sha256', signingKey).update(toSign).digest('hex'), auth[2]);
+      assert.ok(Array.isArray(JSON.parse(upload.text).Profiles));
+      await waitFor(async () => (await server.status()).offsiteBackup.lastUploadName.includes('before-purge'), { message: 'upload recorded' });
+      // A rejected upload is reported in the dashboard and as an alert.
+      await server.admin('/offsite-backup', 'PUT', { ...saved, accessKeyId: 'BADKEY' });
+      const failed = await server.admin('/offsite-backup/upload', 'POST', {}, true);
+      assert.equal(failed.status, 400);
+      assert.match((await failed.json()).error, /403 \(AccessDenied\)/);
+      assert.match((await server.status()).offsiteBackup.lastError, /AccessDenied/);
+      await waitFor(() => discord().some(item => /Backup failed/.test(item.content)), { message: 'backup alert' });
+      await server.admin('/offsite-backup', 'PUT', { ...saved, enabled: false, secretAccessKey: '' });
+    } finally {
+      await storage.close();
+    }
   });
 });
