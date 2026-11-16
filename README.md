@@ -79,6 +79,11 @@ The primary-writer model prevents a logged-out secondary browser from replacing 
 - Several accounts per site (for example two GitHub users), switched per browser from the toolbar
 - Optional unlock code that browsers ask for every time they start, turned on, off or changed from the dashboard
 - A minimum browser version that makes outdated browsers update before they can sync or browse
+- Alerts to Discord, Telegram and LINE, and session health with expiry warnings
+- Remote actions per browser: lock, close tabs, clear a site's cookies, restart, open a page
+- Browsing controls: site allow/block lists, allowed hours, and blocking downloads, uploads or copying on chosen sites
+- Offsite copies of every vault backup in S3-compatible storage
+- A download manager, and bookmark folders
 - Live updates over Server-Sent Events
 - Audit log, automatic vault backups, and vault export/import
 - Announcements from the administrator to all or selected browsers
@@ -203,7 +208,7 @@ docker compose up -d --build
 ### Upgrading
 
 - The server reads vaults written by earlier versions as they are; there is nothing to migrate. Settings added later start with the previous behavior: profiles and announcements go to all browsers, the administrator token still enrolls browsers, and proxy TLS is off.
-- Older browsers keep working against a newer server. They do not show announcements, keep polling instead of receiving live updates, and (before 1.1) do not remove cookies from profiles they lose access to. Browsers before 1.4 cannot switch accounts and always use a site's first account, and browsers before 1.5 do not ask for the unlock code.
+- Older browsers keep working against a newer server. They do not show announcements, keep polling instead of receiving live updates, and (before 1.1) do not remove cookies from profiles they lose access to. Browsers before 1.4 cannot switch accounts and always use a site's first account, browsers before 1.5 do not ask for the unlock code, and browsers before 1.7 ignore actions, browsing controls and the idle lock.
 - Update every browser that uses Managed proxy mode to 1.2 or newer before turning on proxy TLS.
 - With the server released alongside browser 1.3, **Browser connection mode** defaults to requiring the managed proxy with Strict privacy, also on existing installations. Enable the proxy before upgrading the server, or set the mode to **Let each browser choose** afterwards, otherwise 1.3 browsers stop loading websites until the proxy is on. Browsers before 1.3 keep their own setting.
 - Restarting the server briefly interrupts open proxy connections; browsers reconnect and resume syncing on their own.
@@ -262,7 +267,7 @@ pnpm start --profile=WB3
 
 On Windows, `Open-WB1.cmd`, `Open-WB2.cmd`, and `Open-WB3.cmd` in the repository root start the WB1, WB2, and WB3 profiles after the dependencies are installed.
 
-On Linux, make the AppImage executable and pass the profile name the same way (`chmod +x Shared-Browser-*.AppImage`, then `./Shared-Browser-1.4.0-linux-x86_64.AppImage --profile=WB1`). AppImages need FUSE; on Ubuntu 22.04 and newer install `libfuse2` (`libfuse2t64` on 24.04). Started from the AppImage, the client updates itself.
+On Linux, make the AppImage executable and pass the profile name the same way (`chmod +x Shared-Browser-*.AppImage`, then `./Shared-Browser-1.7.0-linux-x86_64.AppImage --profile=WB1`). AppImages need FUSE; on Ubuntu 22.04 and newer install `libfuse2` (`libfuse2t64` on 24.04). Started from the AppImage, the client updates itself.
 
 Each profile name gets its own browser storage, device identity, encrypted device token, and offline cache. All profiles connect to the same management server and shared vault.
 
@@ -274,7 +279,7 @@ Repeat enrollment for WB2 and WB3. In the dashboard, choose the signed-in browse
 
 The installed client checks GitHub Releases at startup and every four hours. Its version is shown in the window title, the toolbar status text, and the settings dialog, which also has **Check for updates**. Windows and Linux AppImage builds download a new release in the background and show **Restart to update** in the toolbar; the update otherwise installs when the browser is closed. The macOS DMG is unsigned, so macOS cannot install updates in place: the toolbar shows **Update to vX** and opens the release page. Update checks follow the browser's connection mode, so in Managed or Strict privacy mode they go through the management proxy.
 
-The address bar accepts full URLs, bare host names (`github.com`, or `localhost:3000` which opens over HTTP), and search terms, which use the search URL configured in the dashboard (DuckDuckGo by default; leave it empty to disable searching). The ★ button lists the shared bookmarks; hold Ctrl (⌘) or Shift to open one in a new tab. Middle-click a tab to close it, and double-click the empty tab strip to open a new one. Download progress is shown in the status text.
+The address bar accepts full URLs, bare host names (`github.com`, or `localhost:3000` which opens over HTTP), and search terms, which use the search URL configured in the dashboard (DuckDuckGo by default; leave it empty to disable searching). The ★ button lists the shared bookmarks, grouped into folders when the dashboard gives them one; hold Ctrl (⌘) or Shift to open one in a new tab. Middle-click a tab to close it, and double-click the empty tab strip to open a new one. Download progress is shown in the status text.
 
 Keyboard shortcuts (⌘ instead of Ctrl on macOS): Ctrl+T new tab, Ctrl+Shift+T reopen the last closed tab, Ctrl+W close tab, Ctrl+Tab / Ctrl+Shift+Tab switch tabs, Ctrl+L focus the address bar, Ctrl+F or F3 find in page (Enter / Shift+Enter for next and previous, Esc to close), Ctrl+R or F5 reload, Ctrl+Shift+R hard reload, Alt+← / Alt+→ back and forward, Ctrl+= / Ctrl+- / Ctrl+0 zoom, and F12 developer tools. Right-click a page for copy/paste, link, and Inspect actions. Links that open a new tab load as tabs; `window.open` popups open as real windows so sign-in and approval flows that report back to their opener keep working.
 
@@ -283,6 +288,8 @@ Keyboard shortcuts (⌘ instead of Ctrl on macOS): Ctrl+T new tab, Ctrl+Shift+T 
 A site can have several shared accounts, for example two GitHub users. When the current site has a shared session, the toolbar shows an account button (👤 with the account's name, and the number of accounts when there is more than one). Its menu lists the site's accounts; choosing one switches this browser only: the browser replaces the site's cookies with that account's and reloads the site's open tabs. Other browsers keep the account they use, and a browser that never switched uses the site's first account.
 
 To add an account, open the site in the primary browser and choose **Add another account…** from the account menu. Give it a name. The current account stays saved in the vault: the browser only clears the site's cookies locally (it does not sign out on the site), so the site shows its sign-in page; sign in with the other user and that session is saved as the new account. Do not use the site's own **Sign out** on an account you want to keep, because that ends the saved session on the site's side and the primary browser then removes its cookies from that account. Secondary browsers only switch between accounts, because only the primary browser's sign-ins are saved. An administrator can also add an account in the dashboard: create a profile with the site's domain and a different name. The dashboard shows, for each account, which browsers use it.
+
+The ⬇ button opens the download manager. Files are saved to the computer's Downloads folder (a name that already exists gets a number added); the list shows progress and lets you pause, resume or cancel a download, open a finished file, or show it in its folder. The badge counts downloads in progress.
 
 Open tabs and the window size and position are restored the next time a profile starts. Tab addresses are stored encrypted along with the device credentials.
 
@@ -397,6 +404,41 @@ Set **Minimum browser version** in Browser settings (for example `1.6.0`) to mak
 - Set it only to a version that is already published under GitHub Releases, otherwise browsers have nothing to update to.
 - Lowering the minimum or clearing it releases waiting browsers within a second or two, without a restart.
 
+### Notifications
+
+Under **Notifications**, paste a Discord webhook URL (in Discord: Edit channel → Integrations → Webhooks → Copy webhook URL), a Telegram bot token and chat ID, and/or a LINE Messaging API channel access token and user or group ID, choose the events, and use **Send test**. The secrets are stored encrypted in the vault, are shown only as `••••••••`, and are never sent to browsers; leave a field unchanged to keep it, or clear it to remove that channel.
+
+| Event | When |
+| --- | --- |
+| A shared session is signed out | The primary browser no longer holds a profile's sign-in cookie (it signed out, or the site ended the session) |
+| A shared session expires soon | A profile's sign-in cookie expires within the warning period (3 days by default) |
+| A browser goes offline | A browser that was in use this week has not connected for the set time (30 minutes by default) |
+| A new browser enrolls | |
+| A browser reaches its proxy quota | |
+| A wrong unlock code is entered | |
+| A backup fails | The local backup or the offsite copy |
+
+The same alert is sent at most once every 10 minutes. Every alert also appears in the **Activity** log.
+
+### Session health
+
+Each profile shows whether it is signed in and when its sign-in expires (**signed in · 12 d left**, **expires in 2 d**, **signed out**). The server treats long-lived HttpOnly cookies as the sign-in and ignores short-lived ones such as anti-bot cookies; if it guesses wrong for a site, name the sign-in cookie in the profile (for example `user_session` for GitHub).
+
+### Managing a browser
+
+**Manage** in the browsers table opens a panel for that browser:
+
+- **Actions** run once, within a second or two when the browser is online, or the next time it connects (they expire after a day): **Lock now** (needs the unlock code), **Close all tabs**, **Restart browser**, **Open** a page, and **Clear cookies** for a site. Waiting actions are listed and can be cancelled. Clearing a site's cookies on the primary browser also removes that site's session from the vault.
+- **Settings for this browser**: its own home page, its own site filter, and whether it may be used outside the allowed hours.
+
+### Browsing controls
+
+Set under **Browsing controls** for all browsers (a browser's own settings from **Manage** take precedence). They need Shared Browser 1.7 or newer.
+
+- **Site filter**: **Only the sites listed** (an allow list) or **Every site except those listed**. A listed site includes its subdomains. It applies to pages and frames that browsers open, including links and redirects; a blocked page shows a notice. Images and scripts a page loads from other sites are not filtered, so allowed sites keep working.
+- **Allowed hours**: the days and times browsers can be used, in the chosen time zone (a range such as 22:00–06:00 runs past midnight). Outside them browsers show **Outside the allowed hours** and open again on their own. Browsers marked **Can be used outside the allowed hours** are not affected.
+- **Data controls**: block downloads, file uploads (file pickers and drag and drop) and copying text, on the listed sites or on every site. Developer tools stay closed on those sites. This keeps ordinary users from moving data out; it cannot stop screenshots or photos of the screen, and applies to pages loaded after the change.
+
 ### Unlock code
 
 Under **Unlock code** in the dashboard, tick **Require the unlock code when a browser starts**, enter a code (4 to 128 characters), and save. From then on every browser shows a lock screen each time it starts, and no page opens until the code is entered; the saved tabs then come back. Turning the code on also locks browsers that are running at that moment. Change the code by entering a new one (browsers that are already unlocked stay unlocked until they restart), and untick the box to turn it off, which also releases browsers waiting on the lock screen.
@@ -405,6 +447,7 @@ Under **Unlock code** in the dashboard, tick **Require the unlock code when a br
 - After five wrong codes, each further attempt waits longer (30 seconds, doubling up to 15 minutes); the count survives a restart. Successful and failed unlocks appear in the **Activity** log.
 - While locked, the browser's tabs, address bar, settings and shortcuts are unavailable. Synchronization keeps running in the background.
 - The code needs Shared Browser 1.5 or newer. While it is on, the browsers table marks older browsers **UPDATE NEEDED**, because they do not ask for it.
+- **Lock again after idle** locks a browser after that many minutes without keyboard or mouse use, and **Lock when the computer locks or sleeps** follows the operating system's screen lock (both need 1.7).
 - The lock keeps casual users out of the browser. It does not protect against someone who can sign in to the computer's operating-system account and read the browser's files.
 
 ### Announcements
@@ -420,6 +463,8 @@ The dashboard's **Activity** section lists enrollments, enrollment codes, settin
 ### Backups, export and import
 
 The server copies `state.json` into `backups/` at most once an hour (`SHARED_BROWSER_BACKUP_INTERVAL_MINUTES`), and only when the vault changes, and keeps the newest 48 (`SHARED_BROWSER_BACKUP_KEEP`); older ones are deleted automatically. The safety backups taken before a bulk delete, purge, import or restore count toward the same 48. With the defaults that is about two days of hourly backups on a busy vault, and longer on a quiet one; the dashboard shows the oldest backup kept.
+
+**Offsite copy** (under Vault backups) uploads every backup to S3-compatible object storage such as DigitalOcean Spaces (`https://sgp1.digitaloceanspaces.com`, region `sgp1`), AWS S3 (`https://s3.<region>.amazonaws.com`) or MinIO, into the bucket and folder you choose. Create an access key limited to that bucket. The secret key is stored encrypted. The status line shows the last upload or the last error, **Upload latest backup now** tests the settings, and a failed upload raises a backup alert. Old copies are not deleted by the server; set a lifecycle rule on the bucket (for example, delete after 30 days).
 
 The dashboard's **Vault backups** section lists the backups, restores any of them, and deletes the ones you no longer want (a deleted backup cannot be restored). It can also export the current vault or import an exported one. Every import or restore first saves the current vault as another backup.
 
