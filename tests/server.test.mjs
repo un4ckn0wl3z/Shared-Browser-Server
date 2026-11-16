@@ -160,6 +160,65 @@ describe('management API', () => {
     await server.admin('/profiles/delete', 'POST', { ids: [alice.id, bob.id, carol.id, hidden.id] });
   });
 
+  test('the browser unlock code is stored as a hash and survives other settings changes', async () => {
+    const device = await server.enroll(randomDeviceId(), 'lock-device');
+    const lockOf = async () => (await (await server.device(device, '/snapshot')).json()).settings.clientLock;
+    assert.equal((await lockOf()).enabled, false);
+    await assert.rejects(server.admin('/client-lock', 'PUT', { enabled: true }), /Enter an unlock code/);
+    await assert.rejects(server.admin('/client-lock', 'PUT', { enabled: true, code: 'abc' }), /4 to 128/);
+    await server.admin('/client-lock', 'PUT', { enabled: true, code: ' open-sesame ' });
+    const lock = await lockOf();
+    assert.equal(lock.enabled, true);
+    assert.equal(JSON.stringify(lock).includes('open-sesame'), false);
+    const { pbkdf2Sync } = await import('node:crypto');
+    // Browsers check the code with the same PBKDF2-SHA256 parameters, trimming surrounding spaces.
+    const derive = code => pbkdf2Sync(code, Buffer.from(lock.salt, 'base64'), lock.iterations, 32, 'sha256').toString('base64');
+    assert.equal(derive('open-sesame'), lock.hash);
+    assert.notEqual(derive('open-sesame!'), lock.hash);
+    // Saving the other settings keeps the code; turning it off keeps the hash for later.
+    await server.settings({ homePage: '' });
+    assert.equal((await lockOf()).hash, lock.hash);
+    await server.admin('/client-lock', 'PUT', { enabled: false });
+    assert.deepEqual([(await lockOf()).enabled, (await lockOf()).hash], [false, lock.hash]);
+    await server.admin('/client-lock', 'PUT', { enabled: true });
+    await server.admin('/client-lock', 'PUT', { enabled: true, code: 'new-code' });
+    assert.notEqual((await lockOf()).hash, lock.hash);
+    assert.equal((await server.device(device, '/unlock-report', 'POST', { success: false })).status, 204);
+    assert.equal((await server.device(device, '/unlock-report', 'POST', { success: true })).status, 204);
+    const audit = (await server.status()).audit.map(item => item.action);
+    for (const action of ['client_lock.updated', 'browser.unlocked', 'browser.unlock_failed']) assert.ok(audit.includes(action), action);
+    await server.admin('/client-lock', 'PUT', { enabled: false });
+  });
+
+  test('a list of shared sites limits what the primary browser shares', async () => {
+    const primary = await server.enroll(randomDeviceId(), 'list-primary');
+    await server.settings({ primaryDeviceId: primary.id, autoShareCookies: true, autoShareScope: 'all', autoShareDomains: [] });
+    const push = (host, value) => server.device(primary, '/sync', 'POST', { pageUrl: `https://${host}/`, complete: true, cookies: [cookie('s', value, host)] });
+    await push('old.example', '1');
+    assert.ok(await server.profile('old.example'));
+    await assert.rejects(server.settings({ autoShareScope: 'listed', autoShareDomains: [] }), /at least one site/);
+    await assert.rejects(server.settings({ autoShareScope: 'listed', autoShareDomains: ['not a site'] }), /not a valid site/);
+    await server.settings({ autoShareScope: 'listed', autoShareDomains: ['https://Listed.example/login', '*.wild.example', 'listed.example'] });
+    assert.deepEqual((await server.status()).settings.autoShareDomains, ['listed.example', 'wild.example']);
+    // Listed sites, including subdomains, are shared under the listed domain; others are not.
+    await push('www.listed.example', 'a');
+    await push('other.example', 'b');
+    assert.deepEqual((await server.profile('listed.example')).cookies.map(item => item.domain), ['www.listed.example']);
+    assert.equal(await server.profile('www.listed.example'), undefined);
+    assert.equal(await server.profile('other.example'), undefined);
+    // A profile from before the list is kept but no longer updated, and the dashboard says so.
+    await push('old.example', '2');
+    const old = (await server.status()).profiles.find(item => item.domain === 'old.example');
+    assert.equal(old.listed, false);
+    assert.equal((await (await server.device(primary, '/snapshot')).json()).profiles.find(item => item.domain === 'old.example').cookies[0].value, '1');
+    assert.equal((await server.status()).profiles.find(item => item.domain === 'listed.example').listed, true);
+    // Accounts can only be added for listed sites.
+    assert.equal((await server.device(primary, '/accounts', 'POST', { name: 'x', pageUrl: 'https://other.example/' })).status, 400);
+    assert.equal((await server.device(primary, '/accounts', 'POST', { name: 'second', pageUrl: 'https://listed.example/' })).status, 201);
+    await server.settings({ autoShareScope: 'all', autoShareDomains: [] });
+    await server.admin('/profiles/delete', 'POST', { ids: (await server.status()).profiles.filter(item => /(old|listed)\.example$/.test(item.domain)).map(item => item.id) });
+  });
+
   test('bookmarks and search URL validation', async () => {
     const saved = await server.admin('/bookmarks', 'PUT', [{ title: '', url: 'https://github.com' }, { title: 'Docs', url: 'https://example.com/docs' }]);
     assert.deepEqual(saved.map(item => item.title), ['github.com', 'Docs']);

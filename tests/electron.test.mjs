@@ -239,6 +239,44 @@ describe('Electron browsers sharing a session', () => {
     assert.equal(await wb2.window.locator('.announcement').count(), 0);
   });
 
+  test('the unlock code locks running and restarted browsers until it is entered', async () => {
+    const pages = browser => browser.app.evaluate(({ webContents }) => webContents.getAllWebContents().filter(item => /^https?:/.test(item.getURL())).length);
+    const attached = browser => browser.app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].contentView.children.length);
+    const enter = async code => {
+      await wb2.window.fill('#lock-code', code);
+      await wb2.window.click('#lock-form button');
+    };
+    await server.admin('/client-lock', 'PUT', { enabled: true, code: 'letmein' });
+    // A running browser locks as soon as the code is turned on, hides its pages and refuses browser actions.
+    await wb2.window.waitForSelector('#lock-screen:not([hidden])');
+    await waitFor(async () => (await attached(wb2)) === 0, { message: 'page view detached' });
+    await assert.rejects(wb2.window.evaluate(() => window.sharedBrowser.newTab('about:blank')), /Unlock the browser first/);
+    await enter('wrong code');
+    await waitFor(async () => /Wrong unlock code/.test(await wb2.window.textContent('#lock-error')), { message: 'wrong code refused' });
+    assert.ok(await wb2.window.isVisible('#lock-screen'));
+    await enter('letmein');
+    await wb2.window.waitForSelector('#lock-screen', { state: 'hidden' });
+    assert.equal(await attached(wb2), 1);
+    // After a restart no page loads until the code is entered; then the saved tabs come back.
+    const open = await pages(wb2);
+    await wb2.close();
+    wb2 = await launchBrowser(home, 'WB2');
+    await wb2.window.waitForSelector('#lock-screen:not([hidden])');
+    await sleep(2000);
+    assert.equal(await pages(wb2), 0);
+    await enter('letmein');
+    await waitFor(async () => (await pages(wb2)) === open, { message: 'tabs restored after unlock' });
+    // Turning the code off releases a browser waiting on the lock screen.
+    await wb2.close();
+    wb2 = await launchBrowser(home, 'WB2');
+    await wb2.window.waitForSelector('#lock-screen:not([hidden])');
+    await server.admin('/client-lock', 'PUT', { enabled: false });
+    await wb2.window.waitForSelector('#lock-screen', { state: 'hidden' });
+    await waitFor(async () => (await pages(wb2)) === open, { message: 'tabs opened once the code was turned off' });
+    const audit = (await server.status()).audit.map(item => item.action);
+    assert.ok(audit.includes('browser.unlocked') && audit.includes('browser.unlock_failed'));
+  });
+
   test('purging the vault removes shared cookies from the other browser but not from the primary', async () => {
     await waitFor(async () => (await wb2.cookies(site.origin)).includes('pref=dark'), { message: 'WB2 has the shared cookie' });
     await server.admin('/profiles/purge', 'POST', { confirm: true });

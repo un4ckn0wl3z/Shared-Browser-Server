@@ -1,4 +1,4 @@
-const { app, BrowserWindow, WebContentsView, Menu, Notification, clipboard, ipcMain, net, screen, session, safeStorage, shell, webContents } = require('electron');
+const { app, BrowserWindow, WebContentsView, Menu, Notification, clipboard, ipcMain: electronIpcMain, net, screen, session, safeStorage, shell, webContents } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const crypto = require('node:crypto');
@@ -54,6 +54,13 @@ let updateState = { state: 'idle', currentVersion: app.getVersion() };
 let activeTabId;
 let nextTabId = 1;
 let settingsOpen = false;
+// The unlock code is asked once per launch while the server requires it.
+let unlocked = false;
+let lockShown = false;
+let unlockFailures = 0;
+let unlockBlockedUntil = 0;
+// Set once startup reaches the point of opening tabs, so unlocking earlier does not open pages before the proxy is set.
+let initialTabsRequested = false;
 const tabs = new Map();
 
 function logFatal(error) {
@@ -85,7 +92,8 @@ function defaultSnapshot() {
       searchUrl: DEFAULT_SEARCH_URL,
       primaryDeviceId: '',
       autoShareCookies: true,
-      proxy: { enabled: false, host: '127.0.0.1', port: 8899, allowedPorts: '80,443', bypassList: 'localhost;127.0.0.1' }
+      proxy: { enabled: false, host: '127.0.0.1', port: 8899, allowedPorts: '80,443', bypassList: 'localhost;127.0.0.1' },
+      clientLock: { enabled: false }
     },
     profiles: [],
     accounts: [],
@@ -104,7 +112,7 @@ function defaultConfig() {
     strictPrivacy: true,
     window: undefined,
     announcements: { dismissed: [], notified: [], pendingAcks: [] },
-    secrets: { deviceToken: '', enrollmentToken: '', cache: defaultSnapshot(), session: { tabs: [], active: 0 } }
+    secrets: { deviceToken: '', enrollmentToken: '', unlockFailures: 0, cache: defaultSnapshot(), session: { tabs: [], active: 0 } }
   };
 }
 
@@ -153,6 +161,7 @@ function loadConfig() {
       secrets: {
         deviceToken: String(secrets?.deviceToken || ''),
         enrollmentToken: String(secrets?.enrollmentToken || ''),
+        unlockFailures: Math.max(0, Math.floor(Number(secrets?.unlockFailures) || 0)),
         cache: normalizeSnapshot(secrets?.cache),
         session: {
           tabs: Array.isArray(secrets?.session?.tabs) ? secrets.session.tabs.filter(url => /^https?:\/\//i.test(String(url))).slice(0, MAX_RESTORED_TABS) : [],
@@ -291,6 +300,8 @@ function captureSessionState() {
     config.window = { ...mainWindow.getNormalBounds(), maximized: mainWindow.isMaximized() };
   }
   const ordered = [...tabs.values()];
+  // Nothing is open yet (for example while the unlock screen is shown): keep the saved tabs.
+  if (!ordered.length) return;
   const urls = [];
   let active = 0;
   for (const tab of ordered) {
@@ -317,7 +328,12 @@ function scheduleSessionSave() {
 
 // Reopens the tabs from the last session, or the shared home page when there were none.
 async function openInitialTabs() {
+  initialTabsRequested = true;
   if (tabs.size > 0) return;
+  if (isLocked()) {
+    engageLock();
+    return;
+  }
   const { tabs: urls, active } = config.secrets.session;
   if (!urls.length) {
     await addTab(config.secrets.cache.settings.homePage);
@@ -449,6 +465,7 @@ function normalizeAddress(value) {
 }
 
 async function addTab(url, details) {
+  if (lockShown) return undefined;
   const id = nextTabId++;
   const view = new WebContentsView({
     webPreferences: {
@@ -563,7 +580,7 @@ function showContextMenu(webContents, params) {
 }
 
 function handleShortcut(input, source) {
-  if (input.type !== 'keyDown') return false;
+  if (input.type !== 'keyDown' || lockShown) return false;
   const mac = process.platform === 'darwin';
   const command = mac ? input.meta : input.control;
   const key = input.key.toLowerCase();
@@ -608,7 +625,7 @@ async function selectTab(id) {
     send('browser:find-result', { active: 0, matches: 0, reset: true });
   }
   activeTabId = next.id;
-  if (!settingsOpen) mainWindow.contentView.addChildView(next.view);
+  if (!settingsOpen && !lockShown) mainWindow.contentView.addChildView(next.view);
   layoutActiveView();
   publishTabs();
   publishNavigationState();
@@ -812,6 +829,9 @@ async function installSnapshot(snapshot, previous) {
     setImmediate(() => pushAllStoredCookies());
   }
   wasPrimary = primary;
+  // Turning the unlock code on locks running browsers too; turning it off releases a locked one.
+  if (isLocked()) engageLock();
+  else if (lockShown) await releaseLock();
   publishTabs();
   publishNavigationState();
 }
@@ -1052,6 +1072,84 @@ function scheduleCookiePush() {
   if (!isPrimary()) return;
   clearTimeout(cookiePushTimer);
   cookiePushTimer = setTimeout(() => pushAllStoredCookies(), 900);
+}
+
+// ---- Unlock code --------------------------------------------------------------------------------
+// The server sends only a salted PBKDF2 hash of the code, kept in the encrypted local cache, so the
+// browser can be unlocked offline too. Until it is unlocked no page is shown and no tab opens.
+
+function clientLock() {
+  const lock = config.secrets.cache.settings.clientLock;
+  return lock?.enabled && typeof lock.salt === 'string' && lock.salt && typeof lock.hash === 'string' && lock.hash ? lock : null;
+}
+
+function isLocked() {
+  return !unlocked && Boolean(config.secrets.deviceToken) && Boolean(clientLock());
+}
+
+function engageLock() {
+  if (lockShown) return;
+  lockShown = true;
+  const tab = tabs.get(activeTabId);
+  if (tab && mainWindow && !mainWindow.isDestroyed()) {
+    try { mainWindow.contentView.removeChildView(tab.view); } catch { }
+  }
+  for (const item of tabs.values()) if (!item.view.webContents.isDestroyed()) item.view.webContents.setAudioMuted(true);
+  for (const popup of BrowserWindow.getAllWindows()) if (popup !== mainWindow) popup.close();
+  send('browser:lock', lockState());
+}
+
+async function releaseLock() {
+  if (!lockShown) return;
+  lockShown = false;
+  send('browser:lock', lockState());
+  for (const item of tabs.values()) if (!item.view.webContents.isDestroyed()) item.view.webContents.setAudioMuted(false);
+  if (tabs.size) await selectTab(activeTabId ?? [...tabs.keys()][0]);
+  else if (initialTabsRequested) await openInitialTabs();
+}
+
+function lockState() {
+  return { locked: lockShown, deviceName: config.deviceName };
+}
+
+async function verifyUnlockCode(code, lock) {
+  const iterations = Math.min(Math.max(Math.floor(Number(lock.iterations) || 0), 1), 5_000_000);
+  const derived = await new Promise((resolve, reject) => crypto.pbkdf2(code.trim().normalize('NFC'), Buffer.from(lock.salt, 'base64'), iterations, 32, 'sha256', (error, key) => error ? reject(error) : resolve(key)));
+  const expected = Buffer.from(lock.hash, 'base64');
+  return expected.length === derived.length && crypto.timingSafeEqual(expected, derived);
+}
+
+function unlockDelay(failures) {
+  return failures >= 5 ? Math.min(30_000 * 2 ** (failures - 5), 15 * 60_000) : 0;
+}
+
+// After five wrong codes each further attempt waits longer, up to 15 minutes; the count survives restarts.
+async function unlock(code) {
+  if (!lockShown) return { ok: true };
+  const lock = clientLock();
+  if (!lock) {
+    unlocked = true;
+    await releaseLock();
+    return { ok: true };
+  }
+  const wait = unlockBlockedUntil - Date.now();
+  if (wait > 0) return { ok: false, error: `Too many wrong codes. Try again in ${Math.ceil(wait / 1000)} seconds.` };
+  const ok = await verifyUnlockCode(String(code || '').slice(0, 256), lock);
+  if (config.secrets.deviceToken) api('/api/client/unlock-report', { method: 'POST', body: JSON.stringify({ success: ok }) }).catch(() => { });
+  if (!ok) {
+    unlockFailures++;
+    unlockBlockedUntil = Date.now() + unlockDelay(unlockFailures);
+    config.secrets.unlockFailures = unlockFailures;
+    saveConfig();
+    return { ok: false, error: 'Wrong unlock code.' };
+  }
+  unlocked = true;
+  unlockFailures = 0;
+  unlockBlockedUntil = 0;
+  config.secrets.unlockFailures = 0;
+  saveConfig();
+  await releaseLock();
+  return { ok: true };
 }
 
 // ---- Accounts -----------------------------------------------------------------------------------
@@ -1320,6 +1418,8 @@ async function privacyCheck() {
 }
 
 async function startClient() {
+  // Show the unlock screen right away when the cached settings require it, before the server answers.
+  if (isLocked()) engageLock();
   try {
     seedSyncState();
     if (enforceNetworkPolicy()) saveConfig();
@@ -1518,10 +1618,20 @@ function publicConfig() {
   };
 }
 
+// While the unlock screen is shown, only these requests from the window are answered.
+const ALLOWED_WHILE_LOCKED = new Set(['browser:bootstrap', 'browser:chrome-height', 'browser:unlock', 'browser:check-updates', 'browser:install-update']);
+
 function registerIpc() {
+  const ipcMain = {
+    handle: (channel, handler) => electronIpcMain.handle(channel, (...args) => {
+      if (lockShown && !ALLOWED_WHILE_LOCKED.has(channel)) throw new Error('Unlock the browser first');
+      return handler(...args);
+    })
+  };
+  ipcMain.handle('browser:unlock', (_, code) => unlock(code));
   ipcMain.handle('browser:check-updates', checkForUpdates);
   ipcMain.handle('browser:install-update', installUpdate);
-  ipcMain.handle('browser:bootstrap', () => ({ config: publicConfig(), update: updateState, tabs: tabSummaries(), bookmarks: config.secrets.cache.bookmarks, announcements: visibleAnnouncements() }));
+  ipcMain.handle('browser:bootstrap', () => ({ lock: lockState(), config: publicConfig(), update: updateState, tabs: tabSummaries(), bookmarks: config.secrets.cache.bookmarks, announcements: visibleAnnouncements() }));
   ipcMain.handle('browser:dismiss-announcement', (_, id) => dismissAnnouncement(id));
   ipcMain.handle('browser:open-announcement-link', (_, id) => {
     const item = config.secrets.cache.announcements.find(entry => entry.id === String(id));
@@ -1639,6 +1749,8 @@ app.on('login', (event, webContents, details, authInfo, callback) => {
 
 app.whenReady().then(async () => {
   config = loadConfig();
+  unlockFailures = config.secrets.unlockFailures;
+  unlockBlockedUntil = Date.now() + unlockDelay(unlockFailures);
   app.userAgentFallback = browserUserAgent();
   Menu.setApplicationMenu(applicationMenu());
   browserSession = session.fromPartition('persist:shared-browser');

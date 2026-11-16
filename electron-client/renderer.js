@@ -308,10 +308,40 @@ element('settings-form').addEventListener('submit', async event => {
   }
 });
 
+// The unlock screen covers the whole window; the page views are detached by the main process meanwhile.
+const lockScreen = element('lock-screen');
+function updateLock(value) {
+  const locked = Boolean(value?.locked);
+  const wasLocked = !lockScreen.hidden;
+  lockScreen.hidden = !locked;
+  if (locked) {
+    if (dialog.open) dialog.close();
+    if (accountDialog.open) accountDialog.close();
+    element('lock-device').textContent = value.deviceName ? `Browser: ${value.deviceName}` : '';
+    if (!wasLocked) { element('lock-code').value = ''; element('lock-error').textContent = ''; }
+    element('lock-code').focus();
+  }
+}
+element('lock-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  const button = element('lock-form').querySelector('button');
+  button.disabled = true;
+  element('lock-error').textContent = '';
+  try {
+    const result = await api.unlock(element('lock-code').value);
+    if (!result.ok) {
+      element('lock-error').textContent = result.error;
+      element('lock-code').select();
+    } else element('lock-code').value = '';
+  } finally {
+    button.disabled = false;
+  }
+});
+api.onLock(updateLock);
 api.onState(updateState);
 api.onTabs(renderTabs);
 api.onStatus(updateStatus);
-api.onShowSettings(openSettings);
+api.onShowSettings(() => { if (lockScreen.hidden) openSettings(); });
 api.onUpdate(updateUpdate);
 api.onFocusAddress(() => { address.focus(); address.select(); });
 api.onShowFind(showFind);
@@ -331,6 +361,7 @@ api.onConfig(value => {
 new ResizeObserver(() => api.setChromeHeight(Math.ceil(document.querySelector('header').getBoundingClientRect().height))).observe(document.querySelector('header'));
 
 api.bootstrap().then(state => {
+  updateLock(state.lock);
   currentConfig = state.config;
   renderTabs(state.tabs);
   updateUpdate(state.update);

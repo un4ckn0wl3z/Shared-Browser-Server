@@ -64,7 +64,7 @@ The primary-writer model prevents a logged-out secondary browser from replacing 
 - `electron-client/` — cross-platform Shared Browser for Windows, macOS, and Linux
 - Encrypted server-side cookie/session vault
 - Unique device identities and revocable device tokens, enrolled with one-time codes
-- Automatic per-domain cookie/session profiles
+- Automatic per-domain cookie/session profiles, for every site or only a list of sites chosen by the administrator
 - A primary browser that publishes session changes while other browsers consume them
 - Controlled cookie synchronization with one primary writer
 - Shared home-page, address-bar search, and bookmark configuration
@@ -77,6 +77,7 @@ The primary-writer model prevents a logged-out secondary browser from replacing 
 - TLS between browsers and the proxy, with the certificate pinned by the browsers
 - Per-profile access: share a domain with all browsers or only selected ones
 - Several accounts per site (for example two GitHub users), switched per browser from the toolbar
+- Optional unlock code that browsers ask for every time they start, turned on, off or changed from the dashboard
 - Live updates over Server-Sent Events
 - Audit log, automatic vault backups, and vault export/import
 - Announcements from the administrator to all or selected browsers
@@ -201,7 +202,7 @@ docker compose up -d --build
 ### Upgrading
 
 - The server reads vaults written by earlier versions as they are; there is nothing to migrate. Settings added later start with the previous behavior: profiles and announcements go to all browsers, the administrator token still enrolls browsers, and proxy TLS is off.
-- Older browsers keep working against a newer server. They do not show announcements, keep polling instead of receiving live updates, and (before 1.1) do not remove cookies from profiles they lose access to. Browsers before 1.4 cannot switch accounts and always use a site's first account.
+- Older browsers keep working against a newer server. They do not show announcements, keep polling instead of receiving live updates, and (before 1.1) do not remove cookies from profiles they lose access to. Browsers before 1.4 cannot switch accounts and always use a site's first account, and browsers before 1.5 do not ask for the unlock code.
 - Update every browser that uses Managed proxy mode to 1.2 or newer before turning on proxy TLS.
 - With the server released alongside browser 1.3, **Browser connection mode** defaults to requiring the managed proxy with Strict privacy, also on existing installations. Enable the proxy before upgrading the server, or set the mode to **Let each browser choose** afterwards, otherwise 1.3 browsers stop loading websites until the proxy is on. Browsers before 1.3 keep their own setting.
 - Restarting the server briefly interrupts open proxy connections; browsers reconnect and resume syncing on their own.
@@ -358,7 +359,11 @@ A tunnel stays open as long as data flows and closes after 10 minutes without tr
 
 ## Synchronization rules
 
-- Automatic sharing is enabled by default. The primary browser creates a profile for every domain whose cookies it publishes.
+- **Share cookies from the primary browser** in Browser settings decides which sites are shared:
+  - **Only the sites listed below**: a whitelist, one site per line (`github.com`, a URL such as `https://gitlab.com/`, or `*.example.com`). A listed site also covers its subdomains and is kept as one profile under the listed domain. Cookies of other sites stay on the primary browser: they are neither added nor updated, and adding an account is refused for them.
+  - **Every site it visits** (the default, and the behavior of earlier versions): the primary browser creates a profile for every domain whose cookies it publishes.
+  - **Only profiles created in this dashboard**: nothing is added automatically; the primary browser keeps the existing profiles up to date.
+- Switching to a list does not delete what was shared before. Profiles the list does not cover are marked **not on the sharing list** and are no longer updated; **Select sites not on the list** above the profiles selects them for **Delete selected**.
 - Only the primary browser can publish cookie/session changes. This prevents a logged-out secondary browser from overwriting a logged-in session.
 - The primary browser publishes a complete cookie list per domain, and only for domains whose cookies changed. Cookies it no longer has (for example after signing out) are removed from the vault. A cookie typed into the dashboard is protected until the primary browser has received it; after that it is removed on sign-out like any other cookie. Secondary browsers delete a removed cookie only while it still holds the value they received.
 - A disabled profile stops sharing for its domain; the primary browser does not recreate an automatic profile for it.
@@ -380,6 +385,16 @@ The first version deliberately uses the central server as the authority. Direct 
 ### Browsers
 
 The dashboard's **Managed browsers** table shows each enrolled browser, when it was last seen, and a **LIVE** badge while it holds the live event stream. **Revoke** stops a browser from syncing or using the proxy (and closes its open proxy tunnels) but keeps its record so it can be restored; **Delete** removes it, and it must enroll again with a new code to reconnect. The primary session browser is marked **PRIMARY**.
+
+### Unlock code
+
+Under **Unlock code** in the dashboard, tick **Require the unlock code when a browser starts**, enter a code (4 to 128 characters), and save. From then on every browser shows a lock screen each time it starts, and no page opens until the code is entered; the saved tabs then come back. Turning the code on also locks browsers that are running at that moment. Change the code by entering a new one (browsers that are already unlocked stay unlocked until they restart), and untick the box to turn it off, which also releases browsers waiting on the lock screen.
+
+- The server stores only a salted PBKDF2-SHA256 hash of the code and sends that hash to the browsers, which keep it in their encrypted cache. Browsers therefore check the code locally and can be unlocked while the server is unreachable.
+- After five wrong codes, each further attempt waits longer (30 seconds, doubling up to 15 minutes); the count survives a restart. Successful and failed unlocks appear in the **Activity** log.
+- While locked, the browser's tabs, address bar, settings and shortcuts are unavailable. Synchronization keeps running in the background.
+- The code needs Shared Browser 1.5 or newer. While it is on, the browsers table marks older browsers **UPDATE NEEDED**, because they do not ask for it.
+- The lock keeps casual users out of the browser. It does not protect against someone who can sign in to the computer's operating-system account and read the browser's files.
 
 ### Announcements
 

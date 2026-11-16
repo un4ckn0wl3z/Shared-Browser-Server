@@ -36,6 +36,12 @@ public sealed class BrowserSettings
     public string SearchUrl { get; set; } = "https://duckduckgo.com/?q=%s";
     public string PrimaryDeviceId { get; set; } = "";
     public bool AutoShareCookies { get; set; } = true;
+    /// <summary>
+    /// With automatic sharing on: "all" shares every site the primary browser has cookies for, "listed"
+    /// only the sites in <see cref="AutoShareDomains"/> (and their subdomains).
+    /// </summary>
+    public string AutoShareScope { get; set; } = "all";
+    public List<string> AutoShareDomains { get; set; } = [];
     /// <summary>When false, browsers can only enroll with a one-time enrollment code from the dashboard.</summary>
     public bool AllowAdminTokenEnrollment { get; set; } = true;
     /// <summary>
@@ -46,6 +52,20 @@ public sealed class BrowserSettings
     /// <summary>Service that answers with the caller's public IP, used by "Check egress IP" (empty disables it).</summary>
     public string IpCheckUrl { get; set; } = "https://api64.ipify.org?format=json";
     public ProxySettings Proxy { get; set; } = new();
+    public ClientLockSettings ClientLock { get; set; } = new();
+}
+
+/// <summary>
+/// An unlock code browsers ask for every time they start, before any page opens. Only a salted
+/// PBKDF2-SHA256 hash is stored and sent to browsers, which check the code locally so it also works offline.
+/// </summary>
+public sealed class ClientLockSettings
+{
+    public bool Enabled { get; set; }
+    public string Salt { get; set; } = "";
+    public string Hash { get; set; } = "";
+    public int Iterations { get; set; }
+    public DateTimeOffset? ChangedAt { get; set; }
 }
 
 public sealed class ProxySettings
@@ -165,6 +185,9 @@ public sealed record SharedSnapshot(long Revision, DateTimeOffset UpdatedAt, Bro
 public sealed record ClientAccount(string Id, string Name, string Domain, bool Active, int CookieCount);
 /// <summary>Adds an empty account for the site of PageUrl, which the primary browser then signs in to.</summary>
 public sealed record CreateAccountRequest(string? Name, string? PageUrl);
+/// <summary>Code null or empty keeps the current code.</summary>
+public sealed record ClientLockRequest(bool Enabled, string? Code);
+public sealed record UnlockReport(bool Success);
 public sealed record AnnouncementRequest(string? Title, string? Message, string? Level, string? Url, int? ExpiresInMinutes, bool ShareWithAllDevices = true, List<string>? AllowedDeviceIds = null);
 /// <summary>What a browser receives. Targeting stays on the server.</summary>
 public sealed record ClientAnnouncement(string Id, string Title, string Message, string Level, string Url, DateTimeOffset CreatedAt, DateTimeOffset? ExpiresAt)

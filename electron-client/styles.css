@@ -63,3 +63,11 @@ label small { color: #667085; font-weight: normal; }
 .button-row { display: flex; gap: 8px; flex-wrap: wrap; }
 select:disabled, input:disabled { opacity: .6; }
 .account { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lock-screen { position: fixed; inset: 0; z-index: 1000; display: flex; align-items: center; justify-content: center; background: #eef2f7; }
+.lock-screen[hidden] { display: none; }
+.lock-card { width: min(380px, calc(100vw - 40px)); display: grid; gap: 12px; padding: 28px; border-radius: 14px; background: #fff; box-shadow: 0 18px 60px #15203333; text-align: center; }
+.lock-card h1 { margin: 0; font-size: 20px; }
+.lock-card p { margin: 0; color: #667085; font-size: 13px; }
+.lock-card label { text-align: left; }
+.lock-card small { color: #667085; font-size: 12px; }
+.lock-icon { font-size: 34px; }

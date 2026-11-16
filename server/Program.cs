@@ -196,6 +196,15 @@ app.MapPost("/api/client/accounts", async (HttpContext context, CreateAccountReq
     catch (InvalidOperationException error) { return Results.BadRequest(new { error = error.Message }); }
 });
 
+// Browsers check the unlock code locally (so it works offline) and report the outcome for the audit log.
+app.MapPost("/api/client/unlock-report", (HttpContext context, UnlockReport report, SharedStateStore store) =>
+{
+    var device = DeviceAuthorized(context.Request, store);
+    if (device is null) return Results.Unauthorized();
+    audit.Record($"device:{device.Name}", report.Success ? "browser.unlocked" : "browser.unlock_failed", device.Name, "", Ip(context));
+    return Results.NoContent();
+});
+
 // ---- Administration -------------------------------------------------------------------------------
 
 app.MapGet("/api/admin/status", async (HttpContext context, SharedStateStore store, ForwardProxyService proxy) =>
@@ -211,6 +220,18 @@ app.MapPut("/api/admin/settings", async (HttpContext context, BrowserSettings se
         var changes = await store.UpdateSettingsAsync(settings);
         Record(context, "settings.updated", "", changes);
         return Results.Json(store.Settings);
+    }
+    catch (InvalidOperationException error) { return Results.BadRequest(new { error = error.Message }); }
+});
+
+app.MapPut("/api/admin/client-lock", async (HttpContext context, ClientLockRequest request, SharedStateStore store) =>
+{
+    if (!Admin(context)) return Results.Unauthorized();
+    try
+    {
+        var changes = await store.SetClientLockAsync(request);
+        Record(context, "client_lock.updated", "", changes);
+        return Results.Json(new { store.Settings.ClientLock.Enabled, store.Settings.ClientLock.ChangedAt });
     }
     catch (InvalidOperationException error) { return Results.BadRequest(new { error = error.Message }); }
 });

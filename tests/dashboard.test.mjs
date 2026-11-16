@@ -75,6 +75,45 @@ describe('dashboard', () => {
     assert.equal((await server.status()).announcements[0].level, 'critical');
   });
 
+  test('shares only the listed sites', async () => {
+    assert.ok(await page.isHidden('#auto-share-sites'));
+    await page.selectOption('#auto-share-mode', 'listed');
+    assert.ok(await page.isVisible('#auto-share-sites'));
+    await page.fill('#auto-share-domains', 'github.com\nhttps://gitlab.com/');
+    await page.click('#settings-form > button');
+    await waitFor(async () => (await server.status()).settings.autoShareScope === 'listed', { message: 'list saved' });
+    assert.deepEqual((await server.status()).settings.autoShareDomains, ['github.com', 'gitlab.com']);
+    // dash.example was shared before the list: it is flagged and can be selected for deletion.
+    await waitFor(async () => /not on the sharing list/.test(await page.textContent('#profiles')), { message: 'unlisted flag' });
+    await page.click('#select-unlisted');
+    assert.equal(await page.textContent('#delete-selected'), 'Delete selected (1)');
+    assert.ok(await page.isChecked('.profile:has-text("not on the sharing list") input[type=checkbox]'));
+    // Clear the selection again for the bulk-delete test below.
+    await page.check('#select-all-profiles');
+    await page.uncheck('#select-all-profiles');
+    assert.equal(await page.textContent('#delete-selected'), 'Delete selected');
+    await page.selectOption('#auto-share-mode', 'all');
+    await page.click('#settings-form > button');
+    await waitFor(async () => (await server.status()).settings.autoShareScope === 'all', { message: 'every site again' });
+  });
+
+  test('turns the browser unlock code on, and off again', async () => {
+    await page.check('#lock-enabled');
+    await page.click('#lock-form button');
+    await waitFor(async () => /Enter an unlock code/.test(await page.textContent('#toast')), { message: 'code required' });
+    await page.fill('#lock-code', 'dash-code');
+    await page.click('#lock-form button');
+    await waitFor(async () => (await server.status()).settings.clientLock.enabled, { message: 'lock on' });
+    await waitFor(async () => (await page.textContent('#lock-state')) === 'On', { message: 'badge on' });
+    assert.equal(await page.inputValue('#lock-code'), '');
+    // Browsers older than 1.5 are flagged because they do not ask for the code.
+    assert.match(await page.textContent('#devices'), /UPDATE NEEDED/);
+    await page.uncheck('#lock-enabled');
+    await page.click('#lock-form button');
+    await waitFor(async () => !(await server.status()).settings.clientLock.enabled, { message: 'lock off' });
+    assert.ok((await server.status()).settings.clientLock.hash);
+  });
+
   test('lists the accounts of a site and the browsers using them', async () => {
     // A second account for dash.example; the first one is limited to WB1, so WB2 uses the new one.
     await page.click('#new-profile');
@@ -148,7 +187,7 @@ describe('dashboard', () => {
   test('lists backups and the audit log', async () => {
     await waitFor(async () => (await page.locator('#backups tr').count()) >= 1 && !(await page.textContent('#backups')).includes('No backups'), { message: 'backup rows' });
     const audit = await page.textContent('#audit');
-    for (const action of ['enrollment_code.created', 'device.enrolled', 'profile.updated', 'settings.updated', 'announcement.sent', 'profiles.deleted', 'profiles.purged']) assert.ok(audit.includes(action), action);
+    for (const action of ['client_lock.updated', 'enrollment_code.created', 'device.enrolled', 'profile.updated', 'settings.updated', 'announcement.sent', 'profiles.deleted', 'profiles.purged']) assert.ok(audit.includes(action), action);
   });
 
   test('has no script errors', () => {

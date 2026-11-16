@@ -34,6 +34,18 @@
     <div id="announcements" class="announcements" aria-live="polite"></div>
   </header>
 
+  <div id="lock-screen" class="lock-screen" hidden>
+    <form id="lock-form" class="lock-card">
+      <div class="lock-icon" aria-hidden="true">🔒</div>
+      <h1>Shared Browser is locked</h1>
+      <p id="lock-device"></p>
+      <label>Unlock code<input id="lock-code" type="password" autocomplete="off" spellcheck="false" required autofocus></label>
+      <div id="lock-error" class="error" role="alert"></div>
+      <button type="submit" class="primary">Unlock</button>
+      <small>Your administrator requires this code every time the browser starts. Ask them if you do not have it.</small>
+    </form>
+  </div>
+
   <dialog id="settings-dialog">
     <form id="settings-form">
       <div class="dialog-title">
