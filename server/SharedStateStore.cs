@@ -15,6 +15,8 @@ public sealed partial class SharedStateStore
     private const int MaxBookmarks = 200;
     private const int MaxAnnouncements = 50;
     private const int MaxAccountsPerSite = 20;
+    private const int MaxSharedSites = 500;
+    public static readonly string[] AutoShareScopes = ["all", "listed"];
     private static readonly TimeSpan ExpiredAnnouncementRetention = TimeSpan.FromDays(7);
     private static readonly string[] AnnouncementLevels = ["info", "warning", "critical"];
     private const string CodeAlphabet = "ABCDEFGHJKMNPQRSTVWXYZ23456789";
@@ -182,6 +184,8 @@ public sealed partial class SharedStateStore
                 profiles = _state.Profiles.Select(profile => new
                 {
                     accounts = _state.Profiles.Count(item => item.Domain == profile.Domain),
+                    // False when a sharing list is in use and does not cover the profile: the primary browser no longer updates it.
+                    listed = ShareableSiteLocked(profile.Domain) is not null,
                     usedBy = _state.Devices.Where(device => !device.Revoked && ActiveAccountLocked(device, _state.Profiles.Where(item => item.Domain == profile.Domain), true) == profile).Select(device => device.Name).ToList(),
                     profile.Id,
                     profile.Name,
@@ -385,6 +389,10 @@ public sealed partial class SharedStateStore
         if (ipCheckUrl.Length > 0 && (ipCheckUrl.Length > 500 || !Uri.TryCreate(ipCheckUrl, UriKind.Absolute, out var check) || check.Scheme is not ("http" or "https"))) throw new InvalidOperationException("IP check URL must be empty or an HTTP or HTTPS URL");
         settings.Proxy ??= new ProxySettings();
         ValidateProxySettings(settings.Proxy);
+        var scope = (settings.AutoShareScope ?? "all").Trim().ToLowerInvariant();
+        if (!AutoShareScopes.Contains(scope)) throw new InvalidOperationException("Automatic sharing must cover all sites or only the listed sites");
+        var sharedSites = CleanSiteList(settings.AutoShareDomains);
+        if (settings.AutoShareCookies && scope == "listed" && sharedSites.Count == 0) throw new InvalidOperationException("List at least one site to share, or choose another sharing option");
         await _gate.WaitAsync();
         try
         {
@@ -395,7 +403,8 @@ public sealed partial class SharedStateStore
             Compare("home page", before.HomePage, home?.AbsoluteUri ?? "");
             Compare("search URL", before.SearchUrl, searchUrl);
             Compare("primary browser", before.PrimaryDeviceId.Length == 0 ? "automatic" : DeviceName(before.PrimaryDeviceId), primaryDeviceId.Length == 0 ? "automatic" : DeviceName(primaryDeviceId));
-            Compare("automatic sharing", before.AutoShareCookies, settings.AutoShareCookies);
+            Compare("automatic sharing", SharingSummary(before.AutoShareCookies, before.AutoShareScope), SharingSummary(settings.AutoShareCookies, scope));
+            Compare("shared sites", string.Join(", ", before.AutoShareDomains), string.Join(", ", sharedSites));
             Compare("admin-token enrollment", before.AllowAdminTokenEnrollment, settings.AllowAdminTokenEnrollment);
             Compare("proxy enabled", before.Proxy.Enabled, settings.Proxy.Enabled);
             Compare("proxy endpoint", $"{before.Proxy.Host}:{before.Proxy.Port}", $"{settings.Proxy.Host}:{settings.Proxy.Port}");
@@ -416,6 +425,8 @@ public sealed partial class SharedStateStore
                 SearchUrl = searchUrl,
                 PrimaryDeviceId = primaryDeviceId,
                 AutoShareCookies = settings.AutoShareCookies,
+                AutoShareScope = scope,
+                AutoShareDomains = sharedSites,
                 AllowAdminTokenEnrollment = settings.AllowAdminTokenEnrollment,
                 NetworkPolicy = policy,
                 IpCheckUrl = ipCheckUrl,
@@ -428,6 +439,37 @@ public sealed partial class SharedStateStore
             return changes.Count == 0 ? "no changes" : string.Join("; ", changes);
         }
         finally { _gate.Release(); }
+    }
+
+    private static string SharingSummary(bool enabled, string scope) => !enabled ? "off" : scope == "listed" ? "listed sites" : "every site";
+
+    /// <summary>Accepts host names, URLs and "*.example.com"; returns lower-case domains without duplicates.</summary>
+    private static List<string> CleanSiteList(IEnumerable<string>? input)
+    {
+        var result = new List<string>();
+        foreach (var raw in input ?? [])
+        {
+            var text = (raw ?? "").Trim();
+            if (text.Length == 0) continue;
+            if (text.Contains("://", StringComparison.Ordinal) && Uri.TryCreate(text, UriKind.Absolute, out var url)) text = url.Host;
+            if (text.StartsWith("*.", StringComparison.Ordinal)) text = text[2..];
+            var domain = NormalizeDomain(text);
+            if (!ValidDomain(domain) || !domain.Contains('.') && domain != "localhost") throw new InvalidOperationException($"'{raw}' is not a valid site. Enter a domain such as github.com");
+            if (!result.Contains(domain)) result.Add(domain);
+        }
+        if (result.Count > MaxSharedSites) throw new InvalidOperationException($"At most {MaxSharedSites} sites can be listed");
+        return result;
+    }
+
+    /// <summary>
+    /// The site under which the primary browser may share cookies for <paramref name="host"/>: the host itself,
+    /// or with a sharing list the most specific listed domain that covers it. Null when the list leaves it out.
+    /// </summary>
+    private string? ShareableSiteLocked(string host)
+    {
+        var settings = _state.Settings;
+        if (settings.AutoShareScope != "listed") return host;
+        return settings.AutoShareDomains.Where(domain => DomainMatches(host, domain)).OrderByDescending(domain => domain.Length).FirstOrDefault();
     }
 
     public const int UnlockCodeIterations = 210_000;
@@ -745,7 +787,8 @@ public sealed partial class SharedStateStore
             if (!IsPrimaryLocked(deviceId)) throw new UnauthorizedAccessException("Only the primary browser can add accounts, because only its sign-ins are saved");
             var device = _state.Devices.First(item => item.Id == deviceId);
             var site = _state.Profiles.Where(item => DomainMatches(host, item.Domain)).GroupBy(item => item.Domain).OrderByDescending(group => group.Key.Length).FirstOrDefault()?.ToList() ?? [];
-            var domain = site.Count > 0 ? site[0].Domain : host;
+            var shareable = ShareableSiteLocked(host) ?? throw new InvalidOperationException($"{host} is not on the server's list of shared sites");
+            var domain = site.Count > 0 ? site[0].Domain : shareable;
             if (!ValidDomain(domain)) throw new InvalidOperationException("Invalid site");
             if (site.Any(item => string.Equals(item.Name, name, StringComparison.OrdinalIgnoreCase))) throw new InvalidOperationException($"{domain} already has an account named '{name}'");
             if (site.Count >= MaxAccountsPerSite) throw new InvalidOperationException($"A site can have at most {MaxAccountsPerSite} accounts");
@@ -794,6 +837,13 @@ public sealed partial class SharedStateStore
                 return 0;
             }
             var host = NormalizeDomain(page.Host);
+            // With a sharing list, cookies of sites that are not on it are neither added nor updated.
+            var shareable = ShareableSiteLocked(host);
+            if (shareable is null)
+            {
+                if (settingsChanged) { BumpRevision(); await SaveLockedAsync(); }
+                return 0;
+            }
             var site = _state.Profiles.Where(item => DomainMatches(host, item.Domain)).GroupBy(item => item.Domain).OrderByDescending(group => group.Key.Length).FirstOrDefault();
             // Cookies go to the account this browser has switched to. A site whose profiles are all disabled
             // blocks sharing for its domain; it must not be shadowed by an automatic one.
@@ -801,8 +851,9 @@ public sealed partial class SharedStateStore
             var profileCreated = false;
             if (site is null && _state.Settings.AutoShareCookies && incomingCookies.Count > 0)
             {
-                if (!ValidDomain(host)) return 0;
-                profile = new SessionProfile { Id = Guid.NewGuid().ToString("N"), Name = host, Domain = host, Enabled = true };
+                if (!ValidDomain(shareable)) return 0;
+                // A listed site keeps its subdomains in one profile (github.com also covers gist.github.com).
+                profile = new SessionProfile { Id = Guid.NewGuid().ToString("N"), Name = shareable, Domain = shareable, Enabled = true };
                 _state.Profiles.Add(profile);
                 profileCreated = true;
             }
@@ -932,6 +983,8 @@ public sealed partial class SharedStateStore
         disk.Settings.IpCheckUrl ??= "";
         disk.Settings.Proxy ??= new ProxySettings();
         disk.Settings.ClientLock ??= new ClientLockSettings();
+        disk.Settings.AutoShareScope = AutoShareScopes.Contains(disk.Settings.AutoShareScope) ? disk.Settings.AutoShareScope : "all";
+        disk.Settings.AutoShareDomains ??= [];
         disk.Settings.ClientLock.Salt ??= "";
         disk.Settings.ClientLock.Hash ??= "";
         disk.Profiles ??= [];
@@ -1113,7 +1166,7 @@ public sealed partial class SharedStateStore
     private static bool CookieEqual(SharedCookie a, SharedCookie b) =>
         a.Name == b.Name && a.Value == b.Value && a.Domain == b.Domain && a.Path == b.Path && a.Secure == b.Secure && a.HttpOnly == b.HttpOnly && a.SameSite == b.SameSite
         && (a.ExpiresAt is null) == (b.ExpiresAt is null) && Math.Abs((a.ExpiresAt ?? 0) - (b.ExpiresAt ?? 0)) < ExpiryTolerance;
-    private static BrowserSettings CloneSettings(BrowserSettings settings) => new() { HomePage = settings.HomePage, SearchUrl = settings.SearchUrl, PrimaryDeviceId = settings.PrimaryDeviceId, AutoShareCookies = settings.AutoShareCookies, AllowAdminTokenEnrollment = settings.AllowAdminTokenEnrollment, NetworkPolicy = settings.NetworkPolicy, IpCheckUrl = settings.IpCheckUrl, Proxy = CloneProxySettings(settings.Proxy), ClientLock = CloneClientLock(settings.ClientLock) };
+    private static BrowserSettings CloneSettings(BrowserSettings settings) => new() { HomePage = settings.HomePage, SearchUrl = settings.SearchUrl, PrimaryDeviceId = settings.PrimaryDeviceId, AutoShareCookies = settings.AutoShareCookies, AutoShareScope = settings.AutoShareScope, AutoShareDomains = [.. settings.AutoShareDomains], AllowAdminTokenEnrollment = settings.AllowAdminTokenEnrollment, NetworkPolicy = settings.NetworkPolicy, IpCheckUrl = settings.IpCheckUrl, Proxy = CloneProxySettings(settings.Proxy), ClientLock = CloneClientLock(settings.ClientLock) };
     private static ClientLockSettings CloneClientLock(ClientLockSettings? value) => value is null ? new() : new() { Enabled = value.Enabled, Salt = value.Salt, Hash = value.Hash, Iterations = value.Iterations, ChangedAt = value.ChangedAt };
     private static ProxySettings CloneProxySettings(ProxySettings settings) => new()
     {

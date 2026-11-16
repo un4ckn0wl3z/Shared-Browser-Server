@@ -75,6 +75,28 @@ describe('dashboard', () => {
     assert.equal((await server.status()).announcements[0].level, 'critical');
   });
 
+  test('shares only the listed sites', async () => {
+    assert.ok(await page.isHidden('#auto-share-sites'));
+    await page.selectOption('#auto-share-mode', 'listed');
+    assert.ok(await page.isVisible('#auto-share-sites'));
+    await page.fill('#auto-share-domains', 'github.com\nhttps://gitlab.com/');
+    await page.click('#settings-form > button');
+    await waitFor(async () => (await server.status()).settings.autoShareScope === 'listed', { message: 'list saved' });
+    assert.deepEqual((await server.status()).settings.autoShareDomains, ['github.com', 'gitlab.com']);
+    // dash.example was shared before the list: it is flagged and can be selected for deletion.
+    await waitFor(async () => /not on the sharing list/.test(await page.textContent('#profiles')), { message: 'unlisted flag' });
+    await page.click('#select-unlisted');
+    assert.equal(await page.textContent('#delete-selected'), 'Delete selected (1)');
+    assert.ok(await page.isChecked('.profile:has-text("not on the sharing list") input[type=checkbox]'));
+    // Clear the selection again for the bulk-delete test below.
+    await page.check('#select-all-profiles');
+    await page.uncheck('#select-all-profiles');
+    assert.equal(await page.textContent('#delete-selected'), 'Delete selected');
+    await page.selectOption('#auto-share-mode', 'all');
+    await page.click('#settings-form > button');
+    await waitFor(async () => (await server.status()).settings.autoShareScope === 'all', { message: 'every site again' });
+  });
+
   test('turns the browser unlock code on, and off again', async () => {
     await page.check('#lock-enabled');
     await page.click('#lock-form button');

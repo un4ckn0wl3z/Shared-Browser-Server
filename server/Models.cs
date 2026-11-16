@@ -36,6 +36,12 @@ public sealed class BrowserSettings
     public string SearchUrl { get; set; } = "https://duckduckgo.com/?q=%s";
     public string PrimaryDeviceId { get; set; } = "";
     public bool AutoShareCookies { get; set; } = true;
+    /// <summary>
+    /// With automatic sharing on: "all" shares every site the primary browser has cookies for, "listed"
+    /// only the sites in <see cref="AutoShareDomains"/> (and their subdomains).
+    /// </summary>
+    public string AutoShareScope { get; set; } = "all";
+    public List<string> AutoShareDomains { get; set; } = [];
     /// <summary>When false, browsers can only enroll with a one-time enrollment code from the dashboard.</summary>
     public bool AllowAdminTokenEnrollment { get; set; } = true;
     /// <summary>

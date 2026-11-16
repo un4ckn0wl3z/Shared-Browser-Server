@@ -190,6 +190,35 @@ describe('management API', () => {
     await server.admin('/client-lock', 'PUT', { enabled: false });
   });
 
+  test('a list of shared sites limits what the primary browser shares', async () => {
+    const primary = await server.enroll(randomDeviceId(), 'list-primary');
+    await server.settings({ primaryDeviceId: primary.id, autoShareCookies: true, autoShareScope: 'all', autoShareDomains: [] });
+    const push = (host, value) => server.device(primary, '/sync', 'POST', { pageUrl: `https://${host}/`, complete: true, cookies: [cookie('s', value, host)] });
+    await push('old.example', '1');
+    assert.ok(await server.profile('old.example'));
+    await assert.rejects(server.settings({ autoShareScope: 'listed', autoShareDomains: [] }), /at least one site/);
+    await assert.rejects(server.settings({ autoShareScope: 'listed', autoShareDomains: ['not a site'] }), /not a valid site/);
+    await server.settings({ autoShareScope: 'listed', autoShareDomains: ['https://Listed.example/login', '*.wild.example', 'listed.example'] });
+    assert.deepEqual((await server.status()).settings.autoShareDomains, ['listed.example', 'wild.example']);
+    // Listed sites, including subdomains, are shared under the listed domain; others are not.
+    await push('www.listed.example', 'a');
+    await push('other.example', 'b');
+    assert.deepEqual((await server.profile('listed.example')).cookies.map(item => item.domain), ['www.listed.example']);
+    assert.equal(await server.profile('www.listed.example'), undefined);
+    assert.equal(await server.profile('other.example'), undefined);
+    // A profile from before the list is kept but no longer updated, and the dashboard says so.
+    await push('old.example', '2');
+    const old = (await server.status()).profiles.find(item => item.domain === 'old.example');
+    assert.equal(old.listed, false);
+    assert.equal((await (await server.device(primary, '/snapshot')).json()).profiles.find(item => item.domain === 'old.example').cookies[0].value, '1');
+    assert.equal((await server.status()).profiles.find(item => item.domain === 'listed.example').listed, true);
+    // Accounts can only be added for listed sites.
+    assert.equal((await server.device(primary, '/accounts', 'POST', { name: 'x', pageUrl: 'https://other.example/' })).status, 400);
+    assert.equal((await server.device(primary, '/accounts', 'POST', { name: 'second', pageUrl: 'https://listed.example/' })).status, 201);
+    await server.settings({ autoShareScope: 'all', autoShareDomains: [] });
+    await server.admin('/profiles/delete', 'POST', { ids: (await server.status()).profiles.filter(item => /(old|listed)\.example$/.test(item.domain)).map(item => item.id) });
+  });
+
   test('bookmarks and search URL validation', async () => {
     const saved = await server.admin('/bookmarks', 'PUT', [{ title: '', url: 'https://github.com' }, { title: 'Docs', url: 'https://example.com/docs' }]);
     assert.deepEqual(saved.map(item => item.title), ['github.com', 'Docs']);

@@ -72,7 +72,9 @@ function render() {
   $('#profile-count').textContent = state.profiles.length;
   $('#home-page').value = settings.homePage;
   $('#search-url').value = settings.searchUrl || '';
-  $('#auto-share').checked = settings.autoShareCookies !== false;
+  $('#auto-share-mode').value = settings.autoShareCookies === false ? 'off' : settings.autoShareScope === 'listed' ? 'listed' : 'all';
+  $('#auto-share-domains').value = (settings.autoShareDomains || []).join('\n');
+  updateShareSites();
   $('#allow-admin-enroll').checked = settings.allowAdminTokenEnrollment !== false;
 
   const proxy = settings.proxy || {};
@@ -250,7 +252,7 @@ function renderProfiles() {
   for (const profile of [...state.profiles].sort((a, b) => a.domain.localeCompare(b.domain) || order.get(a.id) - order.get(b.id))) {
     const element = document.createElement('div');
     element.className = `profile${selectedProfiles.has(profile.id) ? ' selected' : ''}`;
-    element.innerHTML = `<label class="pick"><input type="checkbox" aria-label="Select ${esc(profile.domain)}"${selectedProfiles.has(profile.id) ? ' checked' : ''}><div><strong>${profile.enabled ? '●' : '○'} ${esc(profile.name)}</strong><span>${esc(profile.domain)} · ${profile.cookieCount} cookie(s)${profile.enabled ? '' : ' · disabled'}${profile.accounts > 1 ? ` · account of ${profile.accounts} · ${profile.usedBy?.length ? `used by ${esc(profile.usedBy.join(', '))}` : 'used by no browser'}` : ''}</span></div></label><button class="secondary">Edit</button>`;
+    element.innerHTML = `<label class="pick"><input type="checkbox" aria-label="Select ${esc(profile.domain)}"${selectedProfiles.has(profile.id) ? ' checked' : ''}><div><strong>${profile.enabled ? '●' : '○'} ${esc(profile.name)}</strong><span>${esc(profile.domain)} · ${profile.cookieCount} cookie(s)${profile.enabled ? '' : ' · disabled'}${profile.listed === false ? ' · <em class="unlisted" title="Not on the list of shared sites: the primary browser no longer updates it">not on the sharing list</em>' : ''}${profile.accounts > 1 ? ` · account of ${profile.accounts} · ${profile.usedBy?.length ? `used by ${esc(profile.usedBy.join(', '))}` : 'used by no browser'}` : ''}</span></div></label><button class="secondary">Edit</button>`;
     element.querySelector('input').onchange = event => {
       if (event.target.checked) selectedProfiles.add(profile.id); else selectedProfiles.delete(profile.id);
       element.classList.toggle('selected', event.target.checked);
@@ -268,6 +270,7 @@ function updateBulkBar() {
   button.disabled = count === 0;
   button.textContent = count ? `Delete selected (${count})` : 'Delete selected';
   $('#purge-profiles').disabled = total === 0;
+  $('#select-unlisted').hidden = !state?.profiles.some(profile => profile.listed === false);
   const all = $('#select-all-profiles');
   all.disabled = total === 0;
   all.checked = total > 0 && count === total;
@@ -280,12 +283,18 @@ async function deleteProfiles(ids) {
   return result;
 }
 
+function updateShareSites() {
+  $('#auto-share-sites').hidden = $('#auto-share-mode').value !== 'listed';
+}
+
 function settingsPayload(proxy) {
   return {
     homePage: $('#home-page').value,
     searchUrl: $('#search-url').value,
     primaryDeviceId: $('#primary-device').value,
-    autoShareCookies: $('#auto-share').checked,
+    autoShareCookies: $('#auto-share-mode').value !== 'off',
+    autoShareScope: $('#auto-share-mode').value === 'listed' ? 'listed' : 'all',
+    autoShareDomains: $('#auto-share-domains').value.split(/[\s,]+/).filter(Boolean),
     allowAdminTokenEnrollment: $('#allow-admin-enroll').checked,
     networkPolicy: $('#network-policy').value,
     ipCheckUrl: $('#ip-check-url').value,
@@ -586,6 +595,13 @@ $('#check-egress').onclick = async () => {
     output.textContent = '';
     toast(error.message, true);
   }
+};
+
+$('#auto-share-mode').onchange = updateShareSites;
+$('#select-unlisted').onclick = () => {
+  for (const profile of state.profiles) if (profile.listed === false) selectedProfiles.add(profile.id);
+  renderProfiles();
+  updateBulkBar();
 };
 
 $('#select-all-profiles').onchange = event => {

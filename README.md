@@ -64,7 +64,7 @@ The primary-writer model prevents a logged-out secondary browser from replacing 
 - `electron-client/` — cross-platform Shared Browser for Windows, macOS, and Linux
 - Encrypted server-side cookie/session vault
 - Unique device identities and revocable device tokens, enrolled with one-time codes
-- Automatic per-domain cookie/session profiles
+- Automatic per-domain cookie/session profiles, for every site or only a list of sites chosen by the administrator
 - A primary browser that publishes session changes while other browsers consume them
 - Controlled cookie synchronization with one primary writer
 - Shared home-page, address-bar search, and bookmark configuration
@@ -359,7 +359,11 @@ A tunnel stays open as long as data flows and closes after 10 minutes without tr
 
 ## Synchronization rules
 
-- Automatic sharing is enabled by default. The primary browser creates a profile for every domain whose cookies it publishes.
+- **Share cookies from the primary browser** in Browser settings decides which sites are shared:
+  - **Only the sites listed below**: a whitelist, one site per line (`github.com`, a URL such as `https://gitlab.com/`, or `*.example.com`). A listed site also covers its subdomains and is kept as one profile under the listed domain. Cookies of other sites stay on the primary browser: they are neither added nor updated, and adding an account is refused for them.
+  - **Every site it visits** (the default, and the behavior of earlier versions): the primary browser creates a profile for every domain whose cookies it publishes.
+  - **Only profiles created in this dashboard**: nothing is added automatically; the primary browser keeps the existing profiles up to date.
+- Switching to a list does not delete what was shared before. Profiles the list does not cover are marked **not on the sharing list** and are no longer updated; **Select sites not on the list** above the profiles selects them for **Delete selected**.
 - Only the primary browser can publish cookie/session changes. This prevents a logged-out secondary browser from overwriting a logged-in session.
 - The primary browser publishes a complete cookie list per domain, and only for domains whose cookies changed. Cookies it no longer has (for example after signing out) are removed from the vault. A cookie typed into the dashboard is protected until the primary browser has received it; after that it is removed on sign-out like any other cookie. Secondary browsers delete a removed cookie only while it still holds the value they received.
 - A disabled profile stops sharing for its domain; the primary browser does not recreate an automatic profile for it.
