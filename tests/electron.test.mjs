@@ -488,6 +488,26 @@ describe('Electron browsers sharing a session', () => {
     await sleep(6000);
     assert.equal(await wb2.window.inputValue('#device-name'), 'typing-test');
   });
+
+  test('a browser deleted on the server reconnects with a new enrollment code', async () => {
+    await server.admin(`/devices/${deviceId('WB2')}`, 'DELETE');
+    assert.ok(!(await server.status()).devices.some(item => item.id === deviceId('WB2')));
+    await waitFor(async () => /unauthorized/i.test(await wb2.status()), { message: 'unauthorized status' });
+    const explained = /removed or revoked/.test(await wb2.window.textContent('#enrollment-help')) || /removed or revoked/.test(await wb2.status());
+    const badgeHidden = await wb2.window.isHidden('#primary-badge');
+    // Saving restarts the browser; here the test starts it again itself.
+    await wb2.app.evaluate(({ app }) => { app.relaunch = () => { }; });
+    await wb2.window.fill('#enrollment-token', await server.code('WB2 again'));
+    const closed = wb2.app.waitForEvent('close');
+    wb2.window.click('#settings-form button.primary').catch(() => { });
+    await closed;
+    wb2 = await launchBrowser(home, 'WB2');
+    await waitFor(async () => (await server.status()).devices.some(item => item.id === deviceId('WB2') && !item.revoked), { message: 'WB2 enrolled again' });
+    await waitFor(async () => /Synced r\d+/.test(await wb2.status()), { message: 'WB2 syncing again' });
+    assert.equal((await server.status()).devices.find(item => item.id === deviceId('WB2')).name, 'typing-test');
+    assert.ok(explained, 'the browser said it was removed');
+    assert.ok(badgeHidden);
+  });
 });
 
 describe('Electron browser in Managed proxy mode', () => {

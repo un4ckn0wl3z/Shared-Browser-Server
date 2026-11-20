@@ -102,9 +102,10 @@ function renderSettingsForm(settings) {
   $('#allow-admin-enroll').checked = settings.allowAdminTokenEnrollment !== false;
   $('#min-version').value = settings.minimumClientVersion || '';
   const primary = $('#primary-device');
-  primary.replaceChildren(new Option('Select automatically', ''));
+  primary.replaceChildren(new Option('None: no browser shares its sign-ins', ''));
   for (const device of state.devices.filter(item => !item.revoked)) primary.append(new Option(`${device.name} (${device.id.slice(0, 8)})`, device.id));
   primary.value = settings.primaryDeviceId || '';
+  $('#no-primary').hidden = Boolean(settings.primaryDeviceId);
 }
 
 function renderSettingsHint(settings) {
