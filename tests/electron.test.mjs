@@ -358,6 +358,36 @@ describe('Electron browsers sharing a session', () => {
     await server.admin('/profiles/delete', 'POST', { ids: [second.id] });
   });
 
+  test('PRIMARY badge, session expiry on the account button, and the unlock code per browser', async () => {
+    await waitFor(async () => await wb1.window.isVisible('#primary-badge'), { message: 'WB1 badge' });
+    assert.ok(await wb2.window.isHidden('#primary-badge'));
+    // A shared sign-in that expires in two days is flagged on the account button and in its tooltip.
+    // A second primary browser (here an API client) publishes a sign-in that expires in two days.
+    const helper = await server.enroll(randomDeviceId(), 'api-primary');
+    await server.settings({ primaryDeviceIds: [deviceId('WB1'), helper.id], primaryDeviceId: deviceId('WB1') });
+    const soon = Math.floor(Date.now() / 1000) + 2 * 86400;
+    await server.device(helper, '/sync', 'POST', { pageUrl: 'http://127.0.0.1/', complete: true, cookies: [{ name: 'token', value: 't', domain: '127.0.0.1', path: '/', secure: false, httpOnly: true, sameSite: 'Lax', expiresAt: soon }] });
+    assert.ok(await wb1.window.isVisible('#primary-badge'));
+    await wb2.navigate(`http://127.0.0.1:${site.port}/expiring`);
+    await waitFor(async () => /👤 127\.0\.0\.1 ⏳ [12] d/.test(await wb2.window.textContent('#account')), { message: 'expiry on the account button' });
+    assert.ok(await wb2.window.locator('#account').evaluate(element => element.classList.contains('expiring') && /Sign-in expires/.test(element.title)));
+    await server.admin(`/devices/${helper.id}`, 'DELETE');
+    await server.admin('/profiles/delete', 'POST', { ids: (await server.status()).profiles.filter(item => item.domain === '127.0.0.1').map(item => item.id) });
+    // Unlock code: on for everyone but off for WB2, then on only for WB2.
+    await server.admin('/client-lock', 'PUT', { enabled: false, code: 'letmein' });
+    await server.admin(`/devices/${deviceId('WB2')}/settings`, 'PUT', { homePage: '', siteFilter: null, scheduleExempt: false, unlockCode: false });
+    await server.admin('/client-lock', 'PUT', { enabled: true });
+    await sleep(2000);
+    assert.ok(await wb2.window.isHidden('#lock-screen'));
+    await server.admin('/client-lock', 'PUT', { enabled: false });
+    await server.admin(`/devices/${deviceId('WB2')}/settings`, 'PUT', { homePage: '', siteFilter: null, scheduleExempt: false, unlockCode: true });
+    await wb2.window.waitForSelector('#lock-screen:not([hidden])');
+    await wb2.window.fill('#lock-code', 'letmein');
+    await wb2.window.click('#lock-form button');
+    await wb2.window.waitForSelector('#lock-screen', { state: 'hidden' });
+    await server.admin(`/devices/${deviceId('WB2')}/settings`, 'PUT', { homePage: '', siteFilter: null, scheduleExempt: false, unlockCode: null });
+  });
+
   test('site filter: blocked sites show a notice, allow lists keep everything else out', async () => {
     const text = async () => (await wb2.pageText()).join('\n');
     await server.settings({ siteFilter: { mode: 'block', domains: ['localhost'] } });

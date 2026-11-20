@@ -101,10 +101,13 @@ function renderSettingsForm(settings) {
   updateShareSites();
   $('#allow-admin-enroll').checked = settings.allowAdminTokenEnrollment !== false;
   $('#min-version').value = settings.minimumClientVersion || '';
-  const primary = $('#primary-device');
-  primary.replaceChildren(new Option('Select automatically', ''));
-  for (const device of state.devices.filter(item => !item.revoked)) primary.append(new Option(`${device.name} (${device.id.slice(0, 8)})`, device.id));
-  primary.value = settings.primaryDeviceId || '';
+  const primaries = new Set(settings.primaryDeviceIds?.length ? settings.primaryDeviceIds : [settings.primaryDeviceId].filter(Boolean));
+  $('#primary-devices').replaceChildren(...state.devices.filter(item => !item.revoked).map(device => {
+    const label = document.createElement('label');
+    label.className = 'check';
+    label.innerHTML = `<input type="checkbox" value="${esc(device.id)}"${primaries.has(device.id) ? ' checked' : ''}>${esc(device.name)} <small>${esc(device.id.slice(0, 8))}</small>`;
+    return label;
+  }));
 }
 
 function renderSettingsHint(settings) {
@@ -184,7 +187,11 @@ function complianceNote(device) {
   if (minimum && !device.revoked && !(device.clientVersion && versionAtLeast(device.clientVersion, minimum))) {
     return `<span class="pill warn" title="Below the minimum browser version ${minimum}: cannot sync until it updates">UPDATE REQUIRED</span>`;
   }
-  if (state.settings.clientLock?.enabled && !device.revoked && !(device.clientVersion && versionAtLeast(device.clientVersion, LOCK_MIN_VERSION))) {
+  const primaries = state.settings.primaryDeviceIds || [];
+  if (!device.revoked && primaries.indexOf(device.id) > 0 && !(device.clientVersion && versionAtLeast(device.clientVersion, '1.9.0'))) {
+    return '<span class="pill warn" title="Browsers before 1.9 only know the first primary browser, so this one does not share its sign-ins yet">UPDATE NEEDED</span>';
+  }
+  if ((device.unlockCode ?? state.settings.clientLock?.enabled) && !device.revoked && !(device.clientVersion && versionAtLeast(device.clientVersion, LOCK_MIN_VERSION))) {
     return `<span class="pill warn" title="Browsers before ${LOCK_MIN_VERSION} do not ask for the unlock code">UPDATE NEEDED</span>`;
   }
   const policy = state.settings.networkPolicy || 'strict';
@@ -250,6 +257,7 @@ function renderDevices() {
     };
     row.querySelector('.limits').onclick = () => toggleLimitsEditor(row, device);
     row.querySelector('.actions-button').onclick = () => toggleDevicePanel(row, device);
+    if (device.unlockCode !== null && device.unlockCode !== undefined) row.children[4].insertAdjacentHTML('beforeend', `<br><span class="pending">Unlock code: ${device.unlockCode ? 'always' : 'never'}</span>`);
     if (device.pendingCommands?.length) row.children[4].insertAdjacentHTML('beforeend', `<br><span class="pending">${device.pendingCommands.length} action(s) waiting</span>`);
     body.append(row);
   }
@@ -268,7 +276,7 @@ function toggleDevicePanel(row, device) {
   panel.innerHTML = `<td colspan="9"><div class="device-panel">
     <strong>Actions for ${esc(device.name)}</strong>
     <div class="buttons">
-      <button type="button" class="secondary" data-command="lock"${state.settings.clientLock?.enabled ? '' : ' disabled title="Turn on the unlock code first"'}>Lock now</button>
+      <button type="button" class="secondary" data-command="lock"${(device.unlockCode ?? state.settings.clientLock?.enabled) && state.settings.clientLock?.hash ? '' : ' disabled title="Turn on the unlock code for this browser first"'}>Lock now</button>
       <button type="button" class="secondary" data-command="close-tabs">Close all tabs</button>
       <button type="button" class="secondary" data-command="restart">Restart browser</button>
       <label>Page to open<input name="openUrl" type="url" placeholder="https://example.com/"></label><button type="button" class="secondary" data-command="open-url">Open</button>
@@ -280,6 +288,7 @@ function toggleDevicePanel(row, device) {
       <label>Home page<input name="homePage" type="url" placeholder="Shared home page"></label>
       <label>Site filter<select name="filterMode"><option value="">Same as all browsers</option><option value="off">Any site</option><option value="allow">Only the sites listed</option><option value="block">Every site except those listed</option></select></label>
       <label>Sites<input name="filterDomains" placeholder="github.com, gitlab.com"></label>
+      <label>Unlock code<select name="unlockCode"><option value="">Same as all browsers</option><option value="on">Always ask for it</option><option value="off">Never ask for it</option></select></label>
       <label class="check"><input name="scheduleExempt" type="checkbox">Can be used outside the allowed hours</label>
       <button>Save settings</button><button type="button" class="ghost cancel">Close</button>
     </form>
@@ -290,6 +299,7 @@ function toggleDevicePanel(row, device) {
   form.elements.filterMode.value = filter ? filter.mode : '';
   form.elements.filterDomains.value = filter ? filter.domains.join(', ') : '';
   form.elements.scheduleExempt.checked = device.scheduleExempt === true;
+  form.elements.unlockCode.value = device.unlockCode === true ? 'on' : device.unlockCode === false ? 'off' : '';
   form.querySelector('.cancel').onclick = () => panel.remove();
   form.onsubmit = async event => {
     event.preventDefault();
@@ -297,7 +307,12 @@ function toggleDevicePanel(row, device) {
     try {
       await api(`/devices/${device.id}/settings`, {
         method: 'PUT',
-        body: JSON.stringify({ homePage: form.elements.homePage.value, siteFilter: mode ? { mode, domains: lines(form.elements.filterDomains.value) } : null, scheduleExempt: form.elements.scheduleExempt.checked })
+        body: JSON.stringify({
+          homePage: form.elements.homePage.value,
+          siteFilter: mode ? { mode, domains: lines(form.elements.filterDomains.value) } : null,
+          scheduleExempt: form.elements.scheduleExempt.checked,
+          unlockCode: { on: true, off: false }[form.elements.unlockCode.value] ?? null
+        })
       });
       await load();
       toast(`Settings saved for ${device.name}`);
@@ -395,7 +410,7 @@ function renderProfiles() {
   for (const profile of paginate('profiles', sorted, profile => `${profile.domain} ${profile.name} ${(profile.usedBy || []).join(' ')}`, 20)) {
     const element = document.createElement('div');
     element.className = `profile${selectedProfiles.has(profile.id) ? ' selected' : ''}`;
-    element.innerHTML = `<label class="pick"><input type="checkbox" aria-label="Select ${esc(profile.domain)}"${selectedProfiles.has(profile.id) ? ' checked' : ''}><div><strong>${profile.enabled ? '●' : '○'} ${esc(profile.name)}</strong><span>${esc(profile.domain)} · ${profile.cookieCount} cookie(s)${profile.enabled ? '' : ' · disabled'}${profile.listed === false ? ' · <em class="unlisted" title="Not on the list of shared sites: the primary browser no longer updates it">not on the sharing list</em>' : ''}${healthBadge(profile)}${profile.accounts > 1 ? ` · account of ${profile.accounts} · ${profile.usedBy?.length ? `used by ${esc(profile.usedBy.join(', '))}` : 'used by no browser'}` : ''}</span></div></label><button class="secondary">Edit</button>`;
+    element.innerHTML = `<label class="pick"><input type="checkbox" aria-label="Select ${esc(profile.domain)}"${selectedProfiles.has(profile.id) ? ' checked' : ''}><div><strong>${profile.enabled ? '●' : '○'} ${esc(profile.name)}</strong><span>${esc(profile.domain)} · ${profile.cookieCount} cookie(s)${profile.enabled ? '' : ' · disabled'}${profile.listed === false ? ' · <em class="unlisted" title="Not on the list of shared sites: the primary browser no longer updates it">not on the sharing list</em>' : ''}${healthBadge(profile)}${profile.primaries?.length > 1 ? ` · <em class="unlisted" title="Each primary browser publishes its own sign-in, so they overwrite each other">${profile.primaries.length} primary browsers on this account</em>` : ''}${profile.accounts > 1 ? ` · account of ${profile.accounts} · ${profile.usedBy?.length ? `used by ${esc(profile.usedBy.join(', '))}` : 'used by no browser'}` : ''}</span></div></label><button class="secondary">Edit</button>`;
     element.querySelector('input').onchange = event => {
       if (event.target.checked) selectedProfiles.add(profile.id); else selectedProfiles.delete(profile.id);
       element.classList.toggle('selected', event.target.checked);
@@ -513,7 +528,10 @@ function settingsPayload(proxy) {
   return {
     homePage: $('#home-page').value,
     searchUrl: $('#search-url').value,
-    primaryDeviceId: $('#primary-device').value,
+    ...(() => {
+      const ids = [...document.querySelectorAll('#primary-devices input:checked')].map(input => input.value);
+      return { primaryDeviceIds: ids, primaryDeviceId: ids[0] || '' };
+    })(),
     autoShareCookies: $('#auto-share-mode').value !== 'off',
     autoShareScope: $('#auto-share-mode').value === 'listed' ? 'listed' : 'all',
     autoShareDomains: $('#auto-share-domains').value.split(/[\s,]+/).filter(Boolean),

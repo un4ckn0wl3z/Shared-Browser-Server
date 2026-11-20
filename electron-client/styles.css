@@ -86,3 +86,6 @@ select:disabled, input:disabled { opacity: .6; }
 .download progress { grid-column: 1; width: 100%; height: 6px; }
 .download.blocked small, .download.interrupted small { color: #b3261e; }
 .announcement .pin { width: 28px; text-align: center; font-size: 15px; }
+.primary-badge { padding: 3px 8px; border-radius: 999px; background: #dcfce7; color: #166534; font-size: 11px; font-weight: 800; letter-spacing: .06em; white-space: nowrap; }
+.primary-badge[hidden] { display: none; }
+.account.expiring { border-color: #f5a524; background: #fff7e6; color: #8a5a00; }

@@ -120,11 +120,16 @@ function updateState(state) {
   const reload = element('reload');
   reload.textContent = loading ? '✕' : '↻';
   reload.title = loading ? 'Stop loading' : 'Reload';
+  element('primary-badge').hidden = !state.primary;
   const account = element('account');
   account.hidden = !state.account;
   if (state.account) {
-    account.textContent = `👤 ${state.account.name}${state.account.count > 1 ? ` (${state.account.count})` : ''} ▾`;
-    account.title = `Shared accounts for ${state.account.domain}`;
+    const left = state.account.expiresAt ? (Date.parse(state.account.expiresAt) - Date.now()) / 86400000 : null;
+    const warning = state.account.session === 'expiring' ? ` ⏳ ${left >= 1 ? `${Math.floor(left)} d` : `${Math.max(0, Math.round(left * 24))} h`}`
+      : state.account.session === 'signed-out' ? ' ⚠ signed out' : '';
+    account.textContent = `👤 ${state.account.name}${state.account.count > 1 ? ` (${state.account.count})` : ''}${warning} ▾`;
+    account.classList.toggle('expiring', Boolean(warning));
+    account.title = `Shared accounts for ${state.account.domain}${state.account.expiresAt ? `\nSign-in ${state.account.session === 'expiring' ? 'expires' : 'valid until'} ${new Date(state.account.expiresAt).toLocaleString()}` : ''}`;
   }
 }
 

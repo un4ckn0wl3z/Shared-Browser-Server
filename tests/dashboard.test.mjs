@@ -313,6 +313,27 @@ describe('dashboard', () => {
     await waitFor(async () => /No backups yet/.test(await page.textContent('#backups')), { message: 'empty table' });
   });
 
+  test('ticks several primary browsers and sets the unlock code for one browser', async () => {
+    await page.click('#refresh');
+    await page.check('#primary-devices label:has-text("WB1") input');
+    await page.check('#primary-devices label:has-text("WB2") input');
+    await page.click('#settings-form > button');
+    await waitFor(async () => /Shared settings saved/.test(await page.textContent('#toast')), { message: 'saved' });
+    const settings = (await server.status()).settings;
+    const ids = (await server.status()).devices.filter(item => item.name === 'WB1' || item.name === 'WB2').map(item => item.id).sort();
+    assert.deepEqual([...settings.primaryDeviceIds].sort(), ids);
+    assert.equal((await page.locator('#devices .pill:has-text("PRIMARY")').count()), 2);
+    await page.click('#devices tr:has-text("WB2") button.actions-button');
+    await page.selectOption('.device-row [name=unlockCode]', 'off');
+    await page.click('.device-row form button:not([type=button])');
+    await waitFor(async () => /Settings saved for WB2/.test(await page.textContent('#toast')), { message: 'device saved' });
+    assert.equal((await server.status()).devices.find(item => item.name === 'WB2').unlockCode, false);
+    assert.match(await page.textContent('#devices tr:has-text("WB2")'), /Unlock code: never/);
+    await page.uncheck('#primary-devices label:has-text("WB2") input');
+    await page.click('#settings-form > button');
+    await waitFor(async () => (await server.status()).settings.primaryDeviceIds.length === 1, { message: 'one primary again' });
+  });
+
   test('lists backups and the audit log', async () => {
     await server.admin('/profiles/purge', 'POST', { confirm: true }).catch(() => { });
     await server.admin('/profiles', 'POST', { name: 'Again', domain: 'again.example', enabled: true, cookies: [] });

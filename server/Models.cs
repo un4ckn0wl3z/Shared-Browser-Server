@@ -167,7 +167,13 @@ public sealed class BrowserSettings
 {
     public string HomePage { get; set; } = "";
     public string SearchUrl { get; set; } = "https://duckduckgo.com/?q=%s";
+    /// <summary>The first primary browser, kept for browsers before 1.9, which know only one.</summary>
     public string PrimaryDeviceId { get; set; } = "";
+    /// <summary>
+    /// Browsers whose sign-ins are shared. Each one publishes into the account it uses, so several primaries
+    /// can look after different sites or accounts.
+    /// </summary>
+    public List<string> PrimaryDeviceIds { get; set; } = [];
     public bool AutoShareCookies { get; set; } = true;
     /// <summary>
     /// With automatic sharing on: "all" shares every site the primary browser has cookies for, "listed"
@@ -293,6 +299,8 @@ public sealed class DeviceRecord
     public SiteFilterSettings? SiteFilter { get; set; }
     /// <summary>True: this browser can be used outside the allowed hours.</summary>
     public bool ScheduleExempt { get; set; }
+    /// <summary>Null follows the shared unlock code setting; true always asks for the code, false never does.</summary>
+    public bool? UnlockCode { get; set; }
     public List<DeviceCommand> Commands { get; set; } = [];
 }
 
@@ -339,9 +347,14 @@ public sealed record SharedSnapshot(long Revision, DateTimeOffset UpdatedAt, Bro
 }
 public sealed record ClientCommand(string Id, string Type, string Argument, DateTimeOffset CreatedAt);
 public sealed record DeviceCommandRequest(string? Type, string? Argument);
-public sealed record DeviceSettingsRequest(string? HomePage, SiteFilterSettings? SiteFilter, bool ScheduleExempt);
+public sealed record DeviceSettingsRequest(string? HomePage, SiteFilterSettings? SiteFilter, bool ScheduleExempt, bool? UnlockCode = null);
 /// <summary>One account (session profile) of a site that a browser can switch to.</summary>
-public sealed record ClientAccount(string Id, string Name, string Domain, bool Active, int CookieCount);
+public sealed record ClientAccount(string Id, string Name, string Domain, bool Active, int CookieCount)
+{
+    /// <summary>ok, expiring (within the warning period), signed-out or empty; and when the sign-in expires.</summary>
+    public string Session { get; init; } = "ok";
+    public DateTimeOffset? ExpiresAt { get; init; }
+}
 /// <summary>Adds an empty account for the site of PageUrl, which the primary browser then signs in to.</summary>
 public sealed record CreateAccountRequest(string? Name, string? PageUrl);
 /// <summary>Code null or empty keeps the current code.</summary>
