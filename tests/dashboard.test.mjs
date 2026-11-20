@@ -324,7 +324,7 @@ describe('dashboard', () => {
     await page.click('#profile-form .actions button');
     await waitFor(async () => (await server.profile('editable.example'))?.editors?.includes('WB2'), { message: 'editor saved' });
     await page.click('#refresh');
-    await waitFor(async () => /updated by the primary and WB2/.test(await page.textContent('#profiles')), { message: 'editors shown' });
+    await waitFor(async () => /updated by WB2 \(not the primary\)/.test(await page.textContent('#profiles')), { message: 'editors shown' });
     assert.match(await page.textContent('#devices tr:has-text("WB2")'), /EDITOR/);
     await page.click('#devices tr:has-text("WB2") button.actions-button');
     await page.selectOption('.device-row [name=unlockCode]', 'off');

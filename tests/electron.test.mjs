@@ -382,8 +382,20 @@ describe('Electron browsers sharing a session', () => {
     await wb2.navigate(`${site.origin}/other-login`);
     await waitFor(async () => (await server.profile('localhost')).cookies.some(item => item.name === 'other'), { message: 'editor sign-in saved' });
     await waitFor(async () => (await wb1.cookies(site.origin)).includes('other=1'), { message: 'primary received it' });
+    // While WB2 edits the profile, the primary's own sign-in there is not shared, and WB2's sign-out is not either.
+    await wb1.navigate(`${site.origin}/login`);
+    await waitFor(async () => (await wb1.cookies(site.origin)).includes('sid=secret-1'), { message: 'WB1 signed in locally' });
+    await sleep(2500);
+    assert.ok(!(await server.profile('localhost')).cookies.some(item => item.name === 'sid'));
+    await wb2.navigate(`${site.origin}/login`);
+    await waitFor(async () => (await server.profile('localhost')).cookies.some(item => item.name === 'sid'), { message: 'editor sign-in shared' });
+    await wb2.navigate(`${site.origin}/logout`);
+    await waitFor(async () => !(await wb2.cookies(site.origin)).includes('sid='), { message: 'WB2 signed out locally' });
+    await sleep(2500);
+    assert.ok((await server.profile('localhost')).cookies.some(item => item.name === 'sid'), 'the shared sign-in survives the editor signing out');
     const updated = await server.profile('localhost');
-    await server.admin(`/profiles/${updated.id}`, 'PUT', { name: updated.name, domain: updated.domain, enabled: true, editorDeviceIds: [], cookies: updated.cookies.filter(item => item.name !== 'other').map(item => ({ ...item, value: '' })) });
+    await server.admin(`/profiles/${updated.id}`, 'PUT', { name: updated.name, domain: updated.domain, enabled: true, editorDeviceIds: [], cookies: updated.cookies.filter(item => item.name !== 'other' && item.name !== 'sid').map(item => ({ ...item, value: '' })) });
+    await wb1.navigate(`${site.origin}/logout`);
     await waitFor(async () => await wb2.window.isHidden('#editor-badge'), { message: 'EDITOR badge gone' });
     // Unlock code: on for everyone but off for WB2, then on only for WB2.
     await server.admin('/client-lock', 'PUT', { enabled: false, code: 'letmein' });

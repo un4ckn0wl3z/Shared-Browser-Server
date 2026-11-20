@@ -117,9 +117,13 @@ public sealed partial class SharedStateStore
             if (view.UnlockCode is { } unlock) settings.ClientLock.Enabled = unlock && settings.ClientLock.Hash.Length > 0;
         }
         var editable = profiles.Where(profile => profile.Enabled && profile.EditorDeviceIds.Contains(deviceId)).Select(profile => profile.Domain).Distinct().ToList();
+        var readOnly = string.Equals(settings.PrimaryDeviceId, deviceId, StringComparison.OrdinalIgnoreCase)
+            ? profiles.Where(profile => profile.Enabled && profile.EditorDeviceIds.Count > 0 && !profile.EditorDeviceIds.Contains(deviceId)).Select(profile => profile.Domain).Distinct().ToList()
+            : [];
         return snapshot with
         {
             EditableDomains = editable,
+            ReadOnlyDomains = readOnly,
             Settings = settings,
             Profiles = profiles,
             Announcements = snapshot.Announcements.Where(item => item.ShareWithAllDevices || item.AllowedDeviceIds.Contains(deviceId)).ToList(),
@@ -1170,7 +1174,9 @@ public sealed partial class SharedStateStore
             // Cookies go to the account this browser has switched to. A site whose profiles are all disabled
             // blocks sharing for its domain; it must not be shadowed by an automatic one.
             var profile = site is null ? null : ActiveAccountLocked(device, site, !primary);
-            if (!primary && profile is not null && !profile.EditorDeviceIds.Contains(deviceId)) profile = null;
+            // A profile with editors has one kind of writer: its editors. The primary browser leaves it alone.
+            var editor = profile is not null && profile.EditorDeviceIds.Contains(deviceId);
+            if (profile is not null && (primary ? profile.EditorDeviceIds.Count > 0 && !editor : !editor)) profile = null;
             var profileCreated = false;
             if (primary && site is null && _state.Settings.AutoShareCookies && incomingCookies.Count > 0)
             {
@@ -1193,6 +1199,8 @@ public sealed partial class SharedStateStore
             {
                 var cookie = ValidateCookie(incoming, profile.Domain, deviceId);
                 if (!DomainMatches(host, cookie.Domain)) continue;
+                // An editor cannot empty a cookie, which is how many sites clear a sign-in.
+                if (editor && cookie.Value.Length == 0) continue;
                 seen.Add(CookieKey(cookie));
                 if (cookie.ExpiresAt is { } expires && expires < DateTimeOffset.UtcNow.ToUnixTimeSeconds()) continue;
                 var index = profile.Cookies.FindIndex(item => CookieKey(item) == CookieKey(cookie));
@@ -1210,7 +1218,8 @@ public sealed partial class SharedStateStore
             // cookies it no longer has (sign-out, server-side deletion) are removed from the vault too.
             // Cookies typed in by an administrator are kept until the primary browser has confirmed it holds
             // them, so a publish that races ahead of installing a new cookie cannot delete it.
-            if (request.Complete)
+            // Editors never remove cookies, so an editor that signs out or loses its cookies cannot sign everyone out.
+            if (request.Complete && !editor)
             {
                 changed += profile.Cookies.RemoveAll(item => item.Domain == host && item.SourceDeviceId != AdminSource && !seen.Contains(CookieKey(item)));
                 // The primary browser no longer holds the sign-in: everyone sharing this profile is now signed out.

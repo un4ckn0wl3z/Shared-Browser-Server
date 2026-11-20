@@ -995,6 +995,17 @@ describe('cookie editors, per-browser unlock code and session expiry for browser
     assert.equal(await value(), 'from-editor');
     await push(reader, 'edit.example', 'from-reader');
     assert.equal(await value(), 'from-editor');
+    // With an editor, the primary only receives this profile; the primary's snapshot says so.
+    await push(primary, 'edit.example', 'primary-again');
+    assert.equal(await value(), 'from-editor');
+    assert.deepEqual((await (await server.device(primary, '/snapshot')).json()).readOnlyDomains, ['edit.example']);
+    assert.deepEqual((await (await server.device(editor, '/snapshot')).json()).readOnlyDomains, []);
+    // An editor never removes or empties cookies: signing out there does not sign everyone out.
+    await server.device(editor, '/sync', 'POST', { pageUrl: 'https://edit.example/', complete: true, cookies: [] });
+    await server.device(editor, '/sync', 'POST', { pageUrl: 'https://edit.example/', complete: true, cookies: [cookie('s', '', 'edit.example')] });
+    assert.equal(await value(), 'from-editor');
+    await server.device(editor, '/sync', 'POST', { pageUrl: 'https://edit.example/', complete: true, cookies: [cookie('s', 'from-editor', 'edit.example'), cookie('extra', '1', 'edit.example')] });
+    assert.deepEqual((await server.profile('edit.example')).cookies.map(item => item.name).sort(), ['extra', 's']);
     const status = await server.status();
     assert.deepEqual(status.profiles.find(item => item.domain === 'edit.example').editors, ['editor']);
     assert.deepEqual(status.devices.find(item => item.id === editor.id).editorOf, ['edit.example']);
