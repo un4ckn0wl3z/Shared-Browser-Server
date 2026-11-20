@@ -226,7 +226,7 @@ function normalizeSnapshot(input) {
   input.bookmarks = Array.isArray(input.bookmarks) ? input.bookmarks.filter(item => item && /^https?:\/\//i.test(item.url || '')) : [];
   input.announcements = Array.isArray(input.announcements)
     ? input.announcements.filter(item => item && typeof item.id === 'string' && ['info', 'warning', 'critical'].includes(item.level))
-      .map(item => ({ ...item, title: String(item.title || ''), message: String(item.message || ''), url: /^https?:\/\//i.test(item.url || '') ? item.url : '' }))
+      .map(item => ({ ...item, pinned: item.pinned === true, title: String(item.title || ''), message: String(item.message || ''), url: /^https?:\/\//i.test(item.url || '') ? item.url : '' }))
     : [];
   input.revision = Number(input.revision) || 0;
   return input;
@@ -241,7 +241,10 @@ function stringList(value) {
 function visibleAnnouncements() {
   const dismissed = new Set(config.announcements.dismissed);
   const now = Date.now();
-  return config.secrets.cache.announcements.filter(item => !dismissed.has(item.id) && !(item.expiresAt && Date.parse(item.expiresAt) <= now));
+  // Pinned announcements stay on screen, even if the user dismissed them before they were pinned.
+  return config.secrets.cache.announcements
+    .filter(item => (item.pinned || !dismissed.has(item.id)) && !(item.expiresAt && Date.parse(item.expiresAt) <= now))
+    .sort((a, b) => Number(Boolean(b.pinned)) - Number(Boolean(a.pinned)));
 }
 
 // Sends the banners to the toolbar, raises a desktop notification for new warning and critical
@@ -274,6 +277,7 @@ function publishAnnouncements() {
 
 async function dismissAnnouncement(id) {
   const value = String(id);
+  if (config.secrets.cache.announcements.some(item => item.id === value && item.pinned)) return;
   if (!config.announcements.dismissed.includes(value)) config.announcements.dismissed.push(value);
   if (!config.announcements.pendingAcks.includes(value)) config.announcements.pendingAcks.push(value);
   saveConfig();
@@ -1352,6 +1356,13 @@ async function runCommand(command) {
       if (pagesHidden()) pendingOpens.push(command.argument);
       else await addTab(command.argument);
       break;
+    case 'switch-account': {
+      const account = config.secrets.cache.accounts.find(item => item.id === command.argument);
+      if (!account) throw new Error('That account is no longer shared with this browser');
+      if (!account.active) await switchAccount(account.id);
+      status(`The administrator switched ${account.domain} to ${account.name}`);
+      break;
+    }
     case 'restart':
       saveSessionState();
       app.relaunch();

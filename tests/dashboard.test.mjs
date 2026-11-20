@@ -208,7 +208,7 @@ describe('dashboard', () => {
       assert.equal(await page.inputValue('#notify-discord'), '••••••••');
       await page.click('#notify-test');
       await waitFor(async () => /Test sent to Discord/.test(await page.textContent('#toast')), { message: 'test sent' });
-      assert.match(JSON.parse(capture.requests[0].text).content, /Test notification/);
+      assert.match(JSON.parse(capture.requests[0].text).embeds[0].title, /Test notification/);
     } finally {
       await capture.close();
     }
@@ -258,7 +258,66 @@ describe('dashboard', () => {
     await page.uncheck('#offsite-enabled');
   });
 
+  test('pins an announcement, pages and searches long lists', async () => {
+    await page.fill('#announcement-title', 'Pinned notice');
+    await page.fill('#announcement-message', 'Read me');
+    await page.check('#announcement-pinned');
+    await page.click('#announcement-form > button');
+    await waitFor(async () => /Announcement sent/.test(await page.textContent('#toast')), { message: 'sent' });
+    assert.equal((await server.status()).announcements.find(item => item.title === 'Pinned notice').pinned, true);
+    assert.match(await page.textContent('#announcements article:first-child'), /📌[\s\S]*Pinned notice[\s\S]*cannot be dismissed/);
+    await page.click('#announcements article:first-child button.pin');
+    await waitFor(async () => !(await server.status()).announcements.find(item => item.title === 'Pinned notice').pinned, { message: 'unpinned' });
+    // Activity has more than one page: paging and search work, and survive the refresh.
+    await page.selectOption('#audit-pager select', '10');
+    await waitFor(async () => /Page 1 of \d+/.test(await page.textContent('#audit-pager')), { message: 'pager shown' });
+    assert.equal(await page.locator('#audit tr').count(), 10);
+    await page.click('#audit-pager [data-go="next"]');
+    assert.match(await page.textContent('#audit-pager'), /11–20 of/);
+    await page.fill('#audit-pager input', 'announcement.sent');
+    await waitFor(async () => (await page.locator('#audit tr').count()) >= 1 && /filtered from/.test(await page.textContent('#audit-pager')), { message: 'search applied' });
+    for (const row of await page.locator('#audit tr').allTextContents()) assert.match(row, /announcement\.sent/);
+    await page.click('#refresh');
+    await waitFor(async () => /filtered from/.test(await page.textContent('#audit-pager')), { message: 'search kept after refresh' });
+    await page.fill('#audit-pager input', '');
+    await page.selectOption('#audit-pager select', '20');
+  });
+
+  test('switches a browser to another account from its Manage panel', async () => {
+    await server.admin('/profiles', 'POST', { name: 'Anuwat', domain: 'switch.example', enabled: true, cookies: [] });
+    const napon = await server.admin('/profiles', 'POST', { name: 'Napon', domain: 'switch.example', enabled: true, cookies: [] });
+    await page.click('#refresh');
+    await waitFor(async () => (await server.status()).devices.find(item => item.name === 'WB2').accounts.length > 0, { message: 'accounts listed' });
+    await page.click('#devices tr:has-text("WB2") button.actions-button');
+    await page.selectOption('.device-row select[data-site="switch.example"]', napon.id);
+    await page.click('.device-row [data-switch="switch.example"]');
+    await waitFor(async () => (await server.status()).devices.find(item => item.name === 'WB2').pendingCommands.some(item => item.type === 'switch-account' && item.argument === napon.id), { message: 'switch queued' });
+    await waitFor(async () => /WB2 switches switch\.example to Napon/.test(await page.textContent('#toast')), { message: 'switch toast' });
+  });
+
+  test('selects backups to delete, and purges them after typing PURGE', async () => {
+    await page.click('#refresh');
+    await waitFor(async () => (await page.locator('#backups .pick-backup').count()) >= 2, { message: 'backups listed' });
+    const before = (await server.status()).backups.length;
+    await page.check('#backups tr:nth-child(1) .pick-backup');
+    assert.equal(await page.textContent('#delete-backups'), 'Delete selected (1)');
+    page.once('dialog', dialog => dialog.accept());
+    await page.click('#delete-backups');
+    await waitFor(async () => (await server.status()).backups.length === before - 1, { message: 'one deleted' });
+    page.once('dialog', dialog => dialog.accept('nope'));
+    await page.click('#purge-backups');
+    await waitFor(async () => /type PURGE/.test(await page.textContent('#toast')), { message: 'purge refused' });
+    page.once('dialog', dialog => dialog.accept('PURGE'));
+    await page.click('#purge-backups');
+    await waitFor(async () => (await server.status()).backups.length === 0, { message: 'purged' });
+    await waitFor(async () => /No backups yet/.test(await page.textContent('#backups')), { message: 'empty table' });
+  });
+
   test('lists backups and the audit log', async () => {
+    await server.admin('/profiles/purge', 'POST', { confirm: true }).catch(() => { });
+    await server.admin('/profiles', 'POST', { name: 'Again', domain: 'again.example', enabled: true, cookies: [] });
+    await server.admin('/profiles/purge', 'POST', { confirm: true });
+    await page.click('#refresh');
     await waitFor(async () => (await page.locator('#backups tr').count()) >= 1 && !(await page.textContent('#backups')).includes('No backups'), { message: 'backup rows' });
     assert.match(await page.textContent('#backup-policy'), /Keeps the newest \d+ backups/);
     const count = await page.locator('#backups tr').count();
@@ -267,6 +326,8 @@ describe('dashboard', () => {
     await waitFor(async () => (await page.locator('#backups tr').count()) === count - 1 || /No backups/.test(await page.textContent('#backups')), { message: 'backup deleted' });
     await page.click('#refresh');
     await waitFor(async () => (await page.textContent('#audit')).includes('backup.deleted'), { message: 'deletion audited' });
+    // Show the whole recent activity on one page.
+    await page.selectOption('#audit-pager select', '100');
     const audit = await page.textContent('#audit');
     for (const action of ['notifications.updated', 'device.command_sent', 'device.settings_updated', 'client_lock.updated', 'enrollment_code.created', 'device.enrolled', 'profile.updated', 'settings.updated', 'announcement.sent', 'profiles.deleted', 'profiles.purged']) assert.ok(audit.includes(action), action);
   });

@@ -217,10 +217,11 @@ function renderDevices() {
   body.replaceChildren();
   if (!state.devices.length) {
     body.innerHTML = '<tr><td colspan="9" class="empty">No browsers enrolled</td></tr>';
+    paginate('devices', [], null);
     return;
   }
   const modes = { direct: 'Direct', managed: 'Managed', strict: 'Strict' };
-  for (const device of state.devices) {
+  for (const device of paginate('devices', state.devices, device => `${device.name} ${device.id} ${device.clientVersion} ${device.networkMode}`)) {
     const row = document.createElement('tr');
     row.innerHTML = `<td>${esc(device.name)}${device.primary ? '<span class="pill">PRIMARY</span>' : ''}<br><code>${esc(device.id.slice(0, 12))}…</code></td>`
       + `<td>${device.clientVersion ? `v${esc(device.clientVersion)}` : '<small>unknown</small>'}${device.networkMode ? ` <span class="pill mode">${esc(modes[device.networkMode] || device.networkMode)}</span>` : ''} ${complianceNote(device)}</td>`
@@ -254,7 +255,7 @@ function renderDevices() {
   }
 }
 
-const COMMAND_LABELS = { lock: 'Lock now', 'close-tabs': 'Close all tabs', 'clear-site': 'Clear cookies for a site', restart: 'Restart browser', 'open-url': 'Open a page' };
+const COMMAND_LABELS = { lock: 'Lock now', 'close-tabs': 'Close all tabs', 'clear-site': 'Clear cookies for a site', restart: 'Restart browser', 'open-url': 'Open a page', 'switch-account': 'Switch account' };
 
 function toggleDevicePanel(row, device) {
   if (row.nextElementSibling?.classList.contains('device-row')) {
@@ -273,6 +274,7 @@ function toggleDevicePanel(row, device) {
       <label>Page to open<input name="openUrl" type="url" placeholder="https://example.com/"></label><button type="button" class="secondary" data-command="open-url">Open</button>
       <label>Site<input name="clearSite" placeholder="github.com"></label><button type="button" class="danger" data-command="clear-site">Clear cookies</button>
     </div>
+    ${(device.accounts || []).length ? `<div class="account-pick"><strong>Accounts</strong>${device.accounts.map(site => `<label>${esc(site.domain)}<select data-site="${esc(site.domain)}">${site.options.map(option => `<option value="${esc(option.id)}"${option.id === site.activeId ? ' selected' : ''}>${esc(option.name)}</option>`).join('')}</select></label><button type="button" class="secondary" data-switch="${esc(site.domain)}">Switch</button>`).join('')}</div>` : ''}
     <div class="pending">${(device.pendingCommands || []).map(command => `${esc(COMMAND_LABELS[command.type] || command.type)}${command.argument ? ` (${esc(command.argument)})` : ''} — waiting <button type="button" class="ghost" data-cancel="${esc(command.id)}">Cancel</button>`).join('<br>')}</div>
     <form class="limits-form device-settings"><strong>Settings for this browser</strong>
       <label>Home page<input name="homePage" type="url" placeholder="Shared home page"></label>
@@ -310,6 +312,17 @@ function toggleDevicePanel(row, device) {
         await api(`/devices/${device.id}/commands`, { method: 'POST', body: JSON.stringify({ type, argument }) });
         await load();
         toast(`${COMMAND_LABELS[type]} sent to ${device.name}`);
+      } catch (error) { toast(error.message, true); }
+    };
+  }
+  for (const button of panel.querySelectorAll('[data-switch]')) {
+    button.onclick = async () => {
+      const select = panel.querySelector(`select[data-site="${CSS.escape(button.dataset.switch)}"]`);
+      const name = select.selectedOptions[0]?.textContent;
+      try {
+        await api(`/devices/${device.id}/commands`, { method: 'POST', body: JSON.stringify({ type: 'switch-account', argument: select.value }) });
+        await load();
+        toast(`${device.name} switches ${button.dataset.switch} to ${name}`);
       } catch (error) { toast(error.message, true); }
     };
   }
@@ -373,11 +386,13 @@ function renderProfiles() {
   container.replaceChildren();
   if (!state.profiles.length) {
     container.innerHTML = '<p class="empty">No shared profiles yet.</p>';
+    paginate('profiles', [], null);
     return;
   }
   // Accounts of the same site sit together, in the order browsers fall back to them.
   const order = new Map(state.profiles.map((profile, index) => [profile.id, index]));
-  for (const profile of [...state.profiles].sort((a, b) => a.domain.localeCompare(b.domain) || order.get(a.id) - order.get(b.id))) {
+  const sorted = [...state.profiles].sort((a, b) => a.domain.localeCompare(b.domain) || order.get(a.id) - order.get(b.id));
+  for (const profile of paginate('profiles', sorted, profile => `${profile.domain} ${profile.name} ${(profile.usedBy || []).join(' ')}`, 20)) {
     const element = document.createElement('div');
     element.className = `profile${selectedProfiles.has(profile.id) ? ' selected' : ''}`;
     element.innerHTML = `<label class="pick"><input type="checkbox" aria-label="Select ${esc(profile.domain)}"${selectedProfiles.has(profile.id) ? ' checked' : ''}><div><strong>${profile.enabled ? '●' : '○'} ${esc(profile.name)}</strong><span>${esc(profile.domain)} · ${profile.cookieCount} cookie(s)${profile.enabled ? '' : ' · disabled'}${profile.listed === false ? ' · <em class="unlisted" title="Not on the list of shared sites: the primary browser no longer updates it">not on the sharing list</em>' : ''}${healthBadge(profile)}${profile.accounts > 1 ? ` · account of ${profile.accounts} · ${profile.usedBy?.length ? `used by ${esc(profile.usedBy.join(', '))}` : 'used by no browser'}` : ''}</span></div></label><button class="secondary">Edit</button>`;
@@ -411,15 +426,6 @@ async function deleteProfiles(ids) {
   return result;
 }
 
-const EVENT_LABELS = {
-  'session.lost': 'A shared session is signed out',
-  'session.expiring': 'A shared session expires soon',
-  'device.offline': 'A browser goes offline',
-  'device.enrolled': 'A new browser enrolls',
-  'proxy.quota_reached': 'A browser reaches its proxy quota',
-  'browser.unlock_failed': 'A wrong unlock code is entered',
-  'backup.failed': 'A backup fails'
-};
 const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 const lines = value => value.split(/[\s,]+/).filter(Boolean);
 
@@ -433,11 +439,16 @@ function renderNotifications() {
   $('#notify-offline').value = notify.offlineMinutes || 30;
   $('#notify-expiry').value = notify.expiryWarningDays || 3;
   const enabled = new Set(notify.events || []);
-  $('#notify-events').replaceChildren(...(notify.allEvents || Object.keys(EVENT_LABELS)).map(event => {
-    const label = document.createElement('label');
-    label.className = 'check';
-    label.innerHTML = `<input type="checkbox" value="${esc(event)}"${enabled.has(event) ? ' checked' : ''}>${esc(EVENT_LABELS[event] || event)}`;
-    return label;
+  const groups = new Map();
+  for (const kind of notify.catalog || []) {
+    if (!groups.has(kind.group)) groups.set(kind.group, []);
+    groups.get(kind.group).push(kind);
+  }
+  $('#notify-events').replaceChildren(...[...groups].map(([group, kinds]) => {
+    const box = document.createElement('div');
+    box.className = 'event-group';
+    box.innerHTML = `<strong>${esc(group)}</strong>` + kinds.map(kind => `<label class="check"><input type="checkbox" value="${esc(kind.key)}"${enabled.has(kind.key) ? ' checked' : ''}>${esc(kind.title)}</label>`).join('');
+    return box;
   }));
 }
 
@@ -598,20 +609,27 @@ function updateAnnouncementDevices() {
 function renderAnnouncements() {
   renderAnnouncementDevices();
   const container = $('#announcements');
-  container.replaceChildren(...(state.announcements || []).map(item => {
+  container.replaceChildren(...paginate('announcements', state.announcements || [], null, 10).map(item => {
     const element = document.createElement('article');
-    element.className = `announcement ${item.level}${item.expired ? ' expired' : ''}`;
+    element.className = `announcement ${item.level}${item.expired ? ' expired' : ''}${item.pinned ? ' pinned' : ''}`;
     const audience = item.shareWithAllDevices ? 'all browsers' : item.recipients.join(', ') || 'no active browsers';
     const read = item.acknowledgedBy.map(entry => entry.name);
     const expiry = item.expired ? 'expired' : item.expiresAt ? `expires ${relativeFuture(item.expiresAt)}` : 'no expiry';
-    element.innerHTML = `<header><div><span class="level ${esc(item.level)}">${esc(item.level.toUpperCase())}</span><strong></strong></div><button class="ghost" type="button">Delete</button></header>`
+    element.innerHTML = `<header><div>${item.pinned ? '<span class="pin-mark" title="Pinned">📌</span>' : ''}<span class="level ${esc(item.level)}">${esc(item.level.toUpperCase())}</span><strong></strong></div><div class="actions"><button class="secondary pin" type="button">${item.pinned ? 'Unpin' : 'Pin'}</button><button class="ghost delete" type="button">Delete</button></div></header>`
       + `<p></p>${item.url ? `<small>Link: <a target="_blank" rel="noopener noreferrer"></a></small>` : ''}`
-      + `<small>Sent ${esc(relativeTime(item.createdAt))} to ${esc(audience)} · ${esc(expiry)} · dismissed by ${read.length} of ${item.recipients.length}${read.length ? ` (${esc(read.join(', '))})` : ''}</small>`;
+      + `<small>Sent ${esc(relativeTime(item.createdAt))} to ${esc(audience)} · ${esc(expiry)} · ${item.pinned ? 'pinned: cannot be dismissed' : `dismissed by ${read.length} of ${item.recipients.length}${read.length ? ` (${esc(read.join(', '))})` : ''}`}</small>`;
     element.querySelector('strong').textContent = item.title || '(no title)';
     element.querySelector('p').textContent = item.message;
     const link = element.querySelector('a');
     if (link) { link.href = item.url; link.textContent = item.url; }
-    element.querySelector('button').onclick = async () => {
+    element.querySelector('.pin').onclick = async () => {
+      try {
+        await api(`/announcements/${item.id}/pin`, { method: 'PUT', body: JSON.stringify({ pinned: !item.pinned }) });
+        await load();
+        toast(item.pinned ? 'Announcement unpinned: browsers can dismiss it again' : 'Announcement pinned: browsers always show it');
+      } catch (error) { toast(error.message, true); }
+    };
+    element.querySelector('.delete').onclick = async () => {
       if (!confirm('Delete this announcement? Browsers remove its banner.')) return;
       try {
         await api(`/announcements/${item.id}`, { method: 'DELETE' });
@@ -679,12 +697,21 @@ function renderBackups() {
     $('#backup-policy').textContent = `Keeps the newest ${policy.keep} backups and deletes older ones automatically. An automatic backup is saved at most every ${policy.intervalMinutes} minutes while the vault changes, so a quiet vault keeps backups for longer.${oldest ? ` Oldest kept: ${oldest}.` : ''} Change with SHARED_BROWSER_BACKUP_KEEP and SHARED_BROWSER_BACKUP_INTERVAL_MINUTES.`;
   }
   if (!state.backups?.length) {
-    body.innerHTML = '<tr><td colspan="4" class="empty">No backups yet</td></tr>';
+    body.innerHTML = '<tr><td colspan="5" class="empty">No backups yet</td></tr>';
+    paginate('backups', [], null);
+    selectedBackups.clear();
+    updateBackupBar();
     return;
   }
-  for (const backup of state.backups) {
+  const existing = new Set(state.backups.map(backup => backup.name));
+  for (const name of [...selectedBackups]) if (!existing.has(name)) selectedBackups.delete(name);
+  for (const backup of paginate('backups', state.backups, null, 20)) {
     const row = document.createElement('tr');
-    row.innerHTML = `<td><code>${esc(backup.name)}</code></td><td>${esc(new Date(backup.createdAt).toLocaleString())}</td><td>${esc(formatBytes(backup.size))}</td><td class="actions"><button class="secondary">Restore</button><button class="danger">Delete</button></td>`;
+    row.innerHTML = `<td><input type="checkbox" class="pick-backup" aria-label="Select ${esc(backup.name)}"${selectedBackups.has(backup.name) ? ' checked' : ''}></td><td><code>${esc(backup.name)}</code></td><td>${esc(new Date(backup.createdAt).toLocaleString())}</td><td>${esc(formatBytes(backup.size))}</td><td class="actions"><button class="secondary">Restore</button><button class="danger">Delete</button></td>`;
+    row.querySelector('.pick-backup').onchange = event => {
+      if (event.target.checked) selectedBackups.add(backup.name); else selectedBackups.delete(backup.name);
+      updateBackupBar();
+    };
     row.querySelector('.danger').onclick = async () => {
       if (!confirm(`Delete ${backup.name}? It cannot be restored afterwards.`)) return;
       try {
@@ -703,6 +730,75 @@ function renderBackups() {
     };
     body.append(row);
   }
+  updateBackupBar();
+}
+
+const selectedBackups = new Set();
+
+function updateBackupBar() {
+  const total = state?.backups?.length || 0;
+  const count = selectedBackups.size;
+  $('#delete-backups').disabled = count === 0;
+  $('#delete-backups').textContent = count ? `Delete selected (${count})` : 'Delete selected';
+  $('#purge-backups').disabled = total === 0;
+  const all = $('#select-all-backups');
+  all.disabled = total === 0;
+  all.checked = total > 0 && count === total;
+  all.indeterminate = count > 0 && count < total;
+}
+
+// ---- Pagination ----
+// Long lists show one page at a time; the page, page size and search survive the automatic refresh.
+const pagers = {};
+
+function paginate(key, items, match, defaultSize = 20) {
+  const pager = pagers[key] ||= { page: 1, size: defaultSize, query: '' };
+  const query = pager.query.trim().toLowerCase();
+  const filtered = query && match ? items.filter(item => match(item).toLowerCase().includes(query)) : items;
+  const pages = Math.max(1, Math.ceil(filtered.length / pager.size));
+  pager.page = Math.min(Math.max(1, pager.page), pages);
+  const start = (pager.page - 1) * pager.size;
+  renderPager(key, filtered.length, items.length, pages);
+  return filtered.slice(start, start + pager.size);
+}
+
+const pagerRenderers = {};
+
+function renderPager(key, shown, total, pages) {
+  const container = $(`#${key}-pager`);
+  if (!container) return;
+  const pager = pagers[key];
+  // The search box is created once so typing in it is never interrupted by a refresh.
+  if (container.dataset.search && !container.querySelector('input')) {
+    const input = document.createElement('input');
+    input.type = 'search';
+    input.placeholder = container.dataset.search;
+    input.oninput = () => { pager.query = input.value; pager.page = 1; pagerRenderers[key]?.(); };
+    container.prepend(input);
+  }
+  let nav = container.querySelector('.nav');
+  if (!nav) {
+    nav = document.createElement('div');
+    nav.className = 'nav';
+    container.append(nav);
+  }
+  container.hidden = total <= 10 && !pager.query;
+  const first = shown ? (pager.page - 1) * pager.size + 1 : 0;
+  const last = Math.min(shown, pager.page * pager.size);
+  nav.innerHTML = `<span>${first}–${last} of ${shown}${shown !== total ? ` (filtered from ${total})` : ''}</span>`
+    + `<button type="button" class="secondary" data-go="first" title="First page"${pager.page <= 1 ? ' disabled' : ''}>«</button>`
+    + `<button type="button" class="secondary" data-go="prev" title="Previous page"${pager.page <= 1 ? ' disabled' : ''}>‹</button>`
+    + `<span>Page ${pager.page} of ${pages}</span>`
+    + `<button type="button" class="secondary" data-go="next" title="Next page"${pager.page >= pages ? ' disabled' : ''}>›</button>`
+    + `<button type="button" class="secondary" data-go="last" title="Last page"${pager.page >= pages ? ' disabled' : ''}>»</button>`
+    + `<select title="Rows per page">${[10, 20, 50, 100].map(size => `<option value="${size}"${size === pager.size ? ' selected' : ''}>${size} / page</option>`).join('')}</select>`;
+  for (const button of nav.querySelectorAll('[data-go]')) {
+    button.onclick = () => {
+      pager.page = { first: 1, prev: pager.page - 1, next: pager.page + 1, last: pages }[button.dataset.go];
+      pagerRenderers[key]?.();
+    };
+  }
+  nav.querySelector('select').onchange = event => { pager.size = Number(event.target.value); pager.page = 1; pagerRenderers[key]?.(); };
 }
 
 function renderAudit() {
@@ -710,13 +806,15 @@ function renderAudit() {
   body.replaceChildren();
   if (!state.audit?.length) {
     body.innerHTML = '<tr><td colspan="6" class="empty">No activity recorded yet</td></tr>';
+    paginate('audit', [], null);
     return;
   }
-  for (const entry of state.audit.slice(0, 100)) {
+  for (const entry of paginate('audit', state.audit, entry => `${entry.actor} ${entry.action} ${entry.target} ${entry.details} ${entry.ip}`, 25)) {
     const row = document.createElement('tr');
     row.innerHTML = `<td title="${esc(new Date(entry.at).toLocaleString())}">${esc(relativeTime(entry.at))}</td><td>${esc(entry.actor)}</td><td><code>${esc(entry.action)}</code></td><td>${esc(entry.target)}</td><td class="details">${esc(entry.details)}</td><td>${esc(entry.ip)}</td>`;
     body.append(row);
   }
+  if (!body.children.length) body.innerHTML = '<tr><td colspan="6" class="empty">No matching activity</td></tr>';
 }
 
 function renderBookmarks() {
@@ -905,6 +1003,35 @@ $('#select-unlisted').onclick = () => {
   updateBulkBar();
 };
 
+$('#select-all-backups').onchange = event => {
+  selectedBackups.clear();
+  if (event.target.checked) for (const backup of state.backups || []) selectedBackups.add(backup.name);
+  renderBackups();
+};
+$('#delete-backups').onclick = async () => {
+  const names = [...selectedBackups];
+  if (!names.length || !confirm(`Delete ${names.length} backup(s)? They cannot be restored afterwards.`)) return;
+  try {
+    const result = await api('/backups/delete', { method: 'POST', body: JSON.stringify({ names }) });
+    selectedBackups.clear();
+    await load();
+    toast(`Deleted ${result.deleted} backup(s)`);
+  } catch (error) { toast(error.message, true); }
+};
+$('#purge-backups').onclick = async () => {
+  const total = state.backups?.length || 0;
+  if (!total) return;
+  const typed = prompt(`Delete all ${total} backup(s)? Nothing can be restored from them afterwards, and the next backup is taken when the vault changes.\n\nType PURGE to confirm.`);
+  if (typed === null) return;
+  if (typed.trim() !== 'PURGE') return toast('Nothing deleted: type PURGE to confirm', true);
+  try {
+    const result = await api('/backups/purge', { method: 'POST', body: JSON.stringify({ confirm: true }) });
+    selectedBackups.clear();
+    await load();
+    toast(`Deleted all ${result.deleted} backup(s)`);
+  } catch (error) { toast(error.message, true); }
+};
+
 $('#select-all-profiles').onchange = event => {
   selectedProfiles.clear();
   if (event.target.checked) for (const profile of state.profiles) selectedProfiles.add(profile.id);
@@ -960,10 +1087,12 @@ $('#announcement-form').onsubmit = async event => {
         url: $('#announcement-url').value,
         expiresInMinutes: expiry ? Number(expiry) : null,
         shareWithAllDevices: $('#announcement-all').checked,
-        allowedDeviceIds: [...document.querySelectorAll('#announcement-devices input:checked')].map(input => input.value)
+        allowedDeviceIds: [...document.querySelectorAll('#announcement-devices input:checked')].map(input => input.value),
+        pinned: $('#announcement-pinned').checked
       })
     });
     for (const id of ['#announcement-title', '#announcement-message', '#announcement-url']) $(id).value = '';
+    $('#announcement-pinned').checked = false;
     await load();
     toast('Announcement sent');
   } catch (error) { toast(error.message, true); }
@@ -1075,6 +1204,8 @@ document.addEventListener('input', event => {
 document.addEventListener('click', event => {
   if (event.target.matches?.('.bookmark .remove, .bookmark .move-up')) $('#bookmarks-form').dataset.dirty = 'true';
 });
+
+Object.assign(pagerRenderers, { audit: renderAudit, devices: renderDevices, profiles: () => { renderProfiles(); updateBulkBar(); }, announcements: renderAnnouncements, backups: renderBackups });
 
 // Keep "last seen" and proxy counters current while the dashboard is open, but never re-render while
 // the administrator is typing in a form.

@@ -236,7 +236,7 @@ public sealed partial class SharedStateStore
                     health = SessionHealth(profile, _state.Notifications.ExpiryWarningDays),
                     // False when a sharing list is in use and does not cover the profile: the primary browser no longer updates it.
                     listed = ShareableSiteLocked(profile.Domain) is not null,
-                    usedBy = _state.Devices.Where(device => !device.Revoked && ActiveAccountLocked(device, _state.Profiles.Where(item => item.Domain == profile.Domain), true) == profile).Select(device => device.Name).ToList(),
+                    usedBy = _state.Devices.Where(device => !device.Revoked && ActiveAccountLocked(device, _state.Profiles.Where(item => item.Domain == profile.Domain), true) == profile).Select(DisplayName).ToList(),
                     profile.Id,
                     profile.Name,
                     profile.Domain,
@@ -259,13 +259,21 @@ public sealed partial class SharedStateStore
                     device.HomePage,
                     device.SiteFilter,
                     device.ScheduleExempt,
+                    // For sites with several accounts: which one this browser uses (null when it can use none).
+                    accounts = _state.Profiles.GroupBy(item => item.Domain).Where(site => site.Count(item => item.Enabled) > 1)
+                        .Select(site => new
+                        {
+                            domain = site.Key,
+                            activeId = ActiveAccountLocked(device, site, true)?.Id,
+                            options = site.Where(item => item.Enabled && Shares(item, device.Id)).Select(item => new { item.Id, item.Name }).ToList()
+                        }).Where(site => site.options.Count > 0).ToList(),
                     pendingCommands = device.Commands.Where(command => command.CreatedAt > now - CommandLifetime).Select(CloneCommand).ToList(),
                     usage = usage(device.Id),
                     primary = device.Id == _state.Settings.PrimaryDeviceId,
                     live = _liveConnections.GetValueOrDefault(device.Id) > 0
                 }).ToList(),
                 bookmarks = _state.Bookmarks.Select(CloneBookmark).ToList(),
-                announcements = _state.Announcements.OrderByDescending(item => item.CreatedAt).Select(item =>
+                announcements = _state.Announcements.OrderByDescending(item => item.Pinned).ThenByDescending(item => item.CreatedAt).Select(item =>
                 {
                     var recipients = _state.Devices.Where(device => !device.Revoked && (item.ShareWithAllDevices || item.AllowedDeviceIds.Contains(device.Id))).ToList();
                     return new
@@ -279,6 +287,7 @@ public sealed partial class SharedStateStore
                         item.ExpiresAt,
                         item.ShareWithAllDevices,
                         item.AllowedDeviceIds,
+                        item.Pinned,
                         expired = item.ExpiresAt is { } expires && expires <= now,
                         recipients = recipients.Select(device => device.Name).ToList(),
                         acknowledgedBy = item.Acknowledgements.OrderBy(entry => entry.Value).Select(entry => new { deviceId = entry.Key, name = DeviceName(entry.Key), at = entry.Value }).ToList()
@@ -782,7 +791,8 @@ public sealed partial class SharedStateStore
             CreatedAt = now,
             ExpiresAt = request.ExpiresInMinutes is { } minutes ? now.AddMinutes(minutes) : null,
             ShareWithAllDevices = request.ShareWithAllDevices,
-            AllowedDeviceIds = request.ShareWithAllDevices ? [] : allowed
+            AllowedDeviceIds = request.ShareWithAllDevices ? [] : allowed,
+            Pinned = request.Pinned
         };
         await _gate.WaitAsync();
         try
@@ -792,6 +802,24 @@ public sealed partial class SharedStateStore
             _state.Announcements.Add(announcement);
             BumpRevision();
             await SaveLockedAsync();
+            return announcement;
+        }
+        finally { _gate.Release(); }
+    }
+
+    public async Task<Announcement?> SetAnnouncementPinnedAsync(string id, bool pinned)
+    {
+        await _gate.WaitAsync();
+        try
+        {
+            var announcement = _state.Announcements.FirstOrDefault(item => item.Id == id);
+            if (announcement is null) return null;
+            if (announcement.Pinned != pinned)
+            {
+                announcement.Pinned = pinned;
+                BumpRevision();
+                await SaveLockedAsync();
+            }
             return announcement;
         }
         finally { _gate.Release(); }
@@ -882,6 +910,10 @@ public sealed partial class SharedStateStore
         return profile.Cookies.Where(cookie => cookie.HttpOnly && (cookie.ExpiresAt is not { } expires || expires - cookie.UpdatedAt.ToUnixTimeSeconds() >= 24 * 60 * 60)).ToList();
     }
 
+    /// <summary>A device name, with the start of its ID when another browser has the same name.</summary>
+    private string DisplayName(DeviceRecord device) =>
+        _state.Devices.Count(item => item.Name == device.Name) > 1 ? $"{device.Name} ({device.Id[..Math.Min(6, device.Id.Length)]})" : device.Name;
+
     private static string ProfileLabel(SessionProfile profile) => profile.Name == profile.Domain ? profile.Domain : $"{profile.Domain} ({profile.Name})";
 
     private static object SessionHealth(SessionProfile profile, int warningDays)
@@ -912,16 +944,16 @@ public sealed partial class SharedStateStore
         finally { _gate.Release(); }
     }
 
-    public async Task<List<(string Id, string Name, DateTimeOffset LastSeenAt, bool Revoked)>> DeviceStatusesAsync()
+    public async Task<List<(string Id, string Name, DateTimeOffset LastSeenAt, bool Revoked, string ClientVersion)>> DeviceStatusesAsync()
     {
         await _gate.WaitAsync();
-        try { return _state.Devices.Select(device => (device.Id, device.Name, device.LastSeenAt, device.Revoked)).ToList(); }
+        try { return _state.Devices.Select(device => (device.Id, device.Name, device.LastSeenAt, device.Revoked, device.ClientVersion)).ToList(); }
         finally { _gate.Release(); }
     }
 
     // ---- Per-browser settings and commands --------------------------------------------------------
 
-    public static readonly string[] CommandTypes = ["lock", "close-tabs", "clear-site", "restart", "open-url"];
+    public static readonly string[] CommandTypes = ["lock", "close-tabs", "clear-site", "restart", "open-url", "switch-account"];
     private static readonly TimeSpan CommandLifetime = TimeSpan.FromDays(1);
 
     public async Task<DeviceCommand?> AddCommandAsync(string deviceId, DeviceCommandRequest request)
@@ -940,12 +972,19 @@ public sealed partial class SharedStateStore
             if (sites.Count != 1) throw new InvalidOperationException("Enter the site whose cookies should be cleared, for example github.com");
             argument = sites[0];
         }
-        else argument = "";
+        else if (type != "switch-account") argument = "";
         await _gate.WaitAsync();
         try
         {
             var device = _state.Devices.FirstOrDefault(item => item.Id == deviceId);
             if (device is null) return null;
+            // The browser switches itself, so its own cookies are replaced safely (the primary browser would
+            // otherwise publish the old account's cookies into the new one).
+            if (type == "switch-account")
+            {
+                var profile = _state.Profiles.FirstOrDefault(item => item.Id == argument && item.Enabled && Shares(item, deviceId)) ?? throw new InvalidOperationException("That account is not available to this browser");
+                device.Commands.RemoveAll(command => command.Type == "switch-account" && _state.Profiles.Any(item => item.Id == command.Argument && item.Domain == profile.Domain));
+            }
             device.Commands.RemoveAll(command => command.CreatedAt < DateTimeOffset.UtcNow - CommandLifetime);
             if (device.Commands.Count >= 20) throw new InvalidOperationException("This browser already has 20 actions waiting. It runs them the next time it connects");
             var command = new DeviceCommand { Id = Guid.NewGuid().ToString("N"), Type = type, Argument = argument, CreatedAt = DateTimeOffset.UtcNow };
@@ -1204,6 +1243,24 @@ public sealed partial class SharedStateStore
         return await ImportAsync(await File.ReadAllTextAsync(path), "restore");
     }
 
+    /// <summary>Deletes the named backups, or every backup when <paramref name="names"/> is null. Returns the deleted names.</summary>
+    public async Task<List<string>> DeleteBackupsAsync(IReadOnlyCollection<string>? names)
+    {
+        if (names is not null && names.Any(name => !BackupName().IsMatch(name))) throw new InvalidOperationException("Invalid backup name");
+        await _gate.WaitAsync();
+        try
+        {
+            var deleted = new List<string>();
+            foreach (var backup in ListBackups().Where(item => names is null || names.Contains(item.Name)))
+            {
+                try { File.Delete(Path.Combine(_backupDirectory, backup.Name)); deleted.Add(backup.Name); }
+                catch (IOException error) { _logger.LogWarning(error, "Could not delete backup {Name}", backup.Name); }
+            }
+            return deleted;
+        }
+        finally { _gate.Release(); }
+    }
+
     /// <summary>Deletes one backup file. Returns false when it does not exist.</summary>
     public async Task<bool> DeleteBackupAsync(string name)
     {
@@ -1314,7 +1371,7 @@ public sealed partial class SharedStateStore
             Profiles = _state.Profiles.Select(CloneProfile).ToList(),
             Bookmarks = _state.Bookmarks.Select(CloneBookmark).ToList(),
             EnrollmentCodes = _state.EnrollmentCodes.Select(code => new EnrollmentCode { Id = code.Id, CodeHash = code.CodeHash, Label = code.Label, CreatedAt = code.CreatedAt, ExpiresAt = code.ExpiresAt, UsedAt = code.UsedAt, UsedByDeviceId = code.UsedByDeviceId, Revoked = code.Revoked }).ToList(),
-            Announcements = _state.Announcements.Select(item => new Announcement { Id = item.Id, Title = item.Title, Message = item.Message, Level = item.Level, Url = item.Url, CreatedAt = item.CreatedAt, ExpiresAt = item.ExpiresAt, ShareWithAllDevices = item.ShareWithAllDevices, AllowedDeviceIds = [.. item.AllowedDeviceIds], Acknowledgements = new(item.Acknowledgements) }).ToList()
+            Announcements = _state.Announcements.Select(item => new Announcement { Id = item.Id, Title = item.Title, Message = item.Message, Level = item.Level, Url = item.Url, CreatedAt = item.CreatedAt, ExpiresAt = item.ExpiresAt, ShareWithAllDevices = item.ShareWithAllDevices, AllowedDeviceIds = [.. item.AllowedDeviceIds], Acknowledgements = new(item.Acknowledgements), Pinned = item.Pinned }).ToList()
         };
         disk.Settings.Proxy.CertificateSha256 = "";
         foreach (var cookie in disk.Profiles.SelectMany(profile => profile.Cookies)) cookie.Value = Encrypt(cookie.Value);
@@ -1359,8 +1416,8 @@ public sealed partial class SharedStateStore
             _state.Bookmarks.Select(CloneBookmark).ToList(),
             _state.Announcements
                 .Where(item => item.ExpiresAt is null || item.ExpiresAt > DateTimeOffset.UtcNow)
-                .OrderByDescending(item => item.CreatedAt)
-                .Select(item => new ClientAnnouncement(item.Id, item.Title, item.Message, item.Level, item.Url, item.CreatedAt, item.ExpiresAt) { ShareWithAllDevices = item.ShareWithAllDevices, AllowedDeviceIds = [.. item.AllowedDeviceIds] })
+                .OrderByDescending(item => item.Pinned).ThenByDescending(item => item.CreatedAt)
+                .Select(item => new ClientAnnouncement(item.Id, item.Title, item.Message, item.Level, item.Url, item.CreatedAt, item.ExpiresAt) { Pinned = item.Pinned, ShareWithAllDevices = item.ShareWithAllDevices, AllowedDeviceIds = [.. item.AllowedDeviceIds] })
                 .ToList());
         _deviceIndex = _state.Devices.ToDictionary(device => device.Id, device => new DeviceAuth(device.Id, device.Name, device.TokenHash, device.Revoked, device.MaxConnections, device.MonthlyQuotaGb, device.RateLimitMbps, device.ClientVersion));
         _deviceViews = _state.Devices.ToDictionary(device => device.Id, device => new DeviceView(

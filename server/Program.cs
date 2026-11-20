@@ -190,7 +190,7 @@ app.MapPost("/api/client/accounts/{id}/switch", async (HttpContext context, stri
     try
     {
         var profile = await store.SwitchAccountAsync(device.Id, id);
-        audit.Record($"device:{device.Name}", "account.switched", profile.Domain, profile.Name, Ip(context));
+        audit.Record($"device:{device.Name}", "account.switched", profile.Domain, $"now uses {profile.Name} ({DeviceLabel(device)})", Ip(context));
         return Results.Json(store.SnapshotFor(device.Id));
     }
     catch (KeyNotFoundException) { return Results.NotFound(new { error = "That account is not available to this browser" }); }
@@ -204,7 +204,7 @@ app.MapPost("/api/client/accounts", async (HttpContext context, CreateAccountReq
     try
     {
         var profile = await store.CreateAccountAsync(device.Id, request);
-        audit.Record($"device:{device.Name}", "account.created", profile.Domain, profile.Name, Ip(context));
+        audit.Record($"device:{device.Name}", "account.created", profile.Domain, $"{profile.Name} added by {DeviceLabel(device)}", Ip(context));
         return Results.Json(store.SnapshotFor(device.Id), statusCode: StatusCodes.Status201Created);
     }
     catch (UnauthorizedAccessException error) { return Results.Json(new { error = error.Message }, statusCode: StatusCodes.Status403Forbidden); }
@@ -216,7 +216,7 @@ app.MapPost("/api/client/unlock-report", (HttpContext context, UnlockReport repo
 {
     var device = DeviceAuthorized(context.Request, store);
     if (device is null) return Results.Unauthorized();
-    audit.Record($"device:{device.Name}", report.Success ? "browser.unlocked" : "browser.unlock_failed", device.Name, "", Ip(context));
+    audit.Record($"device:{device.Name}", report.Success ? "browser.unlocked" : "browser.unlock_failed", DeviceLabel(device), "", Ip(context));
     return Results.NoContent();
 });
 
@@ -226,7 +226,7 @@ app.MapPost("/api/client/commands/{id}/ack", async (HttpContext context, string 
     var device = DeviceAuthorized(context.Request, store);
     if (device is null) return Results.Unauthorized();
     var command = await store.RemoveCommandAsync(device.Id, id);
-    if (command is not null) audit.Record($"device:{device.Name}", "device.command_done", device.Name, CommandLabel(command), Ip(context));
+    if (command is not null) audit.Record($"device:{device.Name}", "device.command_done", DeviceLabel(device), CommandLabel(command), Ip(context));
     return Results.NoContent();
 });
 
@@ -234,7 +234,7 @@ app.MapPost("/api/client/commands/{id}/ack", async (HttpContext context, string 
 
 app.MapGet("/api/admin/status", async (HttpContext context, SharedStateStore store, ForwardProxyService proxy) =>
     Admin(context)
-        ? Results.Json(await store.AdminStatusAsync(proxy.PublicStatus(), audit.Recent(200), proxy.UsageReport))
+        ? Results.Json(await store.AdminStatusAsync(proxy.PublicStatus(), audit.Recent(500), proxy.UsageReport))
         : Results.Unauthorized());
 
 app.MapPut("/api/admin/settings", async (HttpContext context, BrowserSettings settings, SharedStateStore store) =>
@@ -276,7 +276,7 @@ app.MapPut("/api/admin/notifications", async (HttpContext context, NotificationS
 app.MapPost("/api/admin/notifications/test", async (HttpContext context, SharedStateStore store, Notifier notifier) =>
 {
     if (!Admin(context)) return Results.Unauthorized();
-    var results = await notifier.SendAsync(store.NotificationSettings(), "Test notification", "Alerts from Shared Browser reach this channel.", context.RequestAborted);
+    var results = await notifier.SendTestAsync(store.NotificationSettings(), context.RequestAborted);
     if (results.Count == 0) return Results.BadRequest(new { error = "Set up Discord, Telegram or LINE first" });
     Record(context, "notifications.tested", "", string.Join("; ", results.Select(item => $"{item.Channel}: {(item.Ok ? "ok" : item.Error)}")));
     return Results.Json(new { results });
@@ -367,6 +367,15 @@ app.MapPost("/api/admin/announcements", async (HttpContext context, Announcement
         return Results.Json(announcement, statusCode: StatusCodes.Status201Created);
     }
     catch (InvalidOperationException error) { return Results.BadRequest(new { error = error.Message }); }
+});
+
+app.MapPut("/api/admin/announcements/{id}/pin", async (HttpContext context, string id, PinRequest request, SharedStateStore store) =>
+{
+    if (!Admin(context)) return Results.Unauthorized();
+    var announcement = await store.SetAnnouncementPinnedAsync(id, request.Pinned);
+    if (announcement is null) return Results.NotFound(new { error = "Announcement not found" });
+    Record(context, request.Pinned ? "announcement.pinned" : "announcement.unpinned", announcement.Title.Length > 0 ? announcement.Title : announcement.Message[..Math.Min(60, announcement.Message.Length)]);
+    return Results.NoContent();
 });
 
 app.MapDelete("/api/admin/announcements/{id}", async (HttpContext context, string id, SharedStateStore store) =>
@@ -523,6 +532,29 @@ app.MapPost("/api/admin/import", async (HttpContext context, SharedStateStore st
     catch (InvalidOperationException error) { return Results.BadRequest(new { error = error.Message }); }
 }).WithMetadata(new Microsoft.AspNetCore.Mvc.RequestSizeLimitAttribute(256L * 1024 * 1024));
 
+app.MapPost("/api/admin/backups/delete", async (HttpContext context, DeleteBackupsRequest request, SharedStateStore store) =>
+{
+    if (!Admin(context)) return Results.Unauthorized();
+    if (request.Names is not { Count: > 0 }) return Results.BadRequest(new { error = "Select at least one backup" });
+    try
+    {
+        var deleted = await store.DeleteBackupsAsync(request.Names);
+        Record(context, "backup.deleted", deleted.Count == 1 ? deleted[0] : $"{deleted.Count} backups", string.Join(", ", deleted.Take(10)) + (deleted.Count > 10 ? $" and {deleted.Count - 10} more" : ""));
+        return Results.Json(new { deleted = deleted.Count });
+    }
+    catch (InvalidOperationException error) { return Results.BadRequest(new { error = error.Message }); }
+});
+
+// Deleting every backup must be confirmed explicitly, like purging the profiles.
+app.MapPost("/api/admin/backups/purge", async (HttpContext context, PurgeProfilesRequest request, SharedStateStore store) =>
+{
+    if (!Admin(context)) return Results.Unauthorized();
+    if (!request.Confirm) return Results.BadRequest(new { error = "Confirm the purge" });
+    var deleted = await store.DeleteBackupsAsync(null);
+    Record(context, "backups.purged", $"{deleted.Count} backups");
+    return Results.Json(new { deleted = deleted.Count });
+});
+
 app.MapDelete("/api/admin/backups/{name}", async (HttpContext context, string name, SharedStateStore store) =>
 {
     if (!Admin(context)) return Results.Unauthorized();
@@ -549,6 +581,9 @@ app.MapPost("/api/admin/backups/{name}/restore", async (HttpContext context, str
 });
 
 app.Run();
+
+// Names can repeat (several browsers called "default"), so alerts and the audit log add the ID and version.
+static string DeviceLabel(DeviceAuth device) => $"{device.Name} (id {device.Id[..Math.Min(8, device.Id.Length)]}{(device.ClientVersion.Length > 0 ? $", v{device.ClientVersion}" : "")})";
 
 static string CommandLabel(DeviceCommand command) => command.Argument.Length > 0 ? $"{command.Type} {command.Argument}" : command.Type;
 
