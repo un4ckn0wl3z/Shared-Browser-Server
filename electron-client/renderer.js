@@ -218,8 +218,10 @@ async function openSettings() {
   element('server-url').value = currentConfig.serverUrl;
   element('device-name').value = currentConfig.deviceName;
   element('enrollment-token').value = '';
-  element('enrollment-token').required = !currentConfig.enrolled;
-  element('enrollment-help').textContent = currentConfig.enrolled ? 'Already enrolled. Leave empty to keep the current device token.' : 'Create a one-time enrollment code in the management dashboard and enter it here. The administrator token also works unless the server has disabled it.';
+  element('enrollment-token').required = !currentConfig.enrolled || currentConfig.rejected;
+  element('enrollment-help').textContent = currentConfig.rejected
+    ? 'The server no longer accepts this browser (it was removed or revoked). Enter a new enrollment code from the dashboard to connect it again.'
+    : currentConfig.enrolled ? 'Already enrolled. Leave empty to keep the current device token, or enter a new code to enroll again.' : 'Create a one-time enrollment code in the management dashboard and enter it here. The administrator token also works unless the server has disabled it.';
   element('network-mode').value = currentConfig.networkMode;
   element('strict-privacy').checked = currentConfig.strictPrivacy === true;
   element('privacy-warning').hidden = !currentConfig.strictPrivacy;

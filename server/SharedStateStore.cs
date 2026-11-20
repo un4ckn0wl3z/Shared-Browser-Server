@@ -147,14 +147,6 @@ public sealed partial class SharedStateStore
 
     private bool IsPrimaryLocked(string deviceId) => string.Equals(_state.Settings.PrimaryDeviceId, deviceId, StringComparison.OrdinalIgnoreCase);
 
-    /// <summary>With automatic sharing and no primary browser yet, the first browser that shares becomes it.</summary>
-    private bool ClaimPrimaryLocked(string deviceId)
-    {
-        if (!_state.Settings.AutoShareCookies || _state.Settings.PrimaryDeviceId.Length > 0) return false;
-        _state.Settings.PrimaryDeviceId = deviceId;
-        _state.Settings.PrimaryDeviceIds = [deviceId];
-        return true;
-    }
 
     /// <summary>Completes when the revision differs from <paramref name="known"/>, or after the timeout.</summary>
     public async Task WaitForRevisionChangeAsync(long known, TimeSpan timeout, CancellationToken cancellationToken)
@@ -1115,7 +1107,6 @@ public sealed partial class SharedStateStore
         await _gate.WaitAsync();
         try
         {
-            ClaimPrimaryLocked(deviceId);
             if (!IsPrimaryLocked(deviceId)) throw new UnauthorizedAccessException("Only the primary browser can add accounts, because new sign-ins are onboarded there");
             var device = _state.Devices.First(item => item.Id == deviceId);
             var site = _state.Profiles.Where(item => DomainMatches(host, item.Domain)).GroupBy(item => item.Domain).OrderByDescending(group => group.Key.Length).FirstOrDefault()?.ToList() ?? [];
@@ -1157,8 +1148,6 @@ public sealed partial class SharedStateStore
         {
             var device = _state.Devices.First(item => item.Id == deviceId);
             device.LastSeenAt = DateTimeOffset.UtcNow;
-            var settingsChanged = false;
-            if (ClaimPrimaryLocked(deviceId)) settingsChanged = true;
             // The primary browser onboards and updates sessions. Any other browser may only update the account it
             // uses on a site, and only when that profile lists it as an editor.
             var primary = IsPrimaryLocked(deviceId);
@@ -1167,7 +1156,6 @@ public sealed partial class SharedStateStore
             var shareable = ShareableSiteLocked(host);
             if (shareable is null)
             {
-                if (settingsChanged) { BumpRevision(); await SaveLockedAsync(); }
                 return 0;
             }
             var site = _state.Profiles.Where(item => DomainMatches(host, item.Domain)).GroupBy(item => item.Domain).OrderByDescending(group => group.Key.Length).FirstOrDefault();
@@ -1188,7 +1176,6 @@ public sealed partial class SharedStateStore
             }
             if (profile is null)
             {
-                if (settingsChanged) { BumpRevision(); await SaveLockedAsync(); }
                 return 0;
             }
             var changed = 0;
@@ -1225,7 +1212,7 @@ public sealed partial class SharedStateStore
                 // The primary browser no longer holds the sign-in: everyone sharing this profile is now signed out.
                 if (signedIn && SignInCookies(profile).Count == 0) RaiseActivity(NotificationEvents.SessionLost, ProfileLabel(profile), $"signed out on {_state.Devices.First(item => item.Id == deviceId).Name}");
             }
-            if (changed > 0 || profileCreated || settingsChanged)
+            if (changed > 0 || profileCreated)
             {
                 BumpRevision();
                 await SaveLockedAsync();

@@ -61,6 +61,8 @@ let unlockFailures = 0;
 let unlockBlockedUntil = 0;
 // Set once startup reaches the point of opening tabs, so unlocking earlier does not open pages before the proxy is set.
 let initialTabsRequested = false;
+// The server no longer accepts this browser's token (it was deleted or revoked); a new enrollment code reconnects it.
+let deviceRejected = false;
 // The minimum version the server requires while this browser is older; pages stay hidden until it updates.
 let updateRequired = '';
 let forcedInstallTimer;
@@ -476,9 +478,9 @@ function publishNavigationState() {
     canGoBack: tab?.view.webContents.navigationHistory.canGoBack() || false,
     canGoForward: tab?.view.webContents.navigationHistory.canGoForward() || false,
     account: accountState(currentUrl),
-    primary: Boolean(config.secrets.deviceToken) && isPrimary(),
+    primary: Boolean(config.secrets.deviceToken) && !deviceRejected && isPrimary(),
     readOnly: config.secrets.cache.readOnlyDomains || [],
-    editor: Boolean(config.secrets.deviceToken) && !isPrimary() ? editableDomains() : []
+    editor: Boolean(config.secrets.deviceToken) && !deviceRejected && !isPrimary() ? editableDomains() : []
   });
 }
 
@@ -725,7 +727,13 @@ async function api(pathname, options = {}, useDevice = true) {
     if (!response.ok) {
       let message = '';
       try { message = JSON.parse(text).error || ''; } catch { }
-      if (response.status === 401) throw new Error(useDevice ? 'This browser is unauthorized or revoked.' : message || 'The enrollment code or token was not accepted.');
+      if (response.status === 401) {
+        if (useDevice) {
+          deviceRejected = true;
+          publishNavigationState();
+        }
+        throw Object.assign(new Error(useDevice ? 'This browser was removed or revoked on the server (unauthorized). Enter a new enrollment code in Settings to reconnect it.' : message || 'The enrollment code or token was not accepted.'), { status: 401 });
+      }
       let data;
       try { data = JSON.parse(text); } catch { }
       throw Object.assign(new Error(message || `Server returned ${response.status}${text ? `: ${text.slice(0, 200)}` : ''}`), { status: response.status, data });
@@ -736,14 +744,27 @@ async function api(pathname, options = {}, useDevice = true) {
   }
 }
 
+// A newly entered enrollment code always enrolls again, even when an old device token is still stored: that
+// token stops working when an administrator deletes or revokes the browser, and the code is how it reconnects.
 async function ensureEnrolled() {
-  if (config.secrets.deviceToken) return;
+  if (config.secrets.deviceToken && !config.secrets.enrollmentToken) return;
   if (!config.secrets.enrollmentToken) throw new Error('Open Settings and enter an enrollment code from the management dashboard.');
-  const result = await api('/api/client/enroll', {
-    method: 'POST',
-    headers: { authorization: `Bearer ${config.secrets.enrollmentToken}` },
-    body: JSON.stringify({ deviceId: config.deviceId, deviceName: config.deviceName })
-  }, false);
+  let result;
+  try {
+    result = await api('/api/client/enroll', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${config.secrets.enrollmentToken}` },
+      body: JSON.stringify({ deviceId: config.deviceId, deviceName: config.deviceName })
+    }, false);
+  } catch (error) {
+    // A code the server refused is not tried again at every start; the user enters a new one.
+    if (error.status === 401 || error.status === 403) {
+      config.secrets.enrollmentToken = '';
+      saveConfig();
+    }
+    throw error;
+  }
+  deviceRejected = false;
   config.deviceId = result.deviceId;
   config.secrets.deviceToken = result.deviceToken;
   config.secrets.enrollmentToken = '';
@@ -824,6 +845,7 @@ async function pullSnapshot(notify = false) {
       }
       syncFailures = 0;
       authPrompted = false;
+      deviceRejected = false;
       if (updateRequired) await clearUpdateRequirement();
       status(`${notify ? 'Synchronization complete — ' : ''}Synced r${config.secrets.cache.revision}`);
       return true;
@@ -902,7 +924,8 @@ function isPrimary() {
   // Servers since 1.9 list every primary browser; older ones name a single one.
   const primaries = (Array.isArray(settings.primaryDeviceIds) && settings.primaryDeviceIds.length ? settings.primaryDeviceIds : [settings.primaryDeviceId])
     .filter(Boolean).map(id => String(id).toLowerCase());
-  return (settings.autoShareCookies && !primaries.length) || primaries.includes(config.deviceId.toLowerCase());
+  // Only the browser the administrator chose is primary; with none chosen, no browser shares its sign-ins.
+  return primaries.includes(config.deviceId.toLowerCase());
 }
 
 function electronSameSite(value) {
@@ -2051,6 +2074,7 @@ function installUpdate() {
 function publicConfig() {
   const backend = safeStorage.isEncryptionAvailable() && process.platform === 'linux' ? safeStorage.getSelectedStorageBackend() : undefined;
   return {
+    rejected: deviceRejected,
     profileName,
     version: app.getVersion(),
     serverUrl: config.serverUrl,

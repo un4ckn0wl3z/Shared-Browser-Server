@@ -1023,6 +1023,23 @@ describe('cookie editors, per-browser unlock code and session expiry for browser
     assert.deepEqual((await server.profile('edit.example')).editorDeviceIds, []);
   });
 
+  test('no browser becomes primary unless the administrator chooses it, also after the primary is deleted', async () => {
+    const first = await server.enroll(randomDeviceId(), 'chosen');
+    const other = await server.enroll(randomDeviceId(), 'bystander');
+    await server.settings({ primaryDeviceId: '' });
+    const push = device => server.device(device, '/sync', 'POST', { pageUrl: 'https://auto.example/', complete: true, cookies: [cookie('s', '1', 'auto.example')] });
+    await push(other);
+    assert.equal((await server.status()).settings.primaryDeviceId, '');
+    assert.equal(await server.profile('auto.example'), undefined);
+    assert.equal((await server.device(other, '/accounts', 'POST', { name: 'x', pageUrl: 'https://auto.example/' })).status, 403);
+    await server.settings({ primaryDeviceId: first.id });
+    await push(first);
+    assert.ok(await server.profile('auto.example'));
+    await server.admin(`/devices/${first.id}`, 'DELETE');
+    await push(other);
+    assert.equal((await server.status()).settings.primaryDeviceId, '');
+  });
+
   test('the unlock code can be switched on or off for one browser', async () => {
     const always = await server.enroll(randomDeviceId(), 'locked-one');
     const never = await server.enroll(randomDeviceId(), 'open-one');

@@ -17,6 +17,8 @@ describe('dashboard', () => {
     page.on('pageerror', error => errors.push(error.message));
     page.on('console', message => { if (message.type() === 'error') errors.push(message.text()); });
     const device = await server.enroll(randomDeviceId(), 'WB1');
+    // The primary browser is always chosen by the administrator.
+    await server.settings({ primaryDeviceId: device.id });
     await server.device(device, '/sync', 'POST', { pageUrl: 'https://dash.example/', complete: true, cookies: [{ name: 's', value: '1', domain: 'dash.example', path: '/', secure: true, httpOnly: true, sameSite: 'Lax' }] });
   });
   after(async () => {
