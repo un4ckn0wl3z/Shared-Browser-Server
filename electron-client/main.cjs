@@ -216,6 +216,8 @@ function normalizeSnapshot(input) {
   input.profiles = Array.isArray(input.profiles) ? input.profiles : [];
   // Sites whose cookies this browser may update although it is not the primary browser (server 1.10+).
   input.editableDomains = stringList(input.editableDomains).map(normalizedDomain).filter(Boolean);
+  // For the primary browser: sites whose account is kept up to date by editors, which it only receives.
+  input.readOnlyDomains = stringList(input.readOnlyDomains).map(normalizedDomain).filter(Boolean);
   input.commands = Array.isArray(input.commands) ? input.commands.filter(item => item && typeof item.id === 'string' && typeof item.type === 'string') : [];
   const settings = input.settings;
   settings.siteFilter = settings.siteFilter && ['off', 'allow', 'block'].includes(settings.siteFilter.mode) ? { mode: settings.siteFilter.mode, domains: stringList(settings.siteFilter.domains).map(normalizedDomain) } : { mode: 'off', domains: [] };
@@ -475,6 +477,7 @@ function publishNavigationState() {
     canGoForward: tab?.view.webContents.navigationHistory.canGoForward() || false,
     account: accountState(currentUrl),
     primary: Boolean(config.secrets.deviceToken) && isPrimary(),
+    readOnly: config.secrets.cache.readOnlyDomains || [],
     editor: Boolean(config.secrets.deviceToken) && !isPrimary() ? editableDomains() : []
   });
 }
@@ -940,13 +943,15 @@ async function applyAllCookies() {
       const entry = { name: cookie.name, domain: normalizedDomain(cookie.domain || profile.domain), path: cookie.path || '/', value: cookie.value, applied: true };
       shared.set(key, entry);
       const previous = appliedCookies.get(key);
-      if (primary ? local.has(key) : previous?.applied && previous.value === cookie.value) continue;
+      // The primary browser keeps its own cookies, except on sites whose editors are the source of the session.
+      const writer = primary && !readOnlyDomain(normalizedDomain(profile.domain));
+      if (writer ? local.has(key) : previous?.applied && previous.value === cookie.value) continue;
       try { await setSharedCookie(cookie, profile.domain); } catch { entry.applied = false; }
     }
   }
-  if (!primary) {
+  {
     for (const [key, entry] of appliedCookies) {
-      if (shared.has(key)) continue;
+      if (shared.has(key) || (primary && !readOnlyDomain(entry.domain))) continue;
       try { await removeSharedCookie(entry); } catch { }
     }
   }
@@ -1077,8 +1082,12 @@ function publishes() {
   return isPrimary() || editableDomains().length > 0;
 }
 
+function readOnlyDomain(domain) {
+  return (config.secrets.cache.readOnlyDomains || []).some(site => domainWithin(domain, site));
+}
+
 function mayPublish(domain) {
-  return isPrimary() || editableDomains().some(site => domainWithin(domain, site));
+  return isPrimary() ? !readOnlyDomain(domain) : editableDomains().some(site => domainWithin(domain, site));
 }
 
 async function pushAllStoredCookies() {

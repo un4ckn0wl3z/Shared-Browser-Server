@@ -121,6 +121,9 @@ function updateState(state) {
   reload.textContent = loading ? '✕' : '↻';
   reload.title = loading ? 'Stop loading' : 'Reload';
   element('primary-badge').hidden = !state.primary;
+  element('primary-badge').title = state.primary && state.readOnly?.length
+    ? `Sign-ins in this browser are shared, except on ${state.readOnly.join(', ')}, which editors keep up to date`
+    : 'Sign-ins in this browser are shared with the other browsers';
   const editor = element('editor-badge');
   editor.hidden = !state.editor?.length;
   editor.title = state.editor?.length ? `This browser can update the shared cookies of ${state.editor.join(', ')}` : '';

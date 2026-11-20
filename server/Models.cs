@@ -246,7 +246,11 @@ public sealed class SessionProfile
 {
     /// <summary>Optional name of the cookie that holds the sign-in, used for session health and alerts.</summary>
     public string SessionCookie { get; set; } = "";
-    /// <summary>Browsers besides the primary one that may update this profile's cookies (while they use it).</summary>
+    /// <summary>
+    /// Browsers that update this profile's cookies while they use it. When there are any, they are its only
+    /// writers: the primary browser stops updating it (it still onboards new sites and accounts). Editors add
+    /// and change cookies but never remove them.
+    /// </summary>
     public List<string> EditorDeviceIds { get; set; } = [];
     public string Id { get; set; } = "";
     public string Name { get; set; } = "";
@@ -346,6 +350,8 @@ public sealed record SharedSnapshot(long Revision, DateTimeOffset UpdatedAt, Bro
     public List<ClientAccount> Accounts { get; init; } = [];
     /// <summary>Sites whose cookies this browser may update: the sites of the accounts it uses and edits.</summary>
     public List<string> EditableDomains { get; init; } = [];
+    /// <summary>For the primary browser: sites whose account it uses is updated by editors, so it only receives them.</summary>
+    public List<string> ReadOnlyDomains { get; init; } = [];
     /// <summary>Actions waiting for this browser; it acknowledges each one after running it.</summary>
     public List<ClientCommand> Commands { get; init; } = [];
 }
