@@ -25,26 +25,36 @@ public sealed class Notifier : BackgroundService
         audit.Recorded += OnAudit;
     }
 
-    public sealed record Alert(string Event, string Title, string Message, string Key);
+    public sealed record Alert(string Event, string Title, string Severity, List<(string Name, string Value)> Fields, DateTimeOffset At, string Key);
     public sealed record ChannelResult(string Channel, bool Ok, string Error);
 
-    private static readonly Dictionary<string, string> Titles = new()
-    {
-        [NotificationEvents.SessionLost] = "Shared session signed out",
-        [NotificationEvents.SessionExpiring] = "Shared session expires soon",
-        [NotificationEvents.DeviceOffline] = "Browser offline",
-        [NotificationEvents.DeviceEnrolled] = "New browser enrolled",
-        [NotificationEvents.QuotaReached] = "Proxy quota reached",
-        [NotificationEvents.UnlockFailed] = "Wrong unlock code entered",
-        [NotificationEvents.BackupFailed] = "Backup failed"
-    };
-
+    /// <summary>Turns an audit entry into labelled fields: who, which browser or site, details, address and time.</summary>
     private void OnAudit(AuditEntry entry)
     {
-        if (!Titles.TryGetValue(entry.Action, out var title)) return;
-        var subject = entry.Actor.StartsWith("device:", StringComparison.Ordinal) ? entry.Actor[7..] : entry.Target;
-        var details = string.Join(" — ", new[] { entry.Target == subject ? "" : entry.Target, entry.Details }.Where(item => !string.IsNullOrWhiteSpace(item)));
-        Enqueue(new Alert(entry.Action, title, string.IsNullOrEmpty(details) ? subject : $"{subject}: {details}", $"{entry.Action}|{subject}|{entry.Target}"));
+        var kind = NotificationEvents.Find(entry.Action);
+        if (kind is null) return;
+        var fields = new List<(string, string)>();
+        var deviceActor = entry.Actor.StartsWith("device:", StringComparison.Ordinal) ? entry.Actor[7..] : "";
+        var aboutBrowser = entry.Action.StartsWith("device.", StringComparison.Ordinal) || entry.Action.StartsWith("browser.", StringComparison.Ordinal);
+        var targetUsed = false;
+        if (aboutBrowser && entry.Target.Length > 0) { fields.Add(("Browser", entry.Target)); targetUsed = true; }
+        else if (deviceActor.Length > 0) fields.Add(("Browser", deviceActor));
+        if (entry.Actor == "admin") fields.Add(("By", "Administrator (dashboard)"));
+        else if (entry.Actor == "anonymous") fields.Add(("By", "Unknown (not signed in)"));
+        if (!targetUsed && entry.Target.Length > 0)
+        {
+            var label = entry.Action.Split('.')[0] switch
+            {
+                "session" or "account" or "profile" or "profiles" => "Site",
+                "backup" or "vault" => "Backup",
+                "announcement" => "Announcement",
+                _ => "Target"
+            };
+            fields.Add((label, entry.Target));
+        }
+        if (entry.Details.Length > 0) fields.Add(("Details", entry.Details));
+        if (entry.Ip.Length > 0) fields.Add(("IP address", entry.Ip));
+        Enqueue(new Alert(entry.Action, kind.Title, kind.Severity, fields, entry.At, $"{entry.Action}|{entry.Actor}|{entry.Target}|{entry.Ip}"));
     }
 
     public void Enqueue(Alert alert)
@@ -64,22 +74,55 @@ public sealed class Notifier : BackgroundService
     {
         await foreach (var alert in _queue.Reader.ReadAllAsync(stoppingToken))
         {
-            foreach (var result in await SendAsync(_store.NotificationSettings(), alert.Title, alert.Message, stoppingToken))
+            foreach (var result in await SendAsync(_store.NotificationSettings(), alert, stoppingToken))
             {
                 if (!result.Ok) _logger.LogWarning("Notification to {Channel} failed: {Error}", result.Channel, result.Error);
             }
         }
     }
 
-    /// <summary>Sends straight away to every configured channel and reports each outcome (used by "Send test").</summary>
-    public async Task<List<ChannelResult>> SendAsync(NotificationSettings settings, string title, string message, CancellationToken cancellationToken)
+    /// <summary>A test message, sent straight away to every configured channel ("Send test").</summary>
+    public Task<List<ChannelResult>> SendTestAsync(NotificationSettings settings, CancellationToken cancellationToken) =>
+        SendAsync(settings, new Alert("test", "Test notification", "info", [("Details", "Alerts from Shared Browser reach this channel.")], DateTimeOffset.UtcNow, "test"), cancellationToken);
+
+    private static readonly Dictionary<string, (int Color, string Icon)> Severities = new()
     {
-        var text = $"{title}\n{message}";
+        ["danger"] = (0xE5484D, "🚨"),
+        ["warning"] = (0xF5A524, "⚠️"),
+        ["info"] = (0x3B82F6, "ℹ️")
+    };
+
+    /// <summary>Times in alerts use the time zone of the allowed hours (Asia/Bangkok unless changed).</summary>
+    private string LocalTime(DateTimeOffset at)
+    {
+        var zoneId = _store.Settings.Schedule?.TimeZone;
+        try
+        {
+            var zone = TimeZoneInfo.FindSystemTimeZoneById(string.IsNullOrWhiteSpace(zoneId) ? "UTC" : zoneId);
+            return $"{TimeZoneInfo.ConvertTime(at, zone):yyyy-MM-dd HH:mm:ss} ({zone.Id})";
+        }
+        catch (Exception error) when (error is TimeZoneNotFoundException or InvalidTimeZoneException) { return $"{at:yyyy-MM-dd HH:mm:ss} UTC"; }
+    }
+
+    private async Task<List<ChannelResult>> SendAsync(NotificationSettings settings, Alert alert, CancellationToken cancellationToken)
+    {
+        var (color, icon) = Severities.GetValueOrDefault(alert.Severity, Severities["info"]);
+        var fields = alert.Fields.Append(("Time", LocalTime(alert.At))).ToList();
+        var text = $"{icon} {alert.Title}\n{string.Join("\n", fields.Select(field => $"{field.Item1}: {field.Item2}"))}";
         var results = new List<ChannelResult>();
         if (settings.DiscordWebhookUrl.Length > 0)
         {
+            // An embed lays the fields out as a card; Discord shows the timestamp in each reader's own time zone.
             // allowed_mentions: none, so a device or site name can never ping @everyone.
-            results.Add(await PostAsync("Discord", settings.DiscordWebhookUrl, new { username = "Shared Browser", content = $"**{Escape(title)}**\n{Escape(message)}", allowed_mentions = new { parse = Array.Empty<string>() } }, null, cancellationToken));
+            var embed = new
+            {
+                title = $"{icon} {Clip(alert.Title, 240)}",
+                color,
+                fields = fields.Take(20).Select(field => new { name = field.Item1, value = Clip(Escape(field.Item2), 1000), inline = field.Item1 is "Browser" or "Site" or "IP address" or "By" }).ToArray(),
+                timestamp = alert.At.UtcDateTime.ToString("o"),
+                footer = new { text = "Shared Browser" }
+            };
+            results.Add(await PostAsync("Discord", settings.DiscordWebhookUrl, new { username = "Shared Browser", embeds = new[] { embed }, allowed_mentions = new { parse = Array.Empty<string>() } }, null, cancellationToken));
         }
         if (settings.TelegramBotToken.Length > 0 && settings.TelegramChatId.Length > 0)
         {
@@ -92,6 +135,7 @@ public sealed class Notifier : BackgroundService
         return results;
     }
 
+    private static string Clip(string value, int length) => value.Length <= length ? value : value[..(length - 1)] + "…";
     private static string Escape(string value) => value.Replace("@", "@​").Replace("*", "\\*").Replace("_", "\\_");
 
     private static async Task<ChannelResult> PostAsync(string channel, string url, object body, string? bearer, CancellationToken cancellationToken)
@@ -154,7 +198,7 @@ public sealed class Notifier : BackgroundService
         settings.Events,
         settings.OfflineMinutes,
         settings.ExpiryWarningDays,
-        allEvents = NotificationEvents.All
+        catalog = NotificationEvents.Catalog.Select(kind => new { kind.Key, kind.Title, kind.Group, kind.Default })
     };
 
     /// <summary>HTTPS to one of the given hosts, or plain HTTP to this machine (used by tests).</summary>

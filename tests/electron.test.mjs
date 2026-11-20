@@ -330,6 +330,34 @@ describe('Electron browsers sharing a session', () => {
     await server.admin('/client-lock', 'PUT', { enabled: false });
   });
 
+  test('a pinned announcement cannot be dismissed, and the administrator can switch the browser to another account', async () => {
+    const pinned = await server.admin('/announcements', 'POST', { title: 'Pinned for all', message: 'stays on screen', pinned: true });
+    await waitFor(async () => /Pinned for all/.test(await wb2.window.textContent('#announcements')), { message: 'pinned banner' });
+    assert.equal(await wb2.window.locator('.announcement.pinned .dismiss').count(), 0);
+    await wb2.window.evaluate(id => window.sharedBrowser.dismissAnnouncement(id), pinned.id);
+    await sleep(500);
+    assert.match(await wb2.window.textContent('#announcements'), /Pinned for all/);
+    await server.admin(`/announcements/${pinned.id}/pin`, 'PUT', { pinned: false });
+    await waitFor(async () => (await wb2.window.locator('.announcement:has-text("Pinned for all") .dismiss').count()) === 1, { message: 'dismissable after unpin' });
+    await server.admin(`/announcements/${pinned.id}`, 'DELETE');
+
+    const second = await server.admin('/profiles', 'POST', { name: 'second', domain: 'localhost', enabled: true, cookies: [{ name: 'other', value: '2', domain: 'localhost', path: '/', secure: false, httpOnly: false, sameSite: 'Lax' }] });
+    const first = (await server.status()).profiles.find(item => item.domain === 'localhost' && item.id !== second.id);
+    const switchTo = id => server.admin(`/devices/${deviceId('WB2')}/commands`, 'POST', { type: 'switch-account', argument: id });
+    await switchTo(second.id);
+    await waitFor(async () => {
+      const cookies = await wb2.cookies(site.origin);
+      return cookies.includes('other=2') && !cookies.includes('pref=');
+    }, { message: 'WB2 on the second account' });
+    assert.ok((await server.status()).profiles.find(item => item.id === second.id).usedBy.includes('WB2'));
+    await switchTo(first.id);
+    await waitFor(async () => {
+      const cookies = await wb2.cookies(site.origin);
+      return cookies.includes('pref=dark') && !cookies.includes('other=');
+    }, { message: 'WB2 back on the first account' });
+    await server.admin('/profiles/delete', 'POST', { ids: [second.id] });
+  });
+
   test('site filter: blocked sites show a notice, allow lists keep everything else out', async () => {
     const text = async () => (await wb2.pageText()).join('\n');
     await server.settings({ siteFilter: { mode: 'block', domains: ['localhost'] } });

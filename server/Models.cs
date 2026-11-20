@@ -23,7 +23,7 @@ public sealed class NotificationSettings
     public string TelegramChatId { get; set; } = "";
     public string LineChannelToken { get; set; } = "";
     public string LineTo { get; set; } = "";
-    public List<string> Events { get; set; } = [.. NotificationEvents.All];
+    public List<string> Events { get; set; } = [.. NotificationEvents.Defaults];
     /// <summary>A browser counts as offline after this many minutes without contact.</summary>
     public int OfflineMinutes { get; set; } = 30;
     /// <summary>Warn this many days before a shared session expires.</summary>
@@ -35,11 +35,59 @@ public static class NotificationEvents
     public const string SessionLost = "session.lost";
     public const string SessionExpiring = "session.expiring";
     public const string DeviceOffline = "device.offline";
+    public const string DeviceOnline = "device.online";
     public const string DeviceEnrolled = "device.enrolled";
     public const string QuotaReached = "proxy.quota_reached";
     public const string UnlockFailed = "browser.unlock_failed";
     public const string BackupFailed = "backup.failed";
-    public static readonly string[] All = [SessionLost, SessionExpiring, DeviceOffline, DeviceEnrolled, QuotaReached, UnlockFailed, BackupFailed];
+
+    /// <summary>An audit action that can raise an alert, its title, group in the dashboard, and whether it is on by default.</summary>
+    public sealed record Kind(string Key, string Title, string Group, bool Default, string Severity);
+
+    public static readonly Kind[] Catalog =
+    [
+        new("admin.sign_in_failed", "Failed administrator sign-in", "Security", true, "danger"),
+        new("device.enroll_failed", "Failed browser enrollment", "Security", true, "danger"),
+        new(UnlockFailed, "Wrong unlock code entered", "Security", true, "danger"),
+        new("browser.unlocked", "Browser unlocked", "Security", false, "info"),
+        new(SessionLost, "Shared session signed out", "Sessions", true, "warning"),
+        new(SessionExpiring, "Shared session expires soon", "Sessions", true, "warning"),
+        new("account.switched", "Browser switched account", "Sessions", false, "info"),
+        new("account.created", "Account added", "Sessions", true, "info"),
+        new("profile.created", "Profile created", "Sessions", false, "info"),
+        new("profile.updated", "Profile changed", "Sessions", false, "info"),
+        new("profile.deleted", "Profile deleted", "Sessions", true, "warning"),
+        new("profiles.deleted", "Profiles deleted", "Sessions", true, "warning"),
+        new("profiles.purged", "Vault purged", "Sessions", true, "danger"),
+        new(DeviceEnrolled, "New browser enrolled", "Browsers", true, "info"),
+        new(DeviceOffline, "Browser offline", "Browsers", true, "warning"),
+        new(DeviceOnline, "Browser back online", "Browsers", false, "info"),
+        new("device.revoked", "Browser revoked", "Browsers", true, "warning"),
+        new("device.restored", "Browser restored", "Browsers", false, "info"),
+        new("device.deleted", "Browser deleted", "Browsers", true, "warning"),
+        new("device.command_sent", "Action sent to a browser", "Browsers", false, "info"),
+        new("device.command_done", "Browser ran an action", "Browsers", false, "info"),
+        new("device.settings_updated", "Browser settings changed", "Browsers", false, "info"),
+        new("device.limits_updated", "Browser limits changed", "Browsers", false, "info"),
+        new(QuotaReached, "Proxy quota reached", "Browsers", true, "warning"),
+        new("settings.updated", "Shared settings changed", "Administration", false, "info"),
+        new("client_lock.updated", "Unlock code changed", "Administration", true, "warning"),
+        new("notifications.updated", "Notification settings changed", "Administration", false, "info"),
+        new("announcement.sent", "Announcement sent", "Administration", false, "info"),
+        new("bookmarks.updated", "Bookmarks changed", "Administration", false, "info"),
+        new("enrollment_code.created", "Enrollment code created", "Administration", false, "info"),
+        new("vault.exported", "Vault exported", "Administration", true, "warning"),
+        new("vault.imported", "Vault imported", "Administration", true, "warning"),
+        new("vault.restored", "Vault restored from a backup", "Administration", true, "warning"),
+        new(BackupFailed, "Backup failed", "Backups", true, "danger"),
+        new("backup.uploaded", "Backup copied offsite", "Backups", false, "info"),
+        new("backup.deleted", "Backup deleted", "Backups", false, "info"),
+        new("backups.purged", "All backups deleted", "Backups", true, "danger")
+    ];
+
+    public static readonly string[] All = Catalog.Select(kind => kind.Key).ToArray();
+    public static readonly string[] Defaults = Catalog.Where(kind => kind.Default).Select(kind => kind.Key).ToArray();
+    public static Kind? Find(string key) => Catalog.FirstOrDefault(kind => kind.Key == key);
 }
 
 /// <summary>Copies every vault backup to S3-compatible storage (AWS S3, DigitalOcean Spaces, MinIO, ...).</summary>
@@ -111,6 +159,8 @@ public sealed class Announcement
     public List<string> AllowedDeviceIds { get; set; } = [];
     /// <summary>Device ID → when that browser's user dismissed the announcement.</summary>
     public Dictionary<string, DateTimeOffset> Acknowledgements { get; set; } = [];
+    /// <summary>Shown all the time, without a way to dismiss it, until it is unpinned, deleted or expires.</summary>
+    public bool Pinned { get; set; }
 }
 
 public sealed class BrowserSettings
@@ -297,10 +347,14 @@ public sealed record CreateAccountRequest(string? Name, string? PageUrl);
 /// <summary>Code null or empty keeps the current code.</summary>
 public sealed record ClientLockRequest(bool Enabled, string? Code, int IdleMinutes = 0, bool LockOnSystemLock = false);
 public sealed record UnlockReport(bool Success);
-public sealed record AnnouncementRequest(string? Title, string? Message, string? Level, string? Url, int? ExpiresInMinutes, bool ShareWithAllDevices = true, List<string>? AllowedDeviceIds = null);
+public sealed record AnnouncementRequest(string? Title, string? Message, string? Level, string? Url, int? ExpiresInMinutes, bool ShareWithAllDevices = true, List<string>? AllowedDeviceIds = null, bool Pinned = false);
+public sealed record PinRequest(bool Pinned);
+public sealed record DeleteBackupsRequest(List<string>? Names);
 /// <summary>What a browser receives. Targeting stays on the server.</summary>
 public sealed record ClientAnnouncement(string Id, string Title, string Message, string Level, string Url, DateTimeOffset CreatedAt, DateTimeOffset? ExpiresAt)
 {
+    /// <summary>Pinned announcements stay on screen and cannot be dismissed (browsers 1.8 and newer).</summary>
+    public bool Pinned { get; init; }
     [JsonIgnore] public bool ShareWithAllDevices { get; init; } = true;
     [JsonIgnore] public IReadOnlyList<string> AllowedDeviceIds { get; init; } = [];
 }

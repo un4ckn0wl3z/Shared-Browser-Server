@@ -60,6 +60,16 @@ function renderAnnouncements(items) {
       open.addEventListener('click', () => api.openAnnouncementLink(item.id));
       banner.append(open);
     }
+    // A pinned announcement has no dismiss button: it stays until the administrator removes or unpins it.
+    if (item.pinned) {
+      banner.classList.add('pinned');
+      const pin = document.createElement('span');
+      pin.className = 'pin';
+      pin.textContent = '📌';
+      pin.title = 'Pinned by the administrator';
+      banner.append(pin);
+      return banner;
+    }
     const dismiss = document.createElement('button');
     dismiss.className = 'dismiss';
     dismiss.textContent = '×';

@@ -704,7 +704,12 @@ describe('alerts, session health, remote actions and per-browser settings', () =
     await server?.stop();
     await capture?.close();
   });
-  const discord = () => capture.requests.filter(item => item.url.startsWith('/api/webhooks/')).map(item => JSON.parse(item.text));
+  // Each Discord alert is an embed; flatten its title and fields into text for the assertions.
+  const discord = () => capture.requests.filter(item => item.url.startsWith('/api/webhooks/')).map(item => {
+    const body = JSON.parse(item.text);
+    const embed = body.embeds?.[0] || {};
+    return { ...body, embed, content: [embed.title, ...(embed.fields || []).map(field => `${field.name}: ${field.value}`)].join('\n') };
+  });
 
   test('notification settings are validated, kept secret and can be tested', async () => {
     await assert.rejects(server.admin('/notifications', 'PUT', { discordWebhookUrl: 'https://example.com/hook', events: [], offlineMinutes: 30, expiryWarningDays: 3 }), /discord\.com\/api\/webhooks/);
@@ -862,5 +867,97 @@ describe('alerts, session health, remote actions and per-browser settings', () =
     } finally {
       await storage.close();
     }
+  });
+});
+
+describe('detailed alerts, pinned announcements, account assignment and backup clean-up', () => {
+  let server;
+  let capture;
+  before(async () => {
+    capture = await startCapture();
+    server = await startServer({ env: { SHARED_BROWSER_HEALTH_INTERVAL_SECONDS: '1' } });
+  });
+  after(async () => {
+    await server?.stop();
+    await capture?.close();
+  });
+  const embeds = () => capture.requests.map(item => JSON.parse(item.text).embeds?.[0]).filter(Boolean);
+  const field = (embed, name) => embed.fields.find(item => item.name === name)?.value;
+
+  test('alerts name the browser with its ID and version, the address and the time, for many more events', async () => {
+    const saved = await server.admin('/notifications', 'PUT', { discordWebhookUrl: `${capture.url}/api/webhooks/9/x`, events: ['browser.unlock_failed', 'admin.sign_in_failed', 'device.revoked', 'account.switched'], offlineMinutes: 30, expiryWarningDays: 3 });
+    assert.ok(saved.catalog.length > 20 && saved.catalog.every(item => item.key && item.title && item.group));
+    assert.ok(saved.catalog.find(item => item.key === 'device.online'));
+    // A fresh vault starts with the important events switched on.
+    const device = await server.enroll(randomDeviceId(), 'front-desk');
+    await server.device(device, '/snapshot?version=1.8.0');
+    await server.device(device, '/unlock-report', 'POST', { success: false });
+    await waitFor(() => embeds().some(item => /Wrong unlock code/.test(item.title)), { message: 'unlock alert' });
+    const unlock = embeds().find(item => /Wrong unlock code/.test(item.title));
+    assert.match(field(unlock, 'Browser'), new RegExp(`^front-desk \\(id ${device.id.slice(0, 8)}, v1\\.8\\.0\\)$`));
+    assert.equal(field(unlock, 'IP address'), '127.0.0.1');
+    assert.match(field(unlock, 'Time'), /^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d \(/);
+    assert.ok(unlock.timestamp && unlock.color);
+    // A failed administrator sign-in is a security alert.
+    await fetch(`${server.url}/api/admin/status`, { headers: { authorization: 'Bearer wrong' } });
+    await waitFor(() => embeds().some(item => /Failed administrator sign-in/.test(item.title)), { message: 'sign-in alert' });
+    assert.equal(field(embeds().find(item => /Failed administrator sign-in/.test(item.title)), 'By'), 'Unknown (not signed in)');
+    await server.admin(`/devices/${device.id}/revoke`, 'POST', {});
+    await waitFor(() => embeds().some(item => /Browser revoked/.test(item.title) && field(item, 'By') === 'Administrator (dashboard)'), { message: 'revoke alert' });
+  });
+
+  test('pinned announcements reach browsers marked as pinned, first, and can be unpinned', async () => {
+    const device = await server.enroll(randomDeviceId(), 'pin-reader');
+    await server.admin('/announcements', 'POST', { title: 'Normal', message: 'one' });
+    const pinned = await server.admin('/announcements', 'POST', { title: 'Always here', message: 'two', pinned: false });
+    await server.admin(`/announcements/${pinned.id}/pin`, 'PUT', { pinned: true });
+    let list = (await (await server.device(device, '/snapshot')).json()).announcements;
+    assert.deepEqual(list.map(item => [item.title, item.pinned]), [['Always here', true], ['Normal', false]]);
+    assert.equal((await server.status()).announcements[0].pinned, true);
+    await server.admin(`/announcements/${pinned.id}/pin`, 'PUT', { pinned: false });
+    list = (await (await server.device(device, '/snapshot')).json()).announcements;
+    assert.equal(list.find(item => item.title === 'Always here').pinned, false);
+    assert.equal((await server.admin('/announcements/nope/pin', 'PUT', { pinned: true }, true)).status, 404);
+    const audit = (await server.status()).audit.map(item => item.action);
+    assert.ok(audit.includes('announcement.pinned') && audit.includes('announcement.unpinned'));
+  });
+
+  test('the administrator can see and set the account a browser uses; same-named browsers are told apart', async () => {
+    const one = await server.enroll(randomDeviceId(), 'default');
+    const two = await server.enroll(randomDeviceId(), 'default');
+    await server.admin('/profiles', 'POST', { name: 'Anuwat', domain: 'assign.example', enabled: true, cookies: [cookie('s', 'a', 'assign.example')] });
+    const napon = await server.admin('/profiles', 'POST', { name: 'Napon', domain: 'assign.example', enabled: true, cookies: [cookie('s', 'n', 'assign.example')] });
+    const usedBy = async name => (await server.status()).profiles.find(item => item.name === name).usedBy;
+    assert.ok((await usedBy('Anuwat')).includes(`default (${one.id.slice(0, 6)})`));
+    const accounts = (await server.status()).devices.find(item => item.id === one.id).accounts.find(item => item.domain === 'assign.example');
+    assert.deepEqual(accounts.options.map(item => item.name), ['Anuwat', 'Napon']);
+    await assert.rejects(server.admin(`/devices/${one.id}/commands`, 'POST', { type: 'switch-account', argument: 'missing' }), /not available/);
+    const command = await server.admin(`/devices/${one.id}/commands`, 'POST', { type: 'switch-account', argument: napon.id });
+    // The browser runs the switch itself; when it does, the dashboard follows.
+    assert.deepEqual((await (await server.device(one, '/snapshot')).json()).commands.map(item => [item.type, item.argument]), [['switch-account', napon.id]]);
+    await server.device(one, `/accounts/${napon.id}/switch`, 'POST');
+    await server.device(one, `/commands/${command.id}/ack`, 'POST');
+    assert.ok((await usedBy('Napon')).includes(`default (${one.id.slice(0, 6)})`));
+    assert.ok((await usedBy('Anuwat')).includes(`default (${two.id.slice(0, 6)})`));
+    assert.equal((await server.status()).devices.find(item => item.id === one.id).accounts[0].activeId, napon.id);
+  });
+
+  test('backups can be deleted in bulk or purged with confirmation', async () => {
+    for (let index = 0; index < 3; index++) {
+      await server.admin('/profiles', 'POST', { name: `B${index}`, domain: `b${index}.example`, enabled: true, cookies: [] });
+      await server.admin('/profiles/purge', 'POST', { confirm: true });
+      await sleep(1100);
+    }
+    let backups = (await server.status()).backups;
+    assert.ok(backups.length >= 3);
+    assert.equal((await server.admin('/backups/delete', 'POST', { names: [] }, true)).status, 400);
+    assert.equal((await server.admin('/backups/delete', 'POST', { names: ['../state.json'] }, true)).status, 400);
+    const result = await server.admin('/backups/delete', 'POST', { names: backups.slice(0, 2).map(item => item.name) });
+    assert.equal(result.deleted, 2);
+    backups = (await server.status()).backups;
+    assert.equal((await server.admin('/backups/purge', 'POST', { confirm: false }, true)).status, 400);
+    assert.equal((await server.admin('/backups/purge', 'POST', { confirm: true })).deleted, backups.length);
+    assert.deepEqual((await server.status()).backups, []);
+    assert.ok((await server.status()).audit.some(item => item.action === 'backups.purged'));
   });
 });

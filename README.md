@@ -208,7 +208,7 @@ docker compose up -d --build
 ### Upgrading
 
 - The server reads vaults written by earlier versions as they are; there is nothing to migrate. Settings added later start with the previous behavior: profiles and announcements go to all browsers, the administrator token still enrolls browsers, and proxy TLS is off.
-- Older browsers keep working against a newer server. They do not show announcements, keep polling instead of receiving live updates, and (before 1.1) do not remove cookies from profiles they lose access to. Browsers before 1.4 cannot switch accounts and always use a site's first account, browsers before 1.5 do not ask for the unlock code, and browsers before 1.7 ignore actions, browsing controls and the idle lock.
+- Older browsers keep working against a newer server. They do not show announcements, keep polling instead of receiving live updates, and (before 1.1) do not remove cookies from profiles they lose access to. Browsers before 1.4 cannot switch accounts and always use a site's first account, browsers before 1.5 do not ask for the unlock code, and browsers before 1.7 ignore actions, browsing controls and the idle lock, and browsers before 1.8 let users dismiss pinned announcements and ignore Switch.
 - Update every browser that uses Managed proxy mode to 1.2 or newer before turning on proxy TLS.
 - With the server released alongside browser 1.3, **Browser connection mode** defaults to requiring the managed proxy with Strict privacy, also on existing installations. Enable the proxy before upgrading the server, or set the mode to **Let each browser choose** afterwards, otherwise 1.3 browsers stop loading websites until the proxy is on. Browsers before 1.3 keep their own setting.
 - Restarting the server briefly interrupts open proxy connections; browsers reconnect and resume syncing on their own.
@@ -267,7 +267,7 @@ pnpm start --profile=WB3
 
 On Windows, `Open-WB1.cmd`, `Open-WB2.cmd`, and `Open-WB3.cmd` in the repository root start the WB1, WB2, and WB3 profiles after the dependencies are installed.
 
-On Linux, make the AppImage executable and pass the profile name the same way (`chmod +x Shared-Browser-*.AppImage`, then `./Shared-Browser-1.7.0-linux-x86_64.AppImage --profile=WB1`). AppImages need FUSE; on Ubuntu 22.04 and newer install `libfuse2` (`libfuse2t64` on 24.04). Started from the AppImage, the client updates itself.
+On Linux, make the AppImage executable and pass the profile name the same way (`chmod +x Shared-Browser-*.AppImage`, then `./Shared-Browser-1.8.0-linux-x86_64.AppImage --profile=WB1`). AppImages need FUSE; on Ubuntu 22.04 and newer install `libfuse2` (`libfuse2t64` on 24.04). Started from the AppImage, the client updates itself.
 
 Each profile name gets its own browser storage, device identity, encrypted device token, and offline cache. All profiles connect to the same management server and shared vault.
 
@@ -408,28 +408,31 @@ Set **Minimum browser version** in Browser settings (for example `1.6.0`) to mak
 
 Under **Notifications**, paste a Discord webhook URL (in Discord: Edit channel → Integrations → Webhooks → Copy webhook URL), a Telegram bot token and chat ID, and/or a LINE Messaging API channel access token and user or group ID, choose the events, and use **Send test**. The secrets are stored encrypted in the vault, are shown only as `••••••••`, and are never sent to browsers; leave a field unchanged to keep it, or clear it to remove that channel.
 
-| Event | When |
-| --- | --- |
-| A shared session is signed out | The primary browser no longer holds a profile's sign-in cookie (it signed out, or the site ended the session) |
-| A shared session expires soon | A profile's sign-in cookie expires within the warning period (3 days by default) |
-| A browser goes offline | A browser that was in use this week has not connected for the set time (30 minutes by default) |
-| A new browser enrolls | |
-| A browser reaches its proxy quota | |
-| A wrong unlock code is entered | |
-| A backup fails | The local backup or the offsite copy |
+Alerts are grouped in the dashboard; the ones marked ★ are on by default:
+
+- **Security**: failed administrator sign-in ★, failed browser enrollment ★, wrong unlock code ★, browser unlocked.
+- **Sessions**: a shared session signed out ★ (the primary browser no longer holds a profile's sign-in cookie), a shared session expires soon ★ (within the warning period, 3 days by default), a browser switched account, an account added ★, profiles created, changed or deleted ★, the vault purged ★.
+- **Browsers**: a new browser enrolled ★, a browser offline ★ (a browser that was in use this week has not connected for the set time, 30 minutes by default) and back online, a browser revoked ★, restored or deleted ★, actions sent to and run by a browser, browser settings and limits changed, the proxy quota reached ★.
+- **Administration**: shared settings, the unlock code ★ and notification settings changed, announcements, bookmarks and enrollment codes, the vault exported ★, imported ★ or restored ★.
+- **Backups**: a backup failed ★ (locally or offsite), copied offsite, deleted, or all backups purged ★.
+
+Each alert says what happened and lists the details it has: the browser (its name, the start of its ID and its version, since several browsers can share a name), who did it (the administrator, or someone who was not signed in), the site or account, details, the IP address, and the time in the time zone of the allowed hours (Asia/Bangkok unless changed). In Discord it is a card coloured by severity whose timestamp each reader sees in their own time zone.
 
 The same alert is sent at most once every 10 minutes. Every alert also appears in the **Activity** log.
 
 ### Session health
 
-Each profile shows whether it is signed in and when its sign-in expires (**signed in · 12 d left**, **expires in 2 d**, **signed out**). The server treats long-lived HttpOnly cookies as the sign-in and ignores short-lived ones such as anti-bot cookies; if it guesses wrong for a site, name the sign-in cookie in the profile (for example `user_session` for GitHub).
+Each profile shows whether it is signed in and when its sign-in expires (**signed in · 12 d left**, **expires in 2 d**, **signed out**). The date is the expiry of the sign-in cookie as the primary browser last shared it; sites such as GitHub extend it while the account is in use, so it moves forward each time the primary browser uses that account. The server treats long-lived HttpOnly cookies as the sign-in and ignores short-lived ones such as anti-bot cookies; if it guesses wrong for a site, name the sign-in cookie in the profile (for example `user_session` for GitHub).
 
 ### Managing a browser
 
 **Manage** in the browsers table opens a panel for that browser:
 
 - **Actions** run once, within a second or two when the browser is online, or the next time it connects (they expire after a day): **Lock now** (needs the unlock code), **Close all tabs**, **Restart browser**, **Open** a page, and **Clear cookies** for a site. Waiting actions are listed and can be cancelled. Clearing a site's cookies on the primary browser also removes that site's session from the vault.
+- **Accounts**: for each site with several accounts, the account this browser uses, and **Switch** to change it. The browser switches itself (like choosing the account from its 👤 button), so its cookies are replaced safely; this needs 1.8.
 - **Settings for this browser**: its own home page, its own site filter, and whether it may be used outside the allowed hours.
+
+A profile's **used by** lists the browsers that have that account selected. A browser that signed in to a site by typing the password, rather than through 👤 or Switch, still counts under the account it has selected, because the server only knows what was shared. Browsers with the same name are shown with the start of their ID.
 
 ### Browsing controls
 
@@ -456,6 +459,10 @@ The dashboard's **Send an announcement** section sends a message to every browse
 
 The banner is plain text: nothing in an announcement is interpreted as HTML. **Open link** opens the link in a new tab, and **×** dismisses the banner on that browser. The dismissal is remembered across restarts and reported to the server, so the dashboard lists which browsers have dismissed each announcement. Deleting an announcement removes its banner everywhere; expired announcements disappear from browsers and stay listed in the dashboard for a week.
 
+### Announcements: pinning
+
+Tick **Pin** when sending an announcement, or use **Pin** / **Unpin** on one already sent. A pinned announcement is listed first and shown all the time, without a way to dismiss it, until it is unpinned, deleted or expires (browsers 1.8 and newer; older ones treat it as a normal announcement).
+
 ### Audit log
 
 The dashboard's **Activity** section lists enrollments, enrollment codes, settings and proxy changes, announcements, profile changes and bulk deletions, bookmark and device changes, vault exports, imports and restores, and failed administrator sign-ins or enrollments (at most one entry per address every five minutes). Entries are also written to `audit.jsonl` in the data directory and to the server log. Set `SHARED_BROWSER_TRUST_FORWARDED_HEADERS=true` behind a reverse proxy so the recorded address is the client's rather than the proxy's.
@@ -466,7 +473,9 @@ The server copies `state.json` into `backups/` at most once an hour (`SHARED_BRO
 
 **Offsite copy** (under Vault backups) uploads every backup to S3-compatible object storage such as DigitalOcean Spaces (`https://sgp1.digitaloceanspaces.com`, region `sgp1`), AWS S3 (`https://s3.<region>.amazonaws.com`) or MinIO, into the bucket and folder you choose. Create an access key limited to that bucket. The secret key is stored encrypted. The status line shows the last upload or the last error, **Upload latest backup now** tests the settings, and a failed upload raises a backup alert. Old copies are not deleted by the server; set a lifecycle rule on the bucket (for example, delete after 30 days).
 
-The dashboard's **Vault backups** section lists the backups, restores any of them, and deletes the ones you no longer want (a deleted backup cannot be restored). It can also export the current vault or import an exported one. Every import or restore first saves the current vault as another backup.
+The dashboard's **Vault backups** section lists the backups, restores any of them, and deletes the ones you no longer want: one at a time, by ticking several and using **Delete selected**, or all of them with **Purge all backups** (confirmed by typing `PURGE`). A deleted backup cannot be restored.
+
+Long lists in the dashboard (activity, backups, profiles, browsers and announcements) are shown one page at a time, with 10 to 100 rows per page; activity, profiles and browsers can also be searched. The activity list holds the latest 500 entries; the full history is in `audit.jsonl`. It can also export the current vault or import an exported one. Every import or restore first saves the current vault as another backup.
 
 Backups and exports keep cookie values encrypted with `SHARED_BROWSER_DATA_KEY`, so they can only be restored on a server with the same data key; a vault written with another key is refused. They do contain device token hashes and enrollment state, so store them as carefully as the data volume.
 
