@@ -167,12 +167,12 @@ public sealed class BrowserSettings
 {
     public string HomePage { get; set; } = "";
     public string SearchUrl { get; set; } = "https://duckduckgo.com/?q=%s";
-    /// <summary>The first primary browser, kept for browsers before 1.9, which know only one.</summary>
-    public string PrimaryDeviceId { get; set; } = "";
     /// <summary>
-    /// Browsers whose sign-ins are shared. Each one publishes into the account it uses, so several primaries
-    /// can look after different sites or accounts.
+    /// The one browser that onboards sessions: its sign-ins create profiles and accounts and it updates the
+    /// accounts it uses. Other browsers update a profile only when the profile lists them as editors.
     /// </summary>
+    public string PrimaryDeviceId { get; set; } = "";
+    /// <summary>Always the primary browser alone (or empty); kept because browsers 1.9 read this list.</summary>
     public List<string> PrimaryDeviceIds { get; set; } = [];
     public bool AutoShareCookies { get; set; } = true;
     /// <summary>
@@ -246,6 +246,8 @@ public sealed class SessionProfile
 {
     /// <summary>Optional name of the cookie that holds the sign-in, used for session health and alerts.</summary>
     public string SessionCookie { get; set; } = "";
+    /// <summary>Browsers besides the primary one that may update this profile's cookies (while they use it).</summary>
+    public List<string> EditorDeviceIds { get; set; } = [];
     public string Id { get; set; } = "";
     public string Name { get; set; } = "";
     public string Domain { get; set; } = "";
@@ -342,6 +344,8 @@ public sealed record SyncResponse(long Revision, int ChangedCookies, SharedSnaps
 public sealed record SharedSnapshot(long Revision, DateTimeOffset UpdatedAt, BrowserSettings Settings, List<SessionProfile> Profiles, List<SharedBookmark> Bookmarks, List<ClientAnnouncement> Announcements)
 {
     public List<ClientAccount> Accounts { get; init; } = [];
+    /// <summary>Sites whose cookies this browser may update: the sites of the accounts it uses and edits.</summary>
+    public List<string> EditableDomains { get; init; } = [];
     /// <summary>Actions waiting for this browser; it acknowledges each one after running it.</summary>
     public List<ClientCommand> Commands { get; init; } = [];
 }

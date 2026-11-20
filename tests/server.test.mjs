@@ -962,46 +962,54 @@ describe('detailed alerts, pinned announcements, account assignment and backup c
   });
 });
 
-describe('several primary browsers, per-browser unlock code and session expiry for browsers', () => {
+describe('cookie editors, per-browser unlock code and session expiry for browsers', () => {
   let server;
   before(async () => { server = await startServer(); });
   after(async () => { await server?.stop(); });
   const now = () => Math.floor(Date.now() / 1000);
 
-  test('each primary browser publishes into the account it uses; an older dashboard can still set one', async () => {
-    const a = await server.enroll(randomDeviceId(), 'primary-a');
-    const b = await server.enroll(randomDeviceId(), 'primary-b');
+  test('one primary onboards sessions; chosen browsers may update a profile while they use it', async () => {
+    const primary = await server.enroll(randomDeviceId(), 'onboarding');
+    const editor = await server.enroll(randomDeviceId(), 'editor');
     const reader = await server.enroll(randomDeviceId(), 'reader');
-    await server.settings({ primaryDeviceIds: [a.id, b.id], primaryDeviceId: a.id });
+    // Only one primary: a list sent by the 1.9 dashboard is ignored in favour of primaryDeviceId.
+    await server.settings({ primaryDeviceIds: [primary.id, editor.id], primaryDeviceId: primary.id });
     let settings = (await server.status()).settings;
-    assert.deepEqual([settings.primaryDeviceIds, settings.primaryDeviceId], [[a.id, b.id], a.id]);
-    assert.deepEqual((await server.status()).devices.filter(item => item.primary).map(item => item.name).sort(), ['primary-a', 'primary-b']);
-    const one = await server.admin('/profiles', 'POST', { name: 'one', domain: 'multi.example', enabled: true, cookies: [] });
-    const two = await server.admin('/profiles', 'POST', { name: 'two', domain: 'multi.example', enabled: true, cookies: [] });
-    await server.device(b, `/accounts/${two.id}/switch`, 'POST');
-    const push = (device, value) => server.device(device, '/sync', 'POST', { pageUrl: 'https://multi.example/', complete: true, cookies: [cookie('s', value, 'multi.example')] });
-    await push(a, 'from-a');
-    await push(b, 'from-b');
-    await push(reader, 'from-reader');
-    const profiles = (await server.status()).profiles.filter(item => item.domain === 'multi.example');
-    assert.deepEqual(profiles.map(item => [item.name, item.cookies.length, item.primaries]), [['one', 1, ['primary-a']], ['two', 1, ['primary-b']]]);
-    assert.equal((await (await server.device(reader, '/snapshot')).json()).profiles.find(item => item.domain === 'multi.example').cookies[0].value, 'from-a');
-    // Both primaries on one account are flagged.
-    await server.device(b, `/accounts/${one.id}/switch`, 'POST');
-    assert.deepEqual((await server.status()).profiles.find(item => item.id === one.id).primaries.sort(), ['primary-a', 'primary-b']);
-    // Any primary may add an account; the reader may not.
-    assert.equal((await server.device(b, '/accounts', 'POST', { name: 'three', pageUrl: 'https://multi.example/' })).status, 201);
-    assert.equal((await server.device(reader, '/accounts', 'POST', { name: 'four', pageUrl: 'https://multi.example/' })).status, 403);
-    // A script that only knows primaryDeviceId replaces the list; clearing it clears the list.
-    await server.settings({ primaryDeviceId: reader.id });
-    settings = (await server.status()).settings;
-    assert.deepEqual(settings.primaryDeviceIds, [reader.id]);
-    await server.settings({ primaryDeviceIds: [a.id, b.id], primaryDeviceId: a.id });
-    await server.admin(`/devices/${a.id}`, 'DELETE');
-    settings = (await server.status()).settings;
-    assert.deepEqual([settings.primaryDeviceIds, settings.primaryDeviceId], [[b.id], b.id]);
-    const unknown = randomDeviceId();
-    await assert.rejects(server.settings({ primaryDeviceIds: [b.id, unknown], primaryDeviceId: b.id }), /active enrolled/);
+    assert.deepEqual([settings.primaryDeviceId, settings.primaryDeviceIds], [primary.id, [primary.id]]);
+    const push = (device, host, value) => server.device(device, '/sync', 'POST', { pageUrl: `https://${host}/`, complete: true, cookies: [cookie('s', value, host)] });
+    // The primary onboards a new site; nobody else can.
+    await push(primary, 'edit.example', 'from-primary');
+    await push(editor, 'other-edit.example', 'from-editor');
+    assert.ok(await server.profile('edit.example'));
+    assert.equal(await server.profile('other-edit.example'), undefined);
+    const value = async () => (await server.profile('edit.example')).cookies.length && (await (await server.device(reader, '/snapshot')).json()).profiles.find(item => item.domain === 'edit.example').cookies[0].value;
+    // Without the role an update is ignored; with it the editor's sign-in reaches everyone.
+    await push(editor, 'edit.example', 'from-editor');
+    assert.equal(await value(), 'from-primary');
+    const profile = await server.profile('edit.example');
+    await assert.rejects(server.admin(`/profiles/${profile.id}`, 'PUT', { name: profile.name, domain: profile.domain, enabled: true, editorDeviceIds: [randomDeviceId()], cookies: profile.cookies.map(item => ({ ...item, value: '' })) }), /not enrolled/);
+    await server.admin(`/profiles/${profile.id}`, 'PUT', { name: profile.name, domain: profile.domain, enabled: true, editorDeviceIds: [editor.id], cookies: profile.cookies.map(item => ({ ...item, value: '' })) });
+    assert.deepEqual((await (await server.device(editor, '/snapshot')).json()).editableDomains, ['edit.example']);
+    assert.deepEqual((await (await server.device(reader, '/snapshot')).json()).editableDomains, []);
+    await push(editor, 'edit.example', 'from-editor');
+    assert.equal(await value(), 'from-editor');
+    await push(reader, 'edit.example', 'from-reader');
+    assert.equal(await value(), 'from-editor');
+    const status = await server.status();
+    assert.deepEqual(status.profiles.find(item => item.domain === 'edit.example').editors, ['editor']);
+    assert.deepEqual(status.devices.find(item => item.id === editor.id).editorOf, ['edit.example']);
+    // An editor may not add accounts, and only edits the account it uses.
+    assert.equal((await server.device(editor, '/accounts', 'POST', { name: 'second', pageUrl: 'https://edit.example/' })).status, 403);
+    const second = await server.admin('/profiles', 'POST', { name: 'second', domain: 'edit.example', enabled: true, cookies: [] });
+    await server.device(editor, `/accounts/${second.id}/switch`, 'POST');
+    assert.deepEqual((await (await server.device(editor, '/snapshot')).json()).editableDomains, []);
+    await push(editor, 'edit.example', 'ignored');
+    assert.equal((await server.status()).profiles.find(item => item.id === second.id).cookies.length, 0);
+    // An editor of a profile limited to some browsers must be one of them.
+    await assert.rejects(server.admin(`/profiles/${profile.id}`, 'PUT', { name: profile.name, domain: profile.domain, enabled: true, shareWithAllDevices: false, allowedDeviceIds: [reader.id], editorDeviceIds: [editor.id], cookies: [] }), /must also be among/);
+    // Deleting the editor removes the role.
+    await server.admin(`/devices/${editor.id}`, 'DELETE');
+    assert.deepEqual((await server.profile('edit.example')).editorDeviceIds, []);
   });
 
   test('the unlock code can be switched on or off for one browser', async () => {
@@ -1023,7 +1031,7 @@ describe('several primary browsers, per-browser unlock code and session expiry f
 
   test('browsers receive when each account sign-in expires', async () => {
     const primary = await server.enroll(randomDeviceId(), 'expiry-primary');
-    await server.settings({ primaryDeviceIds: [primary.id], primaryDeviceId: primary.id });
+    await server.settings({ primaryDeviceId: primary.id });
     await server.device(primary, '/sync', 'POST', { pageUrl: 'https://soon.example/', complete: true, cookies: [cookie('user_session', 'x', 'soon.example', { expiresAt: now() + 2 * 86400 })] });
     await server.device(primary, '/sync', 'POST', { pageUrl: 'https://later.example/', complete: true, cookies: [cookie('user_session', 'y', 'later.example', { expiresAt: now() + 20 * 86400 })] });
     const accounts = (await (await server.device(primary, '/snapshot')).json()).accounts;

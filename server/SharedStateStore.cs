@@ -116,8 +116,10 @@ public sealed partial class SharedStateStore
             // This browser's own unlock code setting; it needs a code to have been set.
             if (view.UnlockCode is { } unlock) settings.ClientLock.Enabled = unlock && settings.ClientLock.Hash.Length > 0;
         }
+        var editable = profiles.Where(profile => profile.Enabled && profile.EditorDeviceIds.Contains(deviceId)).Select(profile => profile.Domain).Distinct().ToList();
         return snapshot with
         {
+            EditableDomains = editable,
             Settings = settings,
             Profiles = profiles,
             Announcements = snapshot.Announcements.Where(item => item.ShareWithAllDevices || item.AllowedDeviceIds.Contains(deviceId)).ToList(),
@@ -139,14 +141,14 @@ public sealed partial class SharedStateStore
         return PickAccount(usable, device?.ActiveProfiles.GetValueOrDefault(enabled[0].Domain));
     }
 
-    private bool IsPrimaryLocked(string deviceId) => _state.Settings.PrimaryDeviceIds.Contains(deviceId.ToLowerInvariant());
+    private bool IsPrimaryLocked(string deviceId) => string.Equals(_state.Settings.PrimaryDeviceId, deviceId, StringComparison.OrdinalIgnoreCase);
 
-    /// <summary>With automatic sharing and no primary browser yet, the first browser that shares becomes one.</summary>
+    /// <summary>With automatic sharing and no primary browser yet, the first browser that shares becomes it.</summary>
     private bool ClaimPrimaryLocked(string deviceId)
     {
-        if (!_state.Settings.AutoShareCookies || _state.Settings.PrimaryDeviceIds.Count > 0) return false;
-        _state.Settings.PrimaryDeviceIds = [deviceId];
+        if (!_state.Settings.AutoShareCookies || _state.Settings.PrimaryDeviceId.Length > 0) return false;
         _state.Settings.PrimaryDeviceId = deviceId;
+        _state.Settings.PrimaryDeviceIds = [deviceId];
         return true;
     }
 
@@ -253,8 +255,8 @@ public sealed partial class SharedStateStore
                     // False when a sharing list is in use and does not cover the profile: the primary browser no longer updates it.
                     listed = ShareableSiteLocked(profile.Domain) is not null,
                     usedBy = _state.Devices.Where(device => !device.Revoked && ActiveAccountLocked(device, _state.Profiles.Where(item => item.Domain == profile.Domain), true) == profile).Select(DisplayName).ToList(),
-                    // Primary browsers that publish into this account. Two of them overwrite each other's sign-in.
-                    primaries = _state.Devices.Where(device => !device.Revoked && _state.Settings.PrimaryDeviceIds.Contains(device.Id) && ActiveAccountLocked(device, _state.Profiles.Where(item => item.Domain == profile.Domain), false) == profile).Select(DisplayName).ToList(),
+                    profile.EditorDeviceIds,
+                    editors = _state.Devices.Where(device => profile.EditorDeviceIds.Contains(device.Id)).Select(DisplayName).ToList(),
                     profile.Id,
                     profile.Name,
                     profile.Domain,
@@ -287,7 +289,8 @@ public sealed partial class SharedStateStore
                         }).Where(site => site.options.Count > 0).ToList(),
                     pendingCommands = device.Commands.Where(command => command.CreatedAt > now - CommandLifetime).Select(CloneCommand).ToList(),
                     usage = usage(device.Id),
-                    primary = _state.Settings.PrimaryDeviceIds.Contains(device.Id),
+                    primary = IsPrimaryLocked(device.Id),
+                    editorOf = _state.Profiles.Where(profile => profile.EditorDeviceIds.Contains(device.Id)).Select(ProfileLabel).ToList(),
                     device.UnlockCode,
                     live = _liveConnections.GetValueOrDefault(device.Id) > 0
                 }).ToList(),
@@ -467,12 +470,7 @@ public sealed partial class SharedStateStore
         var searchUrl = (settings.SearchUrl ?? "").Trim();
         if (searchUrl.Length > 0 && (!searchUrl.Contains("%s", StringComparison.Ordinal) || !Uri.TryCreate(searchUrl.Replace("%s", "test", StringComparison.Ordinal), UriKind.Absolute, out var search) || search.Scheme is not ("http" or "https") || searchUrl.Length > 500))
             throw new InvalidOperationException("Search URL must be empty or an HTTP or HTTPS URL containing %s");
-        // The dashboard sends the list. A lone PrimaryDeviceId that differs from the list's first entry comes from
-        // an older dashboard or script that only knows one primary browser, and replaces the list.
-        var primaryIds = (settings.PrimaryDeviceIds ?? []).Where(id => !string.IsNullOrWhiteSpace(id)).Select(NormalizeId).Distinct().ToList();
-        var legacyPrimary = string.IsNullOrWhiteSpace(settings.PrimaryDeviceId) ? "" : NormalizeId(settings.PrimaryDeviceId);
-        if (legacyPrimary != (primaryIds.FirstOrDefault() ?? "")) primaryIds = legacyPrimary.Length == 0 ? [] : [legacyPrimary];
-        if (primaryIds.Count > 50) throw new InvalidOperationException("At most 50 primary browsers");
+        var primaryDeviceId = string.IsNullOrWhiteSpace(settings.PrimaryDeviceId) ? "" : NormalizeId(settings.PrimaryDeviceId);
         var policy = (settings.NetworkPolicy ?? "strict").Trim().ToLowerInvariant();
         if (!NetworkPolicies.Contains(policy)) throw new InvalidOperationException("Browser connection mode must be choice, managed or strict");
         var ipCheckUrl = (settings.IpCheckUrl ?? "").Trim();
@@ -492,14 +490,13 @@ public sealed partial class SharedStateStore
         await _gate.WaitAsync();
         try
         {
-            if (primaryIds.Any(id => !_state.Devices.Any(item => item.Id == id && !item.Revoked))) throw new InvalidOperationException("Primary browsers must be active enrolled devices");
+            if (primaryDeviceId.Length > 0 && !_state.Devices.Any(item => item.Id == primaryDeviceId && !item.Revoked)) throw new InvalidOperationException("Primary browser must be an active enrolled device");
             var before = _state.Settings;
             var changes = new List<string>();
             void Compare(string name, object? a, object? b) { if (!Equals(a, b)) changes.Add($"{name}: {a} → {b}"); }
             Compare("home page", before.HomePage, home?.AbsoluteUri ?? "");
             Compare("search URL", before.SearchUrl, searchUrl);
-            string Primaries(IEnumerable<string> ids) => ids.Any() ? string.Join(", ", ids.Select(DeviceName)) : "automatic";
-            Compare("primary browsers", Primaries(before.PrimaryDeviceIds), Primaries(primaryIds));
+            Compare("primary browser", before.PrimaryDeviceId.Length == 0 ? "automatic" : DeviceName(before.PrimaryDeviceId), primaryDeviceId.Length == 0 ? "automatic" : DeviceName(primaryDeviceId));
             Compare("automatic sharing", SharingSummary(before.AutoShareCookies, before.AutoShareScope), SharingSummary(settings.AutoShareCookies, scope));
             Compare("shared sites", string.Join(", ", before.AutoShareDomains), string.Join(", ", sharedSites));
             Compare("site filter", $"{before.SiteFilter.Mode} {string.Join(", ", before.SiteFilter.Domains)}".Trim(), $"{siteFilter.Mode} {string.Join(", ", siteFilter.Domains)}".Trim());
@@ -524,8 +521,8 @@ public sealed partial class SharedStateStore
             {
                 HomePage = home?.AbsoluteUri ?? "",
                 SearchUrl = searchUrl,
-                PrimaryDeviceId = primaryIds.FirstOrDefault() ?? "",
-                PrimaryDeviceIds = primaryIds,
+                PrimaryDeviceId = primaryDeviceId,
+                PrimaryDeviceIds = primaryDeviceId.Length > 0 ? [primaryDeviceId] : [],
                 AutoShareCookies = settings.AutoShareCookies,
                 AutoShareScope = scope,
                 AutoShareDomains = sharedSites,
@@ -684,11 +681,16 @@ public sealed partial class SharedStateStore
             var allowed = (input.AllowedDeviceIds ?? []).Select(NormalizeId).Distinct().ToList();
             if (allowed.Any(device => !_state.Devices.Any(item => item.Id == device))) throw new InvalidOperationException("A selected browser is not enrolled");
             if (!input.ShareWithAllDevices && allowed.Count == 0) throw new InvalidOperationException("Select at least one browser, or share the profile with all browsers");
+            var editors = (input.EditorDeviceIds ?? []).Select(NormalizeId).Distinct().ToList();
+            if (editors.Any(device => !_state.Devices.Any(item => item.Id == device))) throw new InvalidOperationException("A browser chosen to update cookies is not enrolled");
+            // An editor must receive the profile to be able to sign in to it.
+            if (!input.ShareWithAllDevices && editors.Any(device => !allowed.Contains(device))) throw new InvalidOperationException("Browsers that update the cookies must also be among the browsers the profile is shared with");
             var clean = new SessionProfile
             {
                 Id = id ?? Guid.NewGuid().ToString("N"),
                 Name = CleanName(input.Name, domain),
                 SessionCookie = CleanName(input.SessionCookie, "").Replace(" ", ""),
+                EditorDeviceIds = editors,
                 Domain = domain,
                 Enabled = input.Enabled,
                 ShareWithAllDevices = input.ShareWithAllDevices,
@@ -770,11 +772,13 @@ public sealed partial class SharedStateStore
             _state.Devices.Remove(device);
             _lastSeenPersisted.Remove(id);
             var bump = false;
-            if (_state.Settings.PrimaryDeviceIds.Remove(id))
+            if (_state.Settings.PrimaryDeviceId == id)
             {
-                _state.Settings.PrimaryDeviceId = _state.Settings.PrimaryDeviceIds.FirstOrDefault() ?? "";
+                _state.Settings.PrimaryDeviceId = "";
+                _state.Settings.PrimaryDeviceIds = [];
                 bump = true;
             }
+            foreach (var profile in _state.Profiles.Where(item => item.EditorDeviceIds.Remove(id))) bump = true;
             // A profile limited to browsers that no longer exist stays limited (to nobody) rather than
             // silently widening to every browser.
             foreach (var profile in _state.Profiles.Where(item => item.AllowedDeviceIds.Remove(id))) bump = true;
@@ -1108,7 +1112,7 @@ public sealed partial class SharedStateStore
         try
         {
             ClaimPrimaryLocked(deviceId);
-            if (!IsPrimaryLocked(deviceId)) throw new UnauthorizedAccessException("Only a primary browser can add accounts, because only primary browsers' sign-ins are saved");
+            if (!IsPrimaryLocked(deviceId)) throw new UnauthorizedAccessException("Only the primary browser can add accounts, because new sign-ins are onboarded there");
             var device = _state.Devices.First(item => item.Id == deviceId);
             var site = _state.Profiles.Where(item => DomainMatches(host, item.Domain)).GroupBy(item => item.Domain).OrderByDescending(group => group.Key.Length).FirstOrDefault()?.ToList() ?? [];
             var shareable = ShareableSiteLocked(host) ?? throw new InvalidOperationException($"{host} is not on the server's list of shared sites");
@@ -1151,11 +1155,9 @@ public sealed partial class SharedStateStore
             device.LastSeenAt = DateTimeOffset.UtcNow;
             var settingsChanged = false;
             if (ClaimPrimaryLocked(deviceId)) settingsChanged = true;
-            if (!IsPrimaryLocked(deviceId))
-            {
-                if (settingsChanged) { BumpRevision(); await SaveLockedAsync(); }
-                return 0;
-            }
+            // The primary browser onboards and updates sessions. Any other browser may only update the account it
+            // uses on a site, and only when that profile lists it as an editor.
+            var primary = IsPrimaryLocked(deviceId);
             var host = NormalizeDomain(page.Host);
             // With a sharing list, cookies of sites that are not on it are neither added nor updated.
             var shareable = ShareableSiteLocked(host);
@@ -1167,9 +1169,10 @@ public sealed partial class SharedStateStore
             var site = _state.Profiles.Where(item => DomainMatches(host, item.Domain)).GroupBy(item => item.Domain).OrderByDescending(group => group.Key.Length).FirstOrDefault();
             // Cookies go to the account this browser has switched to. A site whose profiles are all disabled
             // blocks sharing for its domain; it must not be shadowed by an automatic one.
-            var profile = site is null ? null : ActiveAccountLocked(device, site, false);
+            var profile = site is null ? null : ActiveAccountLocked(device, site, !primary);
+            if (!primary && profile is not null && !profile.EditorDeviceIds.Contains(deviceId)) profile = null;
             var profileCreated = false;
-            if (site is null && _state.Settings.AutoShareCookies && incomingCookies.Count > 0)
+            if (primary && site is null && _state.Settings.AutoShareCookies && incomingCookies.Count > 0)
             {
                 if (!ValidDomain(shareable)) return 0;
                 // A listed site keeps its subdomains in one profile (github.com also covers gist.github.com).
@@ -1352,9 +1355,10 @@ public sealed partial class SharedStateStore
         disk.Settings.MinimumClientVersion ??= "";
         disk.Settings.PrimaryDeviceId ??= "";
         disk.Settings.PrimaryDeviceIds ??= [];
-        // Vaults from before 1.9 have one primary browser.
-        if (disk.Settings.PrimaryDeviceIds.Count == 0 && disk.Settings.PrimaryDeviceId.Length > 0) disk.Settings.PrimaryDeviceIds = [disk.Settings.PrimaryDeviceId];
-        disk.Settings.PrimaryDeviceId = disk.Settings.PrimaryDeviceIds.FirstOrDefault() ?? "";
+        // There is one primary browser. Vaults saved by 1.9, which allowed several, keep the first.
+        if (disk.Settings.PrimaryDeviceId.Length == 0) disk.Settings.PrimaryDeviceId = disk.Settings.PrimaryDeviceIds.FirstOrDefault() ?? "";
+        disk.Settings.PrimaryDeviceIds = disk.Settings.PrimaryDeviceId.Length > 0 ? [disk.Settings.PrimaryDeviceId] : [];
+        foreach (var profile in disk.Profiles) profile.EditorDeviceIds ??= [];
         disk.Settings.ClientLock.Salt ??= "";
         disk.Settings.ClientLock.Hash ??= "";
         disk.Profiles ??= [];
@@ -1648,6 +1652,7 @@ public sealed partial class SharedStateStore
     {
         Id = profile.Id,
         SessionCookie = profile.SessionCookie,
+        EditorDeviceIds = [.. profile.EditorDeviceIds],
         Name = profile.Name,
         Domain = profile.Domain,
         Enabled = profile.Enabled,

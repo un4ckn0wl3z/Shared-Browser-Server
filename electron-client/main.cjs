@@ -214,6 +214,8 @@ function normalizeSnapshot(input) {
   if (typeof input.settings.searchUrl !== 'string') input.settings.searchUrl = fallback.settings.searchUrl;
   input.settings.proxy ||= fallback.settings.proxy;
   input.profiles = Array.isArray(input.profiles) ? input.profiles : [];
+  // Sites whose cookies this browser may update although it is not the primary browser (server 1.10+).
+  input.editableDomains = stringList(input.editableDomains).map(normalizedDomain).filter(Boolean);
   input.commands = Array.isArray(input.commands) ? input.commands.filter(item => item && typeof item.id === 'string' && typeof item.type === 'string') : [];
   const settings = input.settings;
   settings.siteFilter = settings.siteFilter && ['off', 'allow', 'block'].includes(settings.siteFilter.mode) ? { mode: settings.siteFilter.mode, domains: stringList(settings.siteFilter.domains).map(normalizedDomain) } : { mode: 'off', domains: [] };
@@ -472,7 +474,8 @@ function publishNavigationState() {
     canGoBack: tab?.view.webContents.navigationHistory.canGoBack() || false,
     canGoForward: tab?.view.webContents.navigationHistory.canGoForward() || false,
     account: accountState(currentUrl),
-    primary: Boolean(config.secrets.deviceToken) && isPrimary()
+    primary: Boolean(config.secrets.deviceToken) && isPrimary(),
+    editor: Boolean(config.secrets.deviceToken) && !isPrimary() ? editableDomains() : []
   });
 }
 
@@ -1065,8 +1068,21 @@ function domainSignature(cookies) {
 // The primary browser publishes one complete cookie list per cookie domain, and only for domains whose
 // cookies changed since the last publish. A domain whose cookies are all gone (sign-out) is published
 // as an empty list so the server removes them from the vault as well.
+function editableDomains() {
+  return config.secrets.cache.editableDomains || [];
+}
+
+// The primary browser publishes every site; an editor only the sites of the accounts it may update.
+function publishes() {
+  return isPrimary() || editableDomains().length > 0;
+}
+
+function mayPublish(domain) {
+  return isPrimary() || editableDomains().some(site => domainWithin(domain, site));
+}
+
 async function pushAllStoredCookies() {
-  if (!isPrimary() || !config.secrets.deviceToken || pushPending) return;
+  if (!publishes() || !config.secrets.deviceToken || pushPending) return;
   pushPending = true;
   return serialized(async () => {
     pushPending = false;
@@ -1083,7 +1099,10 @@ async function pushAllStoredCookies() {
       for (const [domain, values] of groups) {
         const signature = domainSignature(values);
         if (pushedDomains.get(domain) === signature) continue;
-        if (!/^[a-z0-9.-]+$/.test(domain)) continue;
+        if (!/^[a-z0-9.-]+$/.test(domain) || !mayPublish(domain)) continue;
+        // An editor reports a site as empty only after it published that site itself in this run, so a
+        // browser that never received a site's cookies cannot wipe them from the vault.
+        if (!values.length && !isPrimary() && !pushedDomains.get(domain)) continue;
         const complete = values.length <= MAX_COOKIES_PER_DOMAIN;
         await pushCookies(`https://${domain}/`, values.slice(0, MAX_COOKIES_PER_DOMAIN), complete);
         if (values.length) pushedDomains.set(domain, signature); else pushedDomains.delete(domain);
@@ -1118,7 +1137,7 @@ async function pushCookies(pageUrl, cookies, complete) {
 }
 
 function scheduleCookiePush() {
-  if (!isPrimary()) return;
+  if (!publishes()) return;
   clearTimeout(cookiePushTimer);
   cookiePushTimer = setTimeout(() => pushAllStoredCookies(), 900);
 }
