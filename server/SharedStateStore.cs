@@ -46,7 +46,7 @@ public sealed partial class SharedStateStore
     private static readonly IReadOnlyDictionary<string, string> NoChoices = new Dictionary<string, string>();
 
     /// <summary>What one browser's snapshot needs beyond the shared state (published with the snapshot).</summary>
-    private sealed record DeviceView(IReadOnlyDictionary<string, string> Choices, string HomePage, SiteFilterSettings? SiteFilter, bool ScheduleExempt, List<ClientCommand> Commands);
+    private sealed record DeviceView(IReadOnlyDictionary<string, string> Choices, string HomePage, SiteFilterSettings? SiteFilter, bool ScheduleExempt, List<ClientCommand> Commands, bool? UnlockCode);
 
     /// <summary>Raised (on the thread pool, never under the gate) for events the audit log and alerts should know about.</summary>
     public event Action<string, string, string>? Activity;
@@ -98,16 +98,23 @@ public sealed partial class SharedStateStore
             if (usable.Count == 0) { profiles.AddRange(site); continue; }
             var active = PickAccount(usable, choices.GetValueOrDefault(site.Key));
             profiles.Add(active);
-            accounts.AddRange(usable.Select(profile => new ClientAccount(profile.Id, profile.Name, profile.Domain, profile == active, profile.Cookies.Count)));
+            var warningDays = _notifications.ExpiryWarningDays;
+            accounts.AddRange(usable.Select(profile =>
+            {
+                var (session, expiresAt) = SessionState(profile, warningDays);
+                return new ClientAccount(profile.Id, profile.Name, profile.Domain, profile == active, profile.Cookies.Count) { Session = session, ExpiresAt = expiresAt };
+            }));
         }
         var settings = snapshot.Settings;
-        if (view is not null && (view.HomePage.Length > 0 || view.SiteFilter is not null || view.ScheduleExempt))
+        if (view is not null && (view.HomePage.Length > 0 || view.SiteFilter is not null || view.ScheduleExempt || view.UnlockCode is not null))
         {
             settings = CloneSettings(settings);
             settings.Proxy.CertificateSha256 = snapshot.Settings.Proxy.CertificateSha256;
             if (view.HomePage.Length > 0) settings.HomePage = view.HomePage;
             if (view.SiteFilter is not null) settings.SiteFilter = CloneSiteFilter(view.SiteFilter);
             if (view.ScheduleExempt) settings.Schedule.Enabled = false;
+            // This browser's own unlock code setting; it needs a code to have been set.
+            if (view.UnlockCode is { } unlock) settings.ClientLock.Enabled = unlock && settings.ClientLock.Hash.Length > 0;
         }
         return snapshot with
         {
@@ -132,7 +139,16 @@ public sealed partial class SharedStateStore
         return PickAccount(usable, device?.ActiveProfiles.GetValueOrDefault(enabled[0].Domain));
     }
 
-    private bool IsPrimaryLocked(string deviceId) => string.Equals(_state.Settings.PrimaryDeviceId, deviceId, StringComparison.OrdinalIgnoreCase);
+    private bool IsPrimaryLocked(string deviceId) => _state.Settings.PrimaryDeviceIds.Contains(deviceId.ToLowerInvariant());
+
+    /// <summary>With automatic sharing and no primary browser yet, the first browser that shares becomes one.</summary>
+    private bool ClaimPrimaryLocked(string deviceId)
+    {
+        if (!_state.Settings.AutoShareCookies || _state.Settings.PrimaryDeviceIds.Count > 0) return false;
+        _state.Settings.PrimaryDeviceIds = [deviceId];
+        _state.Settings.PrimaryDeviceId = deviceId;
+        return true;
+    }
 
     /// <summary>Completes when the revision differs from <paramref name="known"/>, or after the timeout.</summary>
     public async Task WaitForRevisionChangeAsync(long known, TimeSpan timeout, CancellationToken cancellationToken)
@@ -237,6 +253,8 @@ public sealed partial class SharedStateStore
                     // False when a sharing list is in use and does not cover the profile: the primary browser no longer updates it.
                     listed = ShareableSiteLocked(profile.Domain) is not null,
                     usedBy = _state.Devices.Where(device => !device.Revoked && ActiveAccountLocked(device, _state.Profiles.Where(item => item.Domain == profile.Domain), true) == profile).Select(DisplayName).ToList(),
+                    // Primary browsers that publish into this account. Two of them overwrite each other's sign-in.
+                    primaries = _state.Devices.Where(device => !device.Revoked && _state.Settings.PrimaryDeviceIds.Contains(device.Id) && ActiveAccountLocked(device, _state.Profiles.Where(item => item.Domain == profile.Domain), false) == profile).Select(DisplayName).ToList(),
                     profile.Id,
                     profile.Name,
                     profile.Domain,
@@ -269,7 +287,8 @@ public sealed partial class SharedStateStore
                         }).Where(site => site.options.Count > 0).ToList(),
                     pendingCommands = device.Commands.Where(command => command.CreatedAt > now - CommandLifetime).Select(CloneCommand).ToList(),
                     usage = usage(device.Id),
-                    primary = device.Id == _state.Settings.PrimaryDeviceId,
+                    primary = _state.Settings.PrimaryDeviceIds.Contains(device.Id),
+                    device.UnlockCode,
                     live = _liveConnections.GetValueOrDefault(device.Id) > 0
                 }).ToList(),
                 bookmarks = _state.Bookmarks.Select(CloneBookmark).ToList(),
@@ -448,7 +467,12 @@ public sealed partial class SharedStateStore
         var searchUrl = (settings.SearchUrl ?? "").Trim();
         if (searchUrl.Length > 0 && (!searchUrl.Contains("%s", StringComparison.Ordinal) || !Uri.TryCreate(searchUrl.Replace("%s", "test", StringComparison.Ordinal), UriKind.Absolute, out var search) || search.Scheme is not ("http" or "https") || searchUrl.Length > 500))
             throw new InvalidOperationException("Search URL must be empty or an HTTP or HTTPS URL containing %s");
-        var primaryDeviceId = string.IsNullOrWhiteSpace(settings.PrimaryDeviceId) ? "" : NormalizeId(settings.PrimaryDeviceId);
+        // The dashboard sends the list. A lone PrimaryDeviceId that differs from the list's first entry comes from
+        // an older dashboard or script that only knows one primary browser, and replaces the list.
+        var primaryIds = (settings.PrimaryDeviceIds ?? []).Where(id => !string.IsNullOrWhiteSpace(id)).Select(NormalizeId).Distinct().ToList();
+        var legacyPrimary = string.IsNullOrWhiteSpace(settings.PrimaryDeviceId) ? "" : NormalizeId(settings.PrimaryDeviceId);
+        if (legacyPrimary != (primaryIds.FirstOrDefault() ?? "")) primaryIds = legacyPrimary.Length == 0 ? [] : [legacyPrimary];
+        if (primaryIds.Count > 50) throw new InvalidOperationException("At most 50 primary browsers");
         var policy = (settings.NetworkPolicy ?? "strict").Trim().ToLowerInvariant();
         if (!NetworkPolicies.Contains(policy)) throw new InvalidOperationException("Browser connection mode must be choice, managed or strict");
         var ipCheckUrl = (settings.IpCheckUrl ?? "").Trim();
@@ -468,13 +492,14 @@ public sealed partial class SharedStateStore
         await _gate.WaitAsync();
         try
         {
-            if (primaryDeviceId.Length > 0 && !_state.Devices.Any(item => item.Id == primaryDeviceId && !item.Revoked)) throw new InvalidOperationException("Primary browser must be an active enrolled device");
+            if (primaryIds.Any(id => !_state.Devices.Any(item => item.Id == id && !item.Revoked))) throw new InvalidOperationException("Primary browsers must be active enrolled devices");
             var before = _state.Settings;
             var changes = new List<string>();
             void Compare(string name, object? a, object? b) { if (!Equals(a, b)) changes.Add($"{name}: {a} → {b}"); }
             Compare("home page", before.HomePage, home?.AbsoluteUri ?? "");
             Compare("search URL", before.SearchUrl, searchUrl);
-            Compare("primary browser", before.PrimaryDeviceId.Length == 0 ? "automatic" : DeviceName(before.PrimaryDeviceId), primaryDeviceId.Length == 0 ? "automatic" : DeviceName(primaryDeviceId));
+            string Primaries(IEnumerable<string> ids) => ids.Any() ? string.Join(", ", ids.Select(DeviceName)) : "automatic";
+            Compare("primary browsers", Primaries(before.PrimaryDeviceIds), Primaries(primaryIds));
             Compare("automatic sharing", SharingSummary(before.AutoShareCookies, before.AutoShareScope), SharingSummary(settings.AutoShareCookies, scope));
             Compare("shared sites", string.Join(", ", before.AutoShareDomains), string.Join(", ", sharedSites));
             Compare("site filter", $"{before.SiteFilter.Mode} {string.Join(", ", before.SiteFilter.Domains)}".Trim(), $"{siteFilter.Mode} {string.Join(", ", siteFilter.Domains)}".Trim());
@@ -499,7 +524,8 @@ public sealed partial class SharedStateStore
             {
                 HomePage = home?.AbsoluteUri ?? "",
                 SearchUrl = searchUrl,
-                PrimaryDeviceId = primaryDeviceId,
+                PrimaryDeviceId = primaryIds.FirstOrDefault() ?? "",
+                PrimaryDeviceIds = primaryIds,
                 AutoShareCookies = settings.AutoShareCookies,
                 AutoShareScope = scope,
                 AutoShareDomains = sharedSites,
@@ -744,9 +770,9 @@ public sealed partial class SharedStateStore
             _state.Devices.Remove(device);
             _lastSeenPersisted.Remove(id);
             var bump = false;
-            if (_state.Settings.PrimaryDeviceId == id)
+            if (_state.Settings.PrimaryDeviceIds.Remove(id))
             {
-                _state.Settings.PrimaryDeviceId = "";
+                _state.Settings.PrimaryDeviceId = _state.Settings.PrimaryDeviceIds.FirstOrDefault() ?? "";
                 bump = true;
             }
             // A profile limited to browsers that no longer exist stays limited (to nobody) rather than
@@ -916,6 +942,17 @@ public sealed partial class SharedStateStore
 
     private static string ProfileLabel(SessionProfile profile) => profile.Name == profile.Domain ? profile.Domain : $"{profile.Domain} ({profile.Name})";
 
+    private static (string State, DateTimeOffset? ExpiresAt) SessionState(SessionProfile profile, int warningDays)
+    {
+        if (profile.Cookies.Count == 0) return ("empty", null);
+        var signIn = SignInCookies(profile);
+        if (signIn.Count == 0) return ("signed-out", null);
+        var expiry = signIn.Where(cookie => cookie.ExpiresAt is not null).Select(cookie => cookie.ExpiresAt!.Value).DefaultIfEmpty(0).Min();
+        if (expiry == 0) return ("ok", null);
+        var expiresAt = DateTimeOffset.FromUnixTimeSeconds((long)expiry);
+        return (expiresAt - DateTimeOffset.UtcNow < TimeSpan.FromDays(warningDays) ? "expiring" : "ok", expiresAt);
+    }
+
     private static object SessionHealth(SessionProfile profile, int warningDays)
     {
         var lastUpdate = profile.Cookies.Select(cookie => (DateTimeOffset?)cookie.UpdatedAt).Max();
@@ -1026,10 +1063,11 @@ public sealed partial class SharedStateStore
         {
             var device = _state.Devices.FirstOrDefault(item => item.Id == deviceId);
             if (device is null) return null;
-            (device.HomePage, device.SiteFilter, device.ScheduleExempt) = (homePage, filter, request.ScheduleExempt);
+            if (request.UnlockCode == true && _state.Settings.ClientLock.Hash.Length == 0) throw new InvalidOperationException("Set an unlock code under Unlock code first");
+            (device.HomePage, device.SiteFilter, device.ScheduleExempt, device.UnlockCode) = (homePage, filter, request.ScheduleExempt, request.UnlockCode);
             BumpRevision();
             await SaveLockedAsync();
-            return $"{device.Name}: home page {(homePage.Length == 0 ? "shared" : homePage)}; site filter {(filter is null ? "shared" : $"{filter.Mode} {string.Join(", ", filter.Domains)}".Trim())}; {(request.ScheduleExempt ? "any time" : "allowed hours apply")}";
+            return $"{device.Name}: home page {(homePage.Length == 0 ? "shared" : homePage)}; site filter {(filter is null ? "shared" : $"{filter.Mode} {string.Join(", ", filter.Domains)}".Trim())}; {(request.ScheduleExempt ? "any time" : "allowed hours apply")}; unlock code {(request.UnlockCode is null ? "shared" : request.UnlockCode.Value ? "always" : "never")}";
         }
         finally { _gate.Release(); }
     }
@@ -1069,8 +1107,8 @@ public sealed partial class SharedStateStore
         await _gate.WaitAsync();
         try
         {
-            if (_state.Settings.AutoShareCookies && string.IsNullOrWhiteSpace(_state.Settings.PrimaryDeviceId)) _state.Settings.PrimaryDeviceId = deviceId;
-            if (!IsPrimaryLocked(deviceId)) throw new UnauthorizedAccessException("Only the primary browser can add accounts, because only its sign-ins are saved");
+            ClaimPrimaryLocked(deviceId);
+            if (!IsPrimaryLocked(deviceId)) throw new UnauthorizedAccessException("Only a primary browser can add accounts, because only primary browsers' sign-ins are saved");
             var device = _state.Devices.First(item => item.Id == deviceId);
             var site = _state.Profiles.Where(item => DomainMatches(host, item.Domain)).GroupBy(item => item.Domain).OrderByDescending(group => group.Key.Length).FirstOrDefault()?.ToList() ?? [];
             var shareable = ShareableSiteLocked(host) ?? throw new InvalidOperationException($"{host} is not on the server's list of shared sites");
@@ -1112,12 +1150,8 @@ public sealed partial class SharedStateStore
             var device = _state.Devices.First(item => item.Id == deviceId);
             device.LastSeenAt = DateTimeOffset.UtcNow;
             var settingsChanged = false;
-            if (_state.Settings.AutoShareCookies && string.IsNullOrWhiteSpace(_state.Settings.PrimaryDeviceId))
-            {
-                _state.Settings.PrimaryDeviceId = deviceId;
-                settingsChanged = true;
-            }
-            if (!string.Equals(_state.Settings.PrimaryDeviceId, deviceId, StringComparison.OrdinalIgnoreCase))
+            if (ClaimPrimaryLocked(deviceId)) settingsChanged = true;
+            if (!IsPrimaryLocked(deviceId))
             {
                 if (settingsChanged) { BumpRevision(); await SaveLockedAsync(); }
                 return 0;
@@ -1316,6 +1350,11 @@ public sealed partial class SharedStateStore
         disk.Settings.AutoShareScope = AutoShareScopes.Contains(disk.Settings.AutoShareScope) ? disk.Settings.AutoShareScope : "all";
         disk.Settings.AutoShareDomains ??= [];
         disk.Settings.MinimumClientVersion ??= "";
+        disk.Settings.PrimaryDeviceId ??= "";
+        disk.Settings.PrimaryDeviceIds ??= [];
+        // Vaults from before 1.9 have one primary browser.
+        if (disk.Settings.PrimaryDeviceIds.Count == 0 && disk.Settings.PrimaryDeviceId.Length > 0) disk.Settings.PrimaryDeviceIds = [disk.Settings.PrimaryDeviceId];
+        disk.Settings.PrimaryDeviceId = disk.Settings.PrimaryDeviceIds.FirstOrDefault() ?? "";
         disk.Settings.ClientLock.Salt ??= "";
         disk.Settings.ClientLock.Hash ??= "";
         disk.Profiles ??= [];
@@ -1367,7 +1406,7 @@ public sealed partial class SharedStateStore
             Revision = _state.Revision,
             UpdatedAt = _state.UpdatedAt,
             Settings = CloneSettings(_state.Settings),
-            Devices = _state.Devices.Select(device => new DeviceRecord { Id = device.Id, Name = device.Name, TokenHash = device.TokenHash, EnrolledAt = device.EnrolledAt, LastSeenAt = device.LastSeenAt, Revoked = device.Revoked, ClientVersion = device.ClientVersion, NetworkMode = device.NetworkMode, MaxConnections = device.MaxConnections, MonthlyQuotaGb = device.MonthlyQuotaGb, RateLimitMbps = device.RateLimitMbps, ActiveProfiles = new(device.ActiveProfiles), HomePage = device.HomePage, SiteFilter = device.SiteFilter is null ? null : CloneSiteFilter(device.SiteFilter), ScheduleExempt = device.ScheduleExempt, Commands = device.Commands.Select(CloneCommand).ToList() }).ToList(),
+            Devices = _state.Devices.Select(device => new DeviceRecord { Id = device.Id, Name = device.Name, TokenHash = device.TokenHash, EnrolledAt = device.EnrolledAt, LastSeenAt = device.LastSeenAt, Revoked = device.Revoked, ClientVersion = device.ClientVersion, NetworkMode = device.NetworkMode, MaxConnections = device.MaxConnections, MonthlyQuotaGb = device.MonthlyQuotaGb, RateLimitMbps = device.RateLimitMbps, ActiveProfiles = new(device.ActiveProfiles), HomePage = device.HomePage, SiteFilter = device.SiteFilter is null ? null : CloneSiteFilter(device.SiteFilter), ScheduleExempt = device.ScheduleExempt, UnlockCode = device.UnlockCode, Commands = device.Commands.Select(CloneCommand).ToList() }).ToList(),
             Profiles = _state.Profiles.Select(CloneProfile).ToList(),
             Bookmarks = _state.Bookmarks.Select(CloneBookmark).ToList(),
             EnrollmentCodes = _state.EnrollmentCodes.Select(code => new EnrollmentCode { Id = code.Id, CodeHash = code.CodeHash, Label = code.Label, CreatedAt = code.CreatedAt, ExpiresAt = code.ExpiresAt, UsedAt = code.UsedAt, UsedByDeviceId = code.UsedByDeviceId, Revoked = code.Revoked }).ToList(),
@@ -1422,7 +1461,7 @@ public sealed partial class SharedStateStore
         _deviceIndex = _state.Devices.ToDictionary(device => device.Id, device => new DeviceAuth(device.Id, device.Name, device.TokenHash, device.Revoked, device.MaxConnections, device.MonthlyQuotaGb, device.RateLimitMbps, device.ClientVersion));
         _deviceViews = _state.Devices.ToDictionary(device => device.Id, device => new DeviceView(
             new Dictionary<string, string>(device.ActiveProfiles), device.HomePage, device.SiteFilter is null ? null : CloneSiteFilter(device.SiteFilter), device.ScheduleExempt,
-            device.Commands.Select(command => new ClientCommand(command.Id, command.Type, command.Argument, command.CreatedAt)).ToList()));
+            device.Commands.Select(command => new ClientCommand(command.Id, command.Type, command.Argument, command.CreatedAt)).ToList(), device.UnlockCode));
         _notifications = CloneNotifications(_state.Notifications);
         _offsite = CloneOffsite(_state.OffsiteBackup);
         if (_state.Revision != _publishedRevision)
@@ -1535,7 +1574,7 @@ public sealed partial class SharedStateStore
     private static bool CookieEqual(SharedCookie a, SharedCookie b) =>
         a.Name == b.Name && a.Value == b.Value && a.Domain == b.Domain && a.Path == b.Path && a.Secure == b.Secure && a.HttpOnly == b.HttpOnly && a.SameSite == b.SameSite
         && (a.ExpiresAt is null) == (b.ExpiresAt is null) && Math.Abs((a.ExpiresAt ?? 0) - (b.ExpiresAt ?? 0)) < ExpiryTolerance;
-    private static BrowserSettings CloneSettings(BrowserSettings settings) => new() { HomePage = settings.HomePage, SearchUrl = settings.SearchUrl, PrimaryDeviceId = settings.PrimaryDeviceId, AutoShareCookies = settings.AutoShareCookies, AutoShareScope = settings.AutoShareScope, AutoShareDomains = [.. settings.AutoShareDomains], AllowAdminTokenEnrollment = settings.AllowAdminTokenEnrollment, NetworkPolicy = settings.NetworkPolicy, IpCheckUrl = settings.IpCheckUrl, Proxy = CloneProxySettings(settings.Proxy), ClientLock = CloneClientLock(settings.ClientLock), MinimumClientVersion = settings.MinimumClientVersion, SiteFilter = CloneSiteFilter(settings.SiteFilter), Schedule = CloneSchedule(settings.Schedule), DataControls = CloneDataControls(settings.DataControls) };
+    private static BrowserSettings CloneSettings(BrowserSettings settings) => new() { HomePage = settings.HomePage, SearchUrl = settings.SearchUrl, PrimaryDeviceId = settings.PrimaryDeviceId, PrimaryDeviceIds = [.. settings.PrimaryDeviceIds], AutoShareCookies = settings.AutoShareCookies, AutoShareScope = settings.AutoShareScope, AutoShareDomains = [.. settings.AutoShareDomains], AllowAdminTokenEnrollment = settings.AllowAdminTokenEnrollment, NetworkPolicy = settings.NetworkPolicy, IpCheckUrl = settings.IpCheckUrl, Proxy = CloneProxySettings(settings.Proxy), ClientLock = CloneClientLock(settings.ClientLock), MinimumClientVersion = settings.MinimumClientVersion, SiteFilter = CloneSiteFilter(settings.SiteFilter), Schedule = CloneSchedule(settings.Schedule), DataControls = CloneDataControls(settings.DataControls) };
     private static ClientLockSettings CloneClientLock(ClientLockSettings? value) => value is null ? new() : new() { Enabled = value.Enabled, Salt = value.Salt, Hash = value.Hash, Iterations = value.Iterations, ChangedAt = value.ChangedAt, IdleMinutes = value.IdleMinutes, LockOnSystemLock = value.LockOnSystemLock };
     private static SiteFilterSettings CloneSiteFilter(SiteFilterSettings? value) => value is null ? new() : new() { Mode = value.Mode, Domains = [.. value.Domains] };
     private static UsageSchedule CloneSchedule(UsageSchedule? value) => value is null ? new() : new() { Enabled = value.Enabled, Days = [.. value.Days], Start = value.Start, End = value.End, TimeZone = value.TimeZone };

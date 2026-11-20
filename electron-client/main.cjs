@@ -101,6 +101,7 @@ function defaultSnapshot() {
       homePage: '',
       searchUrl: DEFAULT_SEARCH_URL,
       primaryDeviceId: '',
+      primaryDeviceIds: [],
       autoShareCookies: true,
       proxy: { enabled: false, host: '127.0.0.1', port: 8899, allowedPorts: '80,443', bypassList: 'localhost;127.0.0.1' },
       clientLock: { enabled: false }
@@ -221,7 +222,11 @@ function normalizeSnapshot(input) {
   // Servers before 1.4 do not send accounts; the account button then stays hidden.
   input.accounts = Array.isArray(input.accounts)
     ? input.accounts.filter(item => item && typeof item.id === 'string' && typeof item.domain === 'string')
-      .map(item => ({ id: item.id, name: String(item.name || item.domain), domain: normalizedDomain(item.domain), active: item.active === true, cookieCount: Number(item.cookieCount) || 0 }))
+      .map(item => ({
+        id: item.id, name: String(item.name || item.domain), domain: normalizedDomain(item.domain), active: item.active === true, cookieCount: Number(item.cookieCount) || 0,
+        session: ['ok', 'expiring', 'signed-out', 'empty'].includes(item.session) ? item.session : 'ok',
+        expiresAt: item.expiresAt && !Number.isNaN(Date.parse(item.expiresAt)) ? item.expiresAt : null
+      }))
     : [];
   input.bookmarks = Array.isArray(input.bookmarks) ? input.bookmarks.filter(item => item && /^https?:\/\//i.test(item.url || '')) : [];
   input.announcements = Array.isArray(input.announcements)
@@ -466,7 +471,8 @@ function publishNavigationState() {
     loading: tab?.view.webContents.isLoading() || false,
     canGoBack: tab?.view.webContents.navigationHistory.canGoBack() || false,
     canGoForward: tab?.view.webContents.navigationHistory.canGoForward() || false,
-    account: accountState(currentUrl)
+    account: accountState(currentUrl),
+    primary: Boolean(config.secrets.deviceToken) && isPrimary()
   });
 }
 
@@ -835,7 +841,10 @@ function clientReport() {
 }
 
 async function installSnapshot(snapshot, previous) {
+  const lockWasOn = Boolean(previous?.settings?.clientLock?.enabled && previous.settings.clientLock.hash);
   config.secrets.cache = snapshot;
+  // Turning the unlock code on (for everyone or for this browser) locks it again, even if it was unlocked earlier in this run.
+  if (!lockWasOn && clientLock()) unlocked = false;
   const modeChanged = enforceNetworkPolicy();
   saveConfig();
   if (modeChanged) {
@@ -884,7 +893,10 @@ function scheduleSync() {
 
 function isPrimary() {
   const settings = config.secrets.cache.settings;
-  return (settings.autoShareCookies && !settings.primaryDeviceId) || settings.primaryDeviceId?.toLowerCase() === config.deviceId.toLowerCase();
+  // Servers since 1.9 list every primary browser; older ones name a single one.
+  const primaries = (Array.isArray(settings.primaryDeviceIds) && settings.primaryDeviceIds.length ? settings.primaryDeviceIds : [settings.primaryDeviceId])
+    .filter(Boolean).map(id => String(id).toLowerCase());
+  return (settings.autoShareCookies && !primaries.length) || primaries.includes(config.deviceId.toLowerCase());
 }
 
 function electronSameSite(value) {
@@ -1567,12 +1579,33 @@ function accountState(url) {
   const site = siteAccounts(url);
   if (!site.accounts.length) return null;
   const active = site.accounts.find(item => item.active) || site.accounts[0];
-  return { domain: site.domain, name: active.name, count: site.accounts.length };
+  warnExpiringSession(active);
+  return { domain: site.domain, name: active.name, count: site.accounts.length, session: active.session, expiresAt: active.expiresAt };
+}
+
+function expiryText(item) {
+  if (item.session === 'signed-out' || item.session === 'empty') return 'signed out';
+  if (!item.expiresAt) return '';
+  const date = new Date(item.expiresAt);
+  return `${item.session === 'expiring' ? 'expires' : 'until'} ${date.toLocaleDateString(undefined, { day: 'numeric', month: 'short' })} ${date.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })}`;
+}
+
+// A desktop notification, once per account and expiry date, when the shared sign-in expires soon.
+const expiryWarned = new Set();
+function warnExpiringSession(item) {
+  if (item.session !== 'expiring' || !item.expiresAt) return;
+  const key = `${item.id}|${item.expiresAt}`;
+  if (expiryWarned.has(key)) return;
+  expiryWarned.add(key);
+  const when = new Date(item.expiresAt).toLocaleString();
+  status(`The shared ${item.domain} sign-in (${item.name}) expires on ${when}`, true);
+  if (Notification.isSupported()) new Notification({ title: `${item.domain}: shared sign-in expires soon`, body: `${item.name} expires on ${when}. Ask your administrator to sign in again on the primary browser.` }).show();
 }
 
 function accountLabel(item) {
   const detail = item.cookieCount ? `${item.cookieCount} cookie${item.cookieCount === 1 ? '' : 's'}` : 'not signed in';
-  return `${item.name.slice(0, 60)} — ${detail}`.replace(/&/g, '&&');
+  const expiry = expiryText(item);
+  return `${item.session === 'expiring' ? '⏳ ' : ''}${item.name.slice(0, 60)} — ${detail}${expiry ? ` · ${expiry}` : ''}`.replace(/&/g, '&&');
 }
 
 function showAccountsMenu(position) {

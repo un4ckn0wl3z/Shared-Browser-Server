@@ -961,3 +961,76 @@ describe('detailed alerts, pinned announcements, account assignment and backup c
     assert.ok((await server.status()).audit.some(item => item.action === 'backups.purged'));
   });
 });
+
+describe('several primary browsers, per-browser unlock code and session expiry for browsers', () => {
+  let server;
+  before(async () => { server = await startServer(); });
+  after(async () => { await server?.stop(); });
+  const now = () => Math.floor(Date.now() / 1000);
+
+  test('each primary browser publishes into the account it uses; an older dashboard can still set one', async () => {
+    const a = await server.enroll(randomDeviceId(), 'primary-a');
+    const b = await server.enroll(randomDeviceId(), 'primary-b');
+    const reader = await server.enroll(randomDeviceId(), 'reader');
+    await server.settings({ primaryDeviceIds: [a.id, b.id], primaryDeviceId: a.id });
+    let settings = (await server.status()).settings;
+    assert.deepEqual([settings.primaryDeviceIds, settings.primaryDeviceId], [[a.id, b.id], a.id]);
+    assert.deepEqual((await server.status()).devices.filter(item => item.primary).map(item => item.name).sort(), ['primary-a', 'primary-b']);
+    const one = await server.admin('/profiles', 'POST', { name: 'one', domain: 'multi.example', enabled: true, cookies: [] });
+    const two = await server.admin('/profiles', 'POST', { name: 'two', domain: 'multi.example', enabled: true, cookies: [] });
+    await server.device(b, `/accounts/${two.id}/switch`, 'POST');
+    const push = (device, value) => server.device(device, '/sync', 'POST', { pageUrl: 'https://multi.example/', complete: true, cookies: [cookie('s', value, 'multi.example')] });
+    await push(a, 'from-a');
+    await push(b, 'from-b');
+    await push(reader, 'from-reader');
+    const profiles = (await server.status()).profiles.filter(item => item.domain === 'multi.example');
+    assert.deepEqual(profiles.map(item => [item.name, item.cookies.length, item.primaries]), [['one', 1, ['primary-a']], ['two', 1, ['primary-b']]]);
+    assert.equal((await (await server.device(reader, '/snapshot')).json()).profiles.find(item => item.domain === 'multi.example').cookies[0].value, 'from-a');
+    // Both primaries on one account are flagged.
+    await server.device(b, `/accounts/${one.id}/switch`, 'POST');
+    assert.deepEqual((await server.status()).profiles.find(item => item.id === one.id).primaries.sort(), ['primary-a', 'primary-b']);
+    // Any primary may add an account; the reader may not.
+    assert.equal((await server.device(b, '/accounts', 'POST', { name: 'three', pageUrl: 'https://multi.example/' })).status, 201);
+    assert.equal((await server.device(reader, '/accounts', 'POST', { name: 'four', pageUrl: 'https://multi.example/' })).status, 403);
+    // A script that only knows primaryDeviceId replaces the list; clearing it clears the list.
+    await server.settings({ primaryDeviceId: reader.id });
+    settings = (await server.status()).settings;
+    assert.deepEqual(settings.primaryDeviceIds, [reader.id]);
+    await server.settings({ primaryDeviceIds: [a.id, b.id], primaryDeviceId: a.id });
+    await server.admin(`/devices/${a.id}`, 'DELETE');
+    settings = (await server.status()).settings;
+    assert.deepEqual([settings.primaryDeviceIds, settings.primaryDeviceId], [[b.id], b.id]);
+    const unknown = randomDeviceId();
+    await assert.rejects(server.settings({ primaryDeviceIds: [b.id, unknown], primaryDeviceId: b.id }), /active enrolled/);
+  });
+
+  test('the unlock code can be switched on or off for one browser', async () => {
+    const always = await server.enroll(randomDeviceId(), 'locked-one');
+    const never = await server.enroll(randomDeviceId(), 'open-one');
+    const lockOf = async device => (await (await server.device(device, '/snapshot')).json()).settings.clientLock.enabled;
+    await assert.rejects(server.admin(`/devices/${always.id}/settings`, 'PUT', { homePage: '', siteFilter: null, scheduleExempt: false, unlockCode: true }), /Set an unlock code/);
+    await server.admin('/client-lock', 'PUT', { enabled: false, code: 'secret-code' });
+    await server.admin(`/devices/${always.id}/settings`, 'PUT', { homePage: '', siteFilter: null, scheduleExempt: false, unlockCode: true });
+    await server.admin(`/devices/${never.id}/settings`, 'PUT', { homePage: '', siteFilter: null, scheduleExempt: false, unlockCode: false });
+    assert.deepEqual([await lockOf(always), await lockOf(never)], [true, false]);
+    await server.admin('/client-lock', 'PUT', { enabled: true });
+    assert.deepEqual([await lockOf(always), await lockOf(never)], [true, false]);
+    assert.equal((await server.status()).devices.find(item => item.id === never.id).unlockCode, false);
+    await server.admin(`/devices/${never.id}/settings`, 'PUT', { homePage: '', siteFilter: null, scheduleExempt: false, unlockCode: null });
+    assert.equal(await lockOf(never), true);
+    await server.admin('/client-lock', 'PUT', { enabled: false });
+  });
+
+  test('browsers receive when each account sign-in expires', async () => {
+    const primary = await server.enroll(randomDeviceId(), 'expiry-primary');
+    await server.settings({ primaryDeviceIds: [primary.id], primaryDeviceId: primary.id });
+    await server.device(primary, '/sync', 'POST', { pageUrl: 'https://soon.example/', complete: true, cookies: [cookie('user_session', 'x', 'soon.example', { expiresAt: now() + 2 * 86400 })] });
+    await server.device(primary, '/sync', 'POST', { pageUrl: 'https://later.example/', complete: true, cookies: [cookie('user_session', 'y', 'later.example', { expiresAt: now() + 20 * 86400 })] });
+    const accounts = (await (await server.device(primary, '/snapshot')).json()).accounts;
+    const soon = accounts.find(item => item.domain === 'soon.example');
+    const later = accounts.find(item => item.domain === 'later.example');
+    assert.equal(soon.session, 'expiring');
+    assert.ok(Math.abs(Date.parse(soon.expiresAt) / 1000 - (now() + 2 * 86400)) < 60);
+    assert.equal(later.session, 'ok');
+  });
+});
