@@ -101,13 +101,10 @@ function renderSettingsForm(settings) {
   updateShareSites();
   $('#allow-admin-enroll').checked = settings.allowAdminTokenEnrollment !== false;
   $('#min-version').value = settings.minimumClientVersion || '';
-  const primaries = new Set(settings.primaryDeviceIds?.length ? settings.primaryDeviceIds : [settings.primaryDeviceId].filter(Boolean));
-  $('#primary-devices').replaceChildren(...state.devices.filter(item => !item.revoked).map(device => {
-    const label = document.createElement('label');
-    label.className = 'check';
-    label.innerHTML = `<input type="checkbox" value="${esc(device.id)}"${primaries.has(device.id) ? ' checked' : ''}>${esc(device.name)} <small>${esc(device.id.slice(0, 8))}</small>`;
-    return label;
-  }));
+  const primary = $('#primary-device');
+  primary.replaceChildren(new Option('Select automatically', ''));
+  for (const device of state.devices.filter(item => !item.revoked)) primary.append(new Option(`${device.name} (${device.id.slice(0, 8)})`, device.id));
+  primary.value = settings.primaryDeviceId || '';
 }
 
 function renderSettingsHint(settings) {
@@ -187,9 +184,8 @@ function complianceNote(device) {
   if (minimum && !device.revoked && !(device.clientVersion && versionAtLeast(device.clientVersion, minimum))) {
     return `<span class="pill warn" title="Below the minimum browser version ${minimum}: cannot sync until it updates">UPDATE REQUIRED</span>`;
   }
-  const primaries = state.settings.primaryDeviceIds || [];
-  if (!device.revoked && primaries.indexOf(device.id) > 0 && !(device.clientVersion && versionAtLeast(device.clientVersion, '1.9.0'))) {
-    return '<span class="pill warn" title="Browsers before 1.9 only know the first primary browser, so this one does not share its sign-ins yet">UPDATE NEEDED</span>';
+  if (!device.revoked && device.editorOf?.length && !(device.clientVersion && versionAtLeast(device.clientVersion, '1.10.0'))) {
+    return `<span class="pill warn" title="Browsers before 1.10 do not send cookie updates, so its edits to ${esc(device.editorOf.join(', '))} are not saved">UPDATE NEEDED</span>`;
   }
   if ((device.unlockCode ?? state.settings.clientLock?.enabled) && !device.revoked && !(device.clientVersion && versionAtLeast(device.clientVersion, LOCK_MIN_VERSION))) {
     return `<span class="pill warn" title="Browsers before ${LOCK_MIN_VERSION} do not ask for the unlock code">UPDATE NEEDED</span>`;
@@ -230,7 +226,7 @@ function renderDevices() {
   const modes = { direct: 'Direct', managed: 'Managed', strict: 'Strict' };
   for (const device of paginate('devices', state.devices, device => `${device.name} ${device.id} ${device.clientVersion} ${device.networkMode}`)) {
     const row = document.createElement('tr');
-    row.innerHTML = `<td>${esc(device.name)}${device.primary ? '<span class="pill">PRIMARY</span>' : ''}<br><code>${esc(device.id.slice(0, 12))}…</code></td>`
+    row.innerHTML = `<td>${esc(device.name)}${device.primary ? '<span class="pill">PRIMARY</span>' : ''}${device.editorOf?.length ? `<span class="pill mode" title="Can update the cookies of ${esc(device.editorOf.join(', '))}">EDITOR</span>` : ''}<br><code>${esc(device.id.slice(0, 12))}…</code></td>`
       + `<td>${device.clientVersion ? `v${esc(device.clientVersion)}` : '<small>unknown</small>'}${device.networkMode ? ` <span class="pill mode">${esc(modes[device.networkMode] || device.networkMode)}</span>` : ''} ${complianceNote(device)}</td>`
       + `<td title="${esc(device.lastSeenAt ? new Date(device.lastSeenAt).toLocaleString() : '')}">${device.live ? '<span class="pill">LIVE</span> ' : ''}${esc(device.live ? 'Connected' : relativeTime(device.lastSeenAt))}</td>`
       + `<td>${usageCell(device)}</td>`
@@ -410,7 +406,7 @@ function renderProfiles() {
   for (const profile of paginate('profiles', sorted, profile => `${profile.domain} ${profile.name} ${(profile.usedBy || []).join(' ')}`, 20)) {
     const element = document.createElement('div');
     element.className = `profile${selectedProfiles.has(profile.id) ? ' selected' : ''}`;
-    element.innerHTML = `<label class="pick"><input type="checkbox" aria-label="Select ${esc(profile.domain)}"${selectedProfiles.has(profile.id) ? ' checked' : ''}><div><strong>${profile.enabled ? '●' : '○'} ${esc(profile.name)}</strong><span>${esc(profile.domain)} · ${profile.cookieCount} cookie(s)${profile.enabled ? '' : ' · disabled'}${profile.listed === false ? ' · <em class="unlisted" title="Not on the list of shared sites: the primary browser no longer updates it">not on the sharing list</em>' : ''}${healthBadge(profile)}${profile.primaries?.length > 1 ? ` · <em class="unlisted" title="Each primary browser publishes its own sign-in, so they overwrite each other">${profile.primaries.length} primary browsers on this account</em>` : ''}${profile.accounts > 1 ? ` · account of ${profile.accounts} · ${profile.usedBy?.length ? `used by ${esc(profile.usedBy.join(', '))}` : 'used by no browser'}` : ''}</span></div></label><button class="secondary">Edit</button>`;
+    element.innerHTML = `<label class="pick"><input type="checkbox" aria-label="Select ${esc(profile.domain)}"${selectedProfiles.has(profile.id) ? ' checked' : ''}><div><strong>${profile.enabled ? '●' : '○'} ${esc(profile.name)}</strong><span>${esc(profile.domain)} · ${profile.cookieCount} cookie(s)${profile.enabled ? '' : ' · disabled'}${profile.listed === false ? ' · <em class="unlisted" title="Not on the list of shared sites: the primary browser no longer updates it">not on the sharing list</em>' : ''}${healthBadge(profile)}${profile.editors?.length ? ` · updated by the primary and ${esc(profile.editors.join(', '))}` : ''}${profile.accounts > 1 ? ` · account of ${profile.accounts} · ${profile.usedBy?.length ? `used by ${esc(profile.usedBy.join(', '))}` : 'used by no browser'}` : ''}</span></div></label><button class="secondary">Edit</button>`;
     element.querySelector('input').onchange = event => {
       if (event.target.checked) selectedProfiles.add(profile.id); else selectedProfiles.delete(profile.id);
       element.classList.toggle('selected', event.target.checked);
@@ -528,10 +524,7 @@ function settingsPayload(proxy) {
   return {
     homePage: $('#home-page').value,
     searchUrl: $('#search-url').value,
-    ...(() => {
-      const ids = [...document.querySelectorAll('#primary-devices input:checked')].map(input => input.value);
-      return { primaryDeviceIds: ids, primaryDeviceId: ids[0] || '' };
-    })(),
+    primaryDeviceId: $('#primary-device').value,
     autoShareCookies: $('#auto-share-mode').value !== 'off',
     autoShareScope: $('#auto-share-mode').value === 'listed' ? 'listed' : 'all',
     autoShareDomains: $('#auto-share-domains').value.split(/[\s,]+/).filter(Boolean),
@@ -592,6 +585,14 @@ function edit(profile = null) {
     return label;
   }));
   updateShareDevices();
+  const editors = new Set(profile?.editorDeviceIds || []);
+  $('#editor-devices').replaceChildren(...state.devices.filter(device => !device.revoked && !device.primary).map(device => {
+    const label = document.createElement('label');
+    label.className = 'check';
+    label.innerHTML = `<input type="checkbox" value="${esc(device.id)}"${editors.has(device.id) ? ' checked' : ''}>${esc(device.name)} <small>${esc(device.id.slice(0, 6))}</small>`;
+    return label;
+  }));
+  if (!$('#editor-devices').children.length) $('#editor-devices').innerHTML = '<span class="hint">No other browsers enrolled.</span>';
   $('#cookies').replaceChildren(...(profile?.cookies?.length ? profile.cookies : [{}]).map(cookieRow));
   $('#editor').scrollIntoView({ behavior: 'smooth' });
 }
@@ -1194,6 +1195,7 @@ $('#profile-form').onsubmit = async event => {
         enabled: $('#profile-enabled').checked,
         shareWithAllDevices: $('#share-all').checked,
         allowedDeviceIds: [...document.querySelectorAll('#share-devices input:checked')].map(input => input.value),
+        editorDeviceIds: [...document.querySelectorAll('#editor-devices input:checked')].map(input => input.value),
         cookies
       })
     });

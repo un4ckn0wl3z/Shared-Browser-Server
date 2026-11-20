@@ -358,13 +358,14 @@ describe('Electron browsers sharing a session', () => {
     await server.admin('/profiles/delete', 'POST', { ids: [second.id] });
   });
 
-  test('PRIMARY badge, session expiry on the account button, and the unlock code per browser', async () => {
+  test('PRIMARY and EDITOR badges, session expiry on the account button, and the unlock code per browser', async () => {
     await waitFor(async () => await wb1.window.isVisible('#primary-badge'), { message: 'WB1 badge' });
     assert.ok(await wb2.window.isHidden('#primary-badge'));
+    assert.ok(await wb2.window.isHidden('#editor-badge'));
     // A shared sign-in that expires in two days is flagged on the account button and in its tooltip.
-    // A second primary browser (here an API client) publishes a sign-in that expires in two days.
-    const helper = await server.enroll(randomDeviceId(), 'api-primary');
-    await server.settings({ primaryDeviceIds: [deviceId('WB1'), helper.id], primaryDeviceId: deviceId('WB1') });
+    // A browser allowed to update the profile (here an API client) publishes a sign-in that expires in two days.
+    const helper = await server.enroll(randomDeviceId(), 'api-editor');
+    await server.admin('/profiles', 'POST', { name: '127.0.0.1', domain: '127.0.0.1', enabled: true, editorDeviceIds: [helper.id], cookies: [] });
     const soon = Math.floor(Date.now() / 1000) + 2 * 86400;
     await server.device(helper, '/sync', 'POST', { pageUrl: 'http://127.0.0.1/', complete: true, cookies: [{ name: 'token', value: 't', domain: '127.0.0.1', path: '/', secure: false, httpOnly: true, sameSite: 'Lax', expiresAt: soon }] });
     assert.ok(await wb1.window.isVisible('#primary-badge'));
@@ -373,6 +374,17 @@ describe('Electron browsers sharing a session', () => {
     assert.ok(await wb2.window.locator('#account').evaluate(element => element.classList.contains('expiring') && /Sign-in expires/.test(element.title)));
     await server.admin(`/devices/${helper.id}`, 'DELETE');
     await server.admin('/profiles/delete', 'POST', { ids: (await server.status()).profiles.filter(item => item.domain === '127.0.0.1').map(item => item.id) });
+    // WB2 made an editor of the localhost profile: its own sign-in on that site reaches the vault.
+    const local = await server.profile('localhost');
+    await server.admin(`/profiles/${local.id}`, 'PUT', { name: local.name, domain: local.domain, enabled: true, editorDeviceIds: [deviceId('WB2')], cookies: local.cookies.map(item => ({ ...item, value: '' })) });
+    await waitFor(async () => await wb2.window.isVisible('#editor-badge'), { message: 'EDITOR badge' });
+    assert.match(await wb2.window.locator('#editor-badge').getAttribute('title'), /localhost/);
+    await wb2.navigate(`${site.origin}/other-login`);
+    await waitFor(async () => (await server.profile('localhost')).cookies.some(item => item.name === 'other'), { message: 'editor sign-in saved' });
+    await waitFor(async () => (await wb1.cookies(site.origin)).includes('other=1'), { message: 'primary received it' });
+    const updated = await server.profile('localhost');
+    await server.admin(`/profiles/${updated.id}`, 'PUT', { name: updated.name, domain: updated.domain, enabled: true, editorDeviceIds: [], cookies: updated.cookies.filter(item => item.name !== 'other').map(item => ({ ...item, value: '' })) });
+    await waitFor(async () => await wb2.window.isHidden('#editor-badge'), { message: 'EDITOR badge gone' });
     // Unlock code: on for everyone but off for WB2, then on only for WB2.
     await server.admin('/client-lock', 'PUT', { enabled: false, code: 'letmein' });
     await server.admin(`/devices/${deviceId('WB2')}/settings`, 'PUT', { homePage: '', siteFilter: null, scheduleExempt: false, unlockCode: false });

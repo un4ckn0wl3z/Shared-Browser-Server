@@ -121,6 +121,9 @@ function updateState(state) {
   reload.textContent = loading ? '✕' : '↻';
   reload.title = loading ? 'Stop loading' : 'Reload';
   element('primary-badge').hidden = !state.primary;
+  const editor = element('editor-badge');
+  editor.hidden = !state.editor?.length;
+  editor.title = state.editor?.length ? `This browser can update the shared cookies of ${state.editor.join(', ')}` : '';
   const account = element('account');
   account.hidden = !state.account;
   if (state.account) {
