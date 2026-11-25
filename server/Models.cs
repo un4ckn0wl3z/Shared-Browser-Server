@@ -352,6 +352,8 @@ public sealed record SharedSnapshot(long Revision, DateTimeOffset UpdatedAt, Bro
     public List<string> EditableDomains { get; init; } = [];
     /// <summary>For the primary browser: sites whose account it uses is updated by editors, so it only receives them.</summary>
     public List<string> ReadOnlyDomains { get; init; } = [];
+    /// <summary>True for the primary browser and for editors: they may share a new site from the browser.</summary>
+    public bool CanShareSites { get; init; }
     /// <summary>Actions waiting for this browser; it acknowledges each one after running it.</summary>
     public List<ClientCommand> Commands { get; init; } = [];
 }
@@ -367,6 +369,8 @@ public sealed record ClientAccount(string Id, string Name, string Domain, bool A
 }
 /// <summary>Adds an empty account for the site of PageUrl, which the primary browser then signs in to.</summary>
 public sealed record CreateAccountRequest(string? Name, string? PageUrl);
+/// <summary>Shares a new site from a browser: Domain is the site (for example facebook.com), Name the profile's name.</summary>
+public sealed record CreateSiteRequest(string? Domain, string? Name);
 /// <summary>Code null or empty keeps the current code.</summary>
 public sealed record ClientLockRequest(bool Enabled, string? Code, int IdleMinutes = 0, bool LockOnSystemLock = false);
 public sealed record UnlockReport(bool Success);

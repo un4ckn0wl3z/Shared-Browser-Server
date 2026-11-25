@@ -90,3 +90,4 @@ select:disabled, input:disabled { opacity: .6; }
 .primary-badge[hidden] { display: none; }
 .account.expiring { border-color: #f5a524; background: #fff7e6; color: #8a5a00; }
 .primary-badge.editor { background: #dbeafe; color: #1e40af; }
+.account.share { border-style: dashed; color: #1e40af; }

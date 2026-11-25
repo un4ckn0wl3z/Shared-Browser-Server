@@ -220,6 +220,7 @@ function normalizeSnapshot(input) {
   input.editableDomains = stringList(input.editableDomains).map(normalizedDomain).filter(Boolean);
   // For the primary browser: sites whose account is kept up to date by editors, which it only receives.
   input.readOnlyDomains = stringList(input.readOnlyDomains).map(normalizedDomain).filter(Boolean);
+  input.canShareSites = input.canShareSites === true;
   input.commands = Array.isArray(input.commands) ? input.commands.filter(item => item && typeof item.id === 'string' && typeof item.type === 'string') : [];
   const settings = input.settings;
   settings.siteFilter = settings.siteFilter && ['off', 'allow', 'block'].includes(settings.siteFilter.mode) ? { mode: settings.siteFilter.mode, domains: stringList(settings.siteFilter.domains).map(normalizedDomain) } : { mode: 'off', domains: [] };
@@ -478,6 +479,7 @@ function publishNavigationState() {
     canGoBack: tab?.view.webContents.navigationHistory.canGoBack() || false,
     canGoForward: tab?.view.webContents.navigationHistory.canGoForward() || false,
     account: accountState(currentUrl),
+    share: accountState(currentUrl) ? null : shareSuggestion(currentUrl),
     primary: Boolean(config.secrets.deviceToken) && !deviceRejected && isPrimary(),
     readOnly: config.secrets.cache.readOnlyDomains || [],
     editor: Boolean(config.secrets.deviceToken) && !deviceRejected && !isPrimary() ? editableDomains() : []
@@ -1726,6 +1728,34 @@ async function addAccount(name) {
   status(`Sign in to ${account?.domain || site.host} to save the ${account?.name || name} account`);
 }
 
+// ---- Sharing a new site --------------------------------------------------------------------------
+// The primary browser and editors can share a site that has no profile yet (for example facebook.com before
+// anyone signed in there). The profile is created on the server; this browser's sign-in then fills it.
+
+function shareSuggestion(url) {
+  const host = hostOf(url);
+  if (!host || !config.secrets.deviceToken || deviceRejected) return null;
+  const shareable = isPrimary() || config.secrets.cache.canShareSites;
+  if (!shareable || siteAccounts(url).accounts.length) return null;
+  return { host, domain: host.replace(/^www\./, '') };
+}
+
+async function shareSite(input) {
+  const pageUrl = activeWebContents()?.getURL() || '';
+  if (!shareSuggestion(pageUrl)) throw new Error('This site cannot be shared from this browser');
+  const domain = String(input?.domain || '').trim().toLowerCase();
+  const name = String(input?.name || '').trim().slice(0, 80);
+  await serialized(async () => {
+    const snapshot = normalizeSnapshot(await api('/api/client/sites', { method: 'POST', body: JSON.stringify({ domain, name }) }));
+    await installSnapshot(snapshot, config.secrets.cache);
+  });
+  // Cookies this browser already holds for the site are shared now; a sign-in after this is shared as it happens.
+  pushedDomains = new Map([...pushedDomains].filter(([key]) => !domainWithin(key, domain)));
+  scheduleCookiePush();
+  publishNavigationState();
+  status(`${domain} is now shared. Sign in to it here to share the session`);
+}
+
 async function configureProxy() {
   const proxy = config.secrets.cache.settings.proxy;
   if (config.strictPrivacy && config.networkMode !== 'managed') {
@@ -2121,6 +2151,7 @@ function registerIpc() {
   ipcMain.handle('browser:show-bookmarks', (_, position) => showBookmarksMenu(position));
   ipcMain.handle('browser:show-accounts', (_, position) => showAccountsMenu(position));
   ipcMain.handle('browser:add-account', (_, name) => addAccount(String(name || '').trim().slice(0, 80)));
+  ipcMain.handle('browser:share-site', (_, input) => shareSite(input));
   ipcMain.handle('browser:switch-account', (_, id) => switchAccount(String(id || '')));
   ipcMain.handle('browser:reopen-tab', reopenClosedTab);
   ipcMain.handle('browser:find', (_, text, options) => {

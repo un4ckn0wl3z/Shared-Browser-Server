@@ -19,6 +19,7 @@
       <button id="go">Go</button>
       <button id="bookmarks" title="Shared bookmarks">★</button>
       <button id="account" class="account" title="Shared accounts for this site" hidden></button>
+      <button id="share-site" class="account share" title="Share this site's sign-in with the other browsers" hidden>＋ Share site</button>
       <button id="downloads-button" class="downloads-button" title="Downloads">⬇<span id="downloads-badge" class="badge" hidden></span></button>
       <div id="find-bar" class="find-bar" hidden>
         <input id="find-text" aria-label="Find in page" placeholder="Find in page" autocomplete="off" spellcheck="false">
@@ -105,6 +106,20 @@
       <div class="actions"><button type="button" id="cancel">Cancel</button><button type="submit" class="primary">Save and restart</button></div>
     </form>
   </dialog>
+  <dialog id="site-dialog">
+    <form id="site-form">
+      <div class="dialog-title">
+        <div><strong>Share this site</strong><small>Its sign-in will reach the other browsers</small></div>
+        <button type="button" id="site-close" class="compact">×</button>
+      </div>
+      <div class="info">A shared profile is created for the site. Sign in to it in this browser and the session is shared. Use the site's main domain (for example facebook.com rather than www.facebook.com) so its subdomains are included.</div>
+      <label>Site<input id="site-domain" required autocomplete="off" spellcheck="false"></label>
+      <label>Name (optional)<input id="site-name" maxlength="80" autocomplete="off" placeholder="For example: Facebook page admin"></label>
+      <div id="site-error" class="error"></div>
+      <div class="actions"><button type="button" id="site-cancel">Cancel</button><button type="submit" class="primary">Share site</button></div>
+    </form>
+  </dialog>
+
   <dialog id="account-dialog">
     <form id="account-form">
       <div class="dialog-title">

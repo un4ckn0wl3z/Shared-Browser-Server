@@ -412,6 +412,35 @@ describe('Electron browsers sharing a session', () => {
     await server.admin(`/devices/${deviceId('WB2')}/settings`, 'PUT', { homePage: '', siteFilter: null, scheduleExempt: false, unlockCode: null });
   });
 
+  test('the primary browser shares a new site from its toolbar, and its sign-in fills the profile', async () => {
+    const page = `http://127.0.0.1:${site.port}/share-me`;
+    // WB1 still holds a cookie for this host from the previous test; with every site shared it would share it again.
+    await wb1.app.evaluate(async ({ session }) => {
+      const store = session.fromPartition('persist:shared-browser').cookies;
+      for (const cookie of await store.get({ domain: '127.0.0.1' })) await store.remove('http://127.0.0.1/', cookie.name);
+    });
+    await sleep(1500);
+    await server.admin('/profiles/delete', 'POST', { ids: (await server.status()).profiles.filter(item => item.domain === '127.0.0.1').map(item => item.id) }).catch(() => { });
+    await wb1.navigate(page);
+    await waitFor(async () => await wb1.window.isVisible('#share-site'), { message: 'Share site button' });
+    await wb2.navigate(page);
+    await sleep(1000);
+    assert.ok(await wb2.window.isHidden('#share-site'), 'a browser that is neither primary nor editor cannot share sites');
+    await wb1.window.click('#share-site');
+    await wb1.window.waitForSelector('#site-dialog[open]');
+    assert.equal(await wb1.window.inputValue('#site-domain'), '127.0.0.1');
+    await wb1.window.fill('#site-name', 'Local app');
+    await wb1.window.click('#site-form button.primary');
+    await wb1.window.waitForSelector('#site-dialog[open]', { state: 'detached' });
+    await waitFor(async () => (await server.profile('127.0.0.1'))?.name === 'Local app', { message: 'profile created' });
+    await waitFor(async () => /👤 Local app/.test(await wb1.window.textContent('#account')), { message: 'account button replaces Share site' });
+    assert.ok(await wb1.window.isHidden('#share-site'));
+    await wb1.navigate(`http://127.0.0.1:${site.port}/other-login`);
+    await waitFor(async () => (await server.profile('127.0.0.1')).cookies.some(item => item.name === 'other'), { message: 'sign-in shared' });
+    await waitFor(async () => (await wb2.cookies(`http://127.0.0.1:${site.port}/`)).includes('other=1'), { message: 'WB2 received it' });
+    await server.admin('/profiles/delete', 'POST', { ids: [(await server.profile('127.0.0.1')).id] });
+  });
+
   test('site filter: blocked sites show a notice, allow lists keep everything else out', async () => {
     const text = async () => (await wb2.pageText()).join('\n');
     await server.settings({ siteFilter: { mode: 'block', domains: ['localhost'] } });

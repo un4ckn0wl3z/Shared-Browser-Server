@@ -1040,6 +1040,39 @@ describe('cookie editors, per-browser unlock code and session expiry for browser
     assert.equal((await server.status()).settings.primaryDeviceId, '');
   });
 
+  test('the primary browser and editors can share a new site from the browser', async () => {
+    const primary = await server.enroll(randomDeviceId(), 'site-primary');
+    const editor = await server.enroll(randomDeviceId(), 'site-editor');
+    const reader = await server.enroll(randomDeviceId(), 'site-reader');
+    await server.settings({ primaryDeviceId: primary.id, autoShareCookies: true, autoShareScope: 'listed', autoShareDomains: ['github.com'] });
+    const share = (device, domain, name = '') => server.device(device, '/sites', 'POST', { domain, name });
+    const snapshot = async device => (await server.device(device, '/snapshot')).json();
+    assert.equal((await snapshot(primary)).canShareSites, true);
+    assert.equal((await snapshot(reader)).canShareSites, false);
+    // The primary shares facebook.com before anyone signed in; it joins the list of shared sites.
+    assert.equal((await share(reader, 'facebook.com')).status, 403);
+    assert.equal((await share(primary, 'not a site')).status, 400);
+    // A URL or a www. host is shared under the main domain, where sites keep their sign-in cookies.
+    const created = await share(primary, 'https://www.facebook.com/login', 'Page admin');
+    assert.equal(created.status, 201);
+    assert.ok((await created.json()).accounts.some(item => item.domain === 'facebook.com' && item.name === 'Page admin' && item.active));
+    assert.ok((await server.status()).settings.autoShareDomains.includes('facebook.com'));
+    assert.equal((await share(primary, 'm.facebook.com')).status, 400, 'a site already covered is refused');
+    await server.device(primary, '/sync', 'POST', { pageUrl: 'https://facebook.com/', complete: true, cookies: [cookie('c_user', '1', 'facebook.com')] });
+    assert.equal((await server.profile('facebook.com')).cookies.length, 1);
+    // An editor of any profile may share a site too, and becomes the new profile's editor.
+    const github = await server.admin('/profiles', 'POST', { name: 'gh', domain: 'github.com', enabled: true, editorDeviceIds: [editor.id], cookies: [] });
+    assert.ok(github.id);
+    assert.equal((await snapshot(editor)).canShareSites, true);
+    assert.equal((await share(editor, 'gitlab.com')).status, 201);
+    const gitlab = await server.profile('gitlab.com');
+    assert.deepEqual(gitlab.editorDeviceIds, [editor.id]);
+    await server.device(editor, '/sync', 'POST', { pageUrl: 'https://gitlab.com/', complete: true, cookies: [cookie('session', 'e', 'gitlab.com')] });
+    assert.equal((await server.profile('gitlab.com')).cookies[0].name, 'session');
+    assert.ok((await server.status()).audit.some(item => item.action === 'profile.created' && item.target === 'gitlab.com'));
+    await server.settings({ autoShareScope: 'all', autoShareDomains: [] });
+  });
+
   test('the unlock code can be switched on or off for one browser', async () => {
     const always = await server.enroll(randomDeviceId(), 'locked-one');
     const never = await server.enroll(randomDeviceId(), 'open-one');

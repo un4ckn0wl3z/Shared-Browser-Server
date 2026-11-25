@@ -127,6 +127,9 @@ function updateState(state) {
   const editor = element('editor-badge');
   editor.hidden = !state.editor?.length;
   editor.title = state.editor?.length ? `This browser can update the shared cookies of ${state.editor.join(', ')}` : '';
+  const share = element('share-site');
+  share.hidden = !state.share;
+  share.dataset.domain = state.share?.domain || '';
   const account = element('account');
   account.hidden = !state.account;
   if (state.account) {
@@ -292,6 +295,35 @@ element('account-form').addEventListener('submit', async event => {
   }
 });
 api.onAddAccount(openAccountDialog);
+
+// Sharing a new site (primary browser and editors only; the button is hidden otherwise).
+const siteDialog = element('site-dialog');
+async function openSiteDialog() {
+  await api.setSettingsOpen(true);
+  element('site-domain').value = element('share-site').dataset.domain || '';
+  element('site-name').value = '';
+  element('site-error').textContent = '';
+  if (!siteDialog.open) siteDialog.showModal();
+  element('site-name').focus();
+}
+function closeSiteDialog() {
+  if (siteDialog.open) siteDialog.close();
+  api.setSettingsOpen(false);
+}
+element('share-site').addEventListener('click', openSiteDialog);
+element('site-close').addEventListener('click', closeSiteDialog);
+element('site-cancel').addEventListener('click', closeSiteDialog);
+siteDialog.addEventListener('cancel', event => { event.preventDefault(); closeSiteDialog(); });
+element('site-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  element('site-error').textContent = '';
+  try {
+    await api.shareSite({ domain: element('site-domain').value, name: element('site-name').value });
+    closeSiteDialog();
+  } catch (failure) {
+    element('site-error').textContent = failure.message.replace(/^Error invoking remote method '[^']+': (Error: )?/, '');
+  }
+});
 findText.addEventListener('input', () => runFind(true, false));
 findText.addEventListener('keydown', event => {
   if (event.key === 'Enter') { event.preventDefault(); runFind(!event.shiftKey, true); }
@@ -368,13 +400,14 @@ function updateLock(value) {
   const schedule = value?.schedule;
   element('schedule-screen').hidden = !schedule;
   if (schedule) element('schedule-text').textContent = `Allowed: ${schedule.days || 'no days'}, ${schedule.start}–${schedule.end} (${schedule.timeZone}).`;
-  if (schedule || requiredUpdate) for (const open of [dialog, accountDialog, downloadsDialog]) if (open.open) open.close();
+  if (schedule || requiredUpdate) for (const open of [dialog, accountDialog, downloadsDialog, siteDialog]) if (open.open) open.close();
   const locked = Boolean(value?.locked);
   const wasLocked = !lockScreen.hidden;
   lockScreen.hidden = !locked;
   if (locked) {
     if (dialog.open) dialog.close();
     if (accountDialog.open) accountDialog.close();
+    if (siteDialog.open) siteDialog.close();
     element('lock-device').textContent = value.deviceName ? `Browser: ${value.deviceName}` : '';
     if (!wasLocked) { element('lock-code').value = ''; element('lock-error').textContent = ''; }
     element('lock-code').focus();
