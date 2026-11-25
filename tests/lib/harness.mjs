@@ -260,7 +260,14 @@ export async function launchBrowser(home, profile) {
     args: [path.join(ROOT, 'electron-client'), `--profile=${profile}`, '--no-sandbox'],
     env: { ...process.env, HOME: home, XDG_CONFIG_HOME: path.join(home, '.config') }
   });
-  const window = await app.firstWindow();
+  // Tabs are WebContentsViews, which Playwright also reports as windows; the browser UI is the index.html page.
+  await app.firstWindow();
+  let window;
+  for (const end = Date.now() + 30000; !window && Date.now() < end;) {
+    window = app.windows().find(page => page.url().endsWith('/index.html'));
+    if (!window) await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  if (!window) throw new Error('The Shared Browser window did not open');
   const browser = {
     app,
     window,

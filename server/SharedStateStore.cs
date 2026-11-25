@@ -123,6 +123,7 @@ public sealed partial class SharedStateStore
         return snapshot with
         {
             EditableDomains = editable,
+            CanShareSites = string.Equals(settings.PrimaryDeviceId, deviceId, StringComparison.OrdinalIgnoreCase) || snapshot.Profiles.Any(profile => profile.EditorDeviceIds.Contains(deviceId)),
             ReadOnlyDomains = readOnly,
             Settings = settings,
             Profiles = profiles,
@@ -1098,6 +1099,46 @@ public sealed partial class SharedStateStore
     /// Adds an empty account for the site of the page and switches this device to it, so the next sign-in
     /// on that site is saved as the new account. Only the primary browser saves cookies, so only it may.
     /// </summary>
+    /// <summary>
+    /// Shares a new site from a browser. The primary browser and editors may do this; an editor becomes the new
+    /// profile's editor so its sign-in there is shared. With a list of shared sites, the site is added to it.
+    /// </summary>
+    public async Task<SessionProfile> CreateSiteAsync(string deviceId, CreateSiteRequest request)
+    {
+        var text = (request.Domain ?? "").Trim();
+        if (text.Contains("://", StringComparison.Ordinal) && Uri.TryCreate(text, UriKind.Absolute, out var url)) text = url.Host;
+        var domain = NormalizeDomain(text);
+        // Sites set their sign-in cookies on the main domain (.facebook.com), which a www. profile would miss.
+        if (domain.StartsWith("www.", StringComparison.Ordinal) && domain.Count(character => character == '.') >= 2) domain = domain[4..];
+        if (!ValidDomain(domain) || (!domain.Contains('.') && domain != "localhost")) throw new InvalidOperationException("Enter a site such as facebook.com");
+        await _gate.WaitAsync();
+        try
+        {
+            var primary = IsPrimaryLocked(deviceId);
+            if (!primary && !_state.Profiles.Any(profile => profile.EditorDeviceIds.Contains(deviceId)))
+                throw new UnauthorizedAccessException("Only the primary browser and browsers that update a profile can share new sites");
+            var covering = _state.Profiles.FirstOrDefault(profile => DomainMatches(domain, profile.Domain) || DomainMatches(profile.Domain, domain));
+            if (covering is not null) throw new InvalidOperationException($"{covering.Domain} is already shared. Use the account button to switch or add accounts");
+            var device = _state.Devices.First(item => item.Id == deviceId);
+            var profile = new SessionProfile
+            {
+                Id = Guid.NewGuid().ToString("N"),
+                Name = CleanName(request.Name, domain),
+                Domain = domain,
+                Enabled = true,
+                EditorDeviceIds = primary ? [] : [deviceId]
+            };
+            _state.Profiles.Add(profile);
+            device.ActiveProfiles[domain] = profile.Id;
+            // A site added from a browser must be shareable even when only listed sites are shared.
+            if (_state.Settings.AutoShareScope == "listed" && ShareableSiteLocked(domain) is null) _state.Settings.AutoShareDomains.Add(domain);
+            BumpRevision();
+            await SaveLockedAsync();
+            return PublicProfile(profile);
+        }
+        finally { _gate.Release(); }
+    }
+
     public async Task<SessionProfile> CreateAccountAsync(string deviceId, CreateAccountRequest request)
     {
         if (!Uri.TryCreate(request.PageUrl, UriKind.Absolute, out var page) || page.Scheme is not ("http" or "https")) throw new InvalidOperationException("Open the site you want to add an account for first");

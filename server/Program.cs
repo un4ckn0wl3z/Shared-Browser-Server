@@ -197,6 +197,21 @@ app.MapPost("/api/client/accounts/{id}/switch", async (HttpContext context, stri
 });
 
 // The primary browser adds an empty account for a site and is switched to it, ready to sign in.
+// The primary browser or an editor shares a new site, ready to sign in to it.
+app.MapPost("/api/client/sites", async (HttpContext context, CreateSiteRequest request, SharedStateStore store) =>
+{
+    var device = DeviceAuthorized(context.Request, store);
+    if (device is null) return Results.Unauthorized();
+    try
+    {
+        var profile = await store.CreateSiteAsync(device.Id, request);
+        audit.Record($"device:{device.Name}", "profile.created", profile.Domain, $"shared from {DeviceLabel(device)}", Ip(context));
+        return Results.Json(store.SnapshotFor(device.Id), statusCode: StatusCodes.Status201Created);
+    }
+    catch (UnauthorizedAccessException error) { return Results.Json(new { error = error.Message }, statusCode: StatusCodes.Status403Forbidden); }
+    catch (InvalidOperationException error) { return Results.BadRequest(new { error = error.Message }); }
+});
+
 app.MapPost("/api/client/accounts", async (HttpContext context, CreateAccountRequest request, SharedStateStore store) =>
 {
     var device = DeviceAuthorized(context.Request, store);

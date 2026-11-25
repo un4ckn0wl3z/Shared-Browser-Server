@@ -27,6 +27,7 @@ contextBridge.exposeInMainWorld('sharedBrowser', {
   showBookmarks: (position) => ipcRenderer.invoke('browser:show-bookmarks', position),
   showAccounts: (position) => ipcRenderer.invoke('browser:show-accounts', position),
   addAccount: (name) => ipcRenderer.invoke('browser:add-account', name),
+  shareSite: (input) => ipcRenderer.invoke('browser:share-site', input),
   switchAccount: (id) => ipcRenderer.invoke('browser:switch-account', id),
   onAddAccount: (callback) => ipcRenderer.on('browser:add-account', (_, value) => callback(value)),
   reopenTab: () => ipcRenderer.invoke('browser:reopen-tab'),
